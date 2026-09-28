@@ -18,6 +18,7 @@ package service
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
@@ -38,21 +39,22 @@ var validTimeCardState = map[domain.TimeCardState]bool{
 type timeCardService struct {
 	repo     repository.TimeCardRepository
 	userRepo repository.UserRepository
-	// snWriteback/snMirror back CreateTimeCard's best-effort, asynchronous
-	// ServiceNow mirror write under DATA_SOURCE=postgres-servicenow-dual-write
-	// -- both nil in every other mode. Set only via
-	// NewTimeCardServiceWithSNWriteback.
+	// snWriteback/snMirror back CreateTimeCard's, UpdateTimeCard's, and
+	// DeleteTimeCard's best-effort, asynchronous ServiceNow mirror writes
+	// under DATA_SOURCE=postgres-servicenow-dual-write -- both nil in every
+	// other mode. Set only via NewTimeCardServiceWithSNWriteback.
 	//
-	// UpdateTimeCard/DeleteTimeCard are deliberately NOT mirrored here, same
-	// reasoning as callRequestService's own doc comment on why
-	// UpdateCallRequest isn't mirrored: CreateTimeCard is Postgres-first --
-	// time_card.id is a plain Postgres-generated UUID with no ServiceNow
-	// counterpart stored anywhere (no column on time_card holds one -- see
-	// migration 000039), unlike case/change_request/incident whose CREATE is
-	// ServiceNow-first under this data source. uuidToSysid(that id) would not
-	// resolve to the real ServiceNow record, so a mirrored update/delete
-	// would either permanently 404 or risk colliding with an unrelated
-	// ServiceNow record.
+	// Update/DeleteTimeCard's mirrors need an id mapping CreateTimeCard
+	// didn't used to record: unlike case/change_request/incident (whose
+	// CREATE is ServiceNow-first under this data source, so their Postgres
+	// id IS the real ServiceNow sys_id round-tripped through sysidToUUID),
+	// CreateTimeCard is Postgres-first -- time_card.id is a plain
+	// Postgres-generated UUID with no ServiceNow counterpart. Migration
+	// 000088 adds time_card.sn_sys_id for exactly this: CreateTimeCard's own
+	// mirror success path now persists it (best-effort, asynchronously --
+	// see that method below), and Update/DeleteTimeCard's mirrors look it up
+	// before dispatching, skipping silently (not erroring) when it is still
+	// NULL.
 	snWriteback *SNWritebackDispatcher
 	snMirror    TimeCardService
 }
@@ -265,17 +267,32 @@ func (s *timeCardService) CreateTimeCard(ctx context.Context, req domain.CreateT
 	// Best-effort ServiceNow mirror write, DATA_SOURCE=postgres-servicenow-dual-write
 	// only (snWriteback/snMirror are both nil otherwise -- see
 	// timeCardService's own doc comment). Postgres has already committed by
-	// this point; the ServiceNow-side id this mirror creates is deliberately
-	// discarded (never written back onto the Postgres row) -- see
-	// timeCardService's own doc comment for why Update/DeleteTimeCard cannot
-	// use it later anyway.
+	// this point. On success, the ServiceNow-side id this mirror creates is
+	// persisted back onto the Postgres row (migration 0135's
+	// time_card.sn_sys_id) -- itself a second best-effort, asynchronous
+	// write: if it fails, the row simply has no id yet, the same "not yet
+	// mirrorable" state Update/DeleteTimeCard's mirrors already tolerate.
 	if s.snWriteback != nil {
 		mirrorReq := req
-		s.snWriteback.Dispatch(ctx, "time_card", view.ID, "create",
+		pgID := view.ID
+		s.snWriteback.Dispatch(ctx, "time_card", pgID, "create",
 			map[string]any{"caseId": req.CaseID, "projectId": req.ProjectID, "date": req.Date},
 			func(writeCtx context.Context) error {
-				_, err := s.snMirror.CreateTimeCard(writeCtx, mirrorReq)
-				return err
+				snResp, err := s.snMirror.CreateTimeCard(writeCtx, mirrorReq)
+				if err != nil {
+					return err
+				}
+				if snResp.TimeCard == nil {
+					slog.WarnContext(writeCtx, "sn writeback: time card create mirror succeeded but returned no time card to read its sys_id from",
+						"timeCardId", pgID)
+					return nil
+				}
+				snSysID := uuidToSysid(snResp.TimeCard.ID)
+				if setErr := s.repo.SetTimeCardSNSysID(writeCtx, pgID, snSysID); setErr != nil {
+					slog.WarnContext(writeCtx, "sn writeback: time card created in ServiceNow but persisting its sys_id back onto Postgres failed -- update/delete mirrors for this row will keep skipping until this is fixed",
+						"timeCardId", pgID, "error", setErr)
+				}
+				return nil
 			},
 		)
 	}
@@ -306,6 +323,7 @@ func (s *timeCardService) UpdateTimeCard(ctx context.Context, req domain.UpdateT
 		if err != nil {
 			return domain.TimeCardMutationResponse{}, err
 		}
+		s.dispatchTimeCardUpdateMirror(ctx, req)
 		return domain.TimeCardMutationResponse{Message: "Time card updated successfully", TimeCard: &view}, nil
 	}
 
@@ -328,7 +346,43 @@ func (s *timeCardService) UpdateTimeCard(ctx context.Context, req domain.UpdateT
 	if err != nil {
 		return domain.TimeCardMutationResponse{}, err
 	}
+	s.dispatchTimeCardUpdateMirror(ctx, req)
 	return domain.TimeCardMutationResponse{Message: "Time card updated successfully", TimeCard: &view}, nil
+}
+
+// dispatchTimeCardUpdateMirror dispatches UpdateTimeCard's best-effort
+// ServiceNow mirror write, DATA_SOURCE=postgres-servicenow-dual-write only
+// (a no-op when snWriteback is nil). Called from both of UpdateTimeCard's
+// return paths (state transition and field edit) with the same, unmodified
+// req -- snMirror.UpdateTimeCard already rejects combining a state
+// transition with field edits (see its own doc comment), the same mutual
+// exclusion the Postgres path above already enforces, so req needs no
+// branch-specific handling here. The SN sys_id lookup happens inside the
+// dispatched closure, after any earlier-queued job for this same time card
+// (e.g. the CREATE mirror that persists it) has already applied -- the
+// dispatcher serializes jobs per entity key precisely so this ordering
+// holds.
+func (s *timeCardService) dispatchTimeCardUpdateMirror(ctx context.Context, req domain.UpdateTimeCardRequest) {
+	if s.snWriteback == nil {
+		return
+	}
+	mirrorReq := req
+	s.snWriteback.Dispatch(ctx, "time_card", req.ID, "update",
+		map[string]any{"id": req.ID, "state": req.State},
+		func(writeCtx context.Context) error {
+			snSysID, lookupErr := s.repo.GetTimeCardSNSysID(writeCtx, req.ID)
+			if lookupErr != nil {
+				return lookupErr
+			}
+			if snSysID == nil || *snSysID == "" {
+				slog.InfoContext(writeCtx, "sn writeback: time card update mirror skipped, no ServiceNow mapping stored yet", "timeCardId", req.ID)
+				return nil
+			}
+			mirrorReq.ID = sysidToUUID(*snSysID)
+			_, err := s.snMirror.UpdateTimeCard(writeCtx, mirrorReq)
+			return err
+		},
+	)
 }
 
 // DeleteTimeCard implements TimeCardService.
@@ -342,8 +396,44 @@ func (s *timeCardService) DeleteTimeCard(ctx context.Context, req domain.DeleteT
 		return domain.DeleteTimeCardResponse{}, err
 	}
 
+	// The SN sys_id must be read BEFORE the Postgres delete below: DeleteTimeCard
+	// removes the row entirely, taking time_card.sn_sys_id with it, so this is
+	// the last point at which it can be looked up. Postgres deletion is
+	// authoritative and must proceed regardless of whether the row happens to
+	// have a ServiceNow mapping yet: a genuinely successful lookup that finds
+	// no mapping is skipped silently below, but a real lookup error is
+	// recorded as a failed writeback (sn_writeback_failures) instead of being
+	// discarded.
+	var snSysID *string
+	var snLookupErr error
+	if s.snWriteback != nil {
+		snSysID, snLookupErr = s.repo.GetTimeCardSNSysID(ctx, req.ID)
+	}
+
 	if err := s.repo.DeleteTimeCard(ctx, req.ID, userID); err != nil {
 		return domain.DeleteTimeCardResponse{}, err
+	}
+
+	// Best-effort ServiceNow mirror write, DATA_SOURCE=postgres-servicenow-dual-write
+	// only. Postgres has already committed (the row is gone) by this point;
+	// skip silently (not an error) if no ServiceNow mapping was ever stored.
+	if s.snWriteback != nil && snLookupErr != nil {
+		lookupErr := snLookupErr
+		s.snWriteback.Dispatch(ctx, "time_card", req.ID, "delete",
+			map[string]any{"id": req.ID},
+			func(context.Context) error {
+				return lookupErr
+			},
+		)
+	} else if s.snWriteback != nil && snSysID != nil && *snSysID != "" {
+		mirrorReq := domain.DeleteTimeCardRequest{ID: sysidToUUID(*snSysID)}
+		s.snWriteback.Dispatch(ctx, "time_card", req.ID, "delete",
+			map[string]any{"id": req.ID},
+			func(writeCtx context.Context) error {
+				_, err := s.snMirror.DeleteTimeCard(writeCtx, mirrorReq)
+				return err
+			},
+		)
 	}
 
 	return domain.DeleteTimeCardResponse{Message: "Time card deleted successfully"}, nil

@@ -71,7 +71,7 @@ const (
 	projectGroupGeneralAccess = "General Access"
 	projectGroupSecurityOnly  = "Security Only"
 	projectGroupLeadUserGroup = "Lead User Group"
-	// projectGroupAdmin carries the ADMIN project role (migration 000084).
+	// projectGroupAdmin carries the ADMIN project role (migration 0128).
 	// Admin is a per-project fact now; the account-level customer_admin /
 	// partner_admin role is derived from every membership a user holds, not
 	// stored independently.
@@ -177,7 +177,7 @@ func mapGlobalRoles(membershipType string, isIntegrationUser bool) (grant, manag
 // Salesforce roles (§6.4). Portal user + Security Contact is Full Access,
 // Portal user alone General Access, Security Contact alone Security Only; a
 // Lead additionally joins Lead User Group; an Admin additionally joins Admin,
-// the group carrying the ADMIN project role (migration 000084) — Admin used
+// the group carrying the ADMIN project role (migration 0128) — Admin used
 // to be a global-only role, with nothing recorded per project at all.
 // Roles the mapping does not know are returned in ignored so the caller can
 // log them; they never fail the ingest.

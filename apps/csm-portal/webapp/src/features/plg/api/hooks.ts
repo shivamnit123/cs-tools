@@ -38,7 +38,7 @@ import type {
 export const queryKeys = {
   me: ["me"] as const,
   products: ["products"] as const,
-  csUsers: ["cs-users"] as const,
+  csUsers: (search: string) => ["cs-users", search] as const,
   lifecycle: ["lifecycle"] as const,
   organizations: (req: SearchOrganizationsRequest) => ["organizations", req] as const,
   organization: (id: string) => ["organization", id] as const,
@@ -75,12 +75,35 @@ export function useProducts(): UseQueryResult<Product[]> {
   });
 }
 
-export function useCSUsers(): UseQueryResult<UserRef[]> {
+/**
+ * Engineers an owner picker may offer.
+ *
+ * `search` empty is the default page — the first 100 by first name, which is
+ * what the picker opens with. A non-empty term asks the server to match it
+ * against a name or an address instead.
+ *
+ * It has to be the server: there are ~1,900 active internal users against a page
+ * limit of 100, so filtering what arrived in the browser would only ever search
+ * the same first 100 — everyone from roughly the A's onward would stay
+ * unreachable, silently.
+ *
+ * Unlike the other reference lists this is NOT `staleTime: Infinity`. Those are
+ * catalogues of five or six rows that change when a migration runs; this is a
+ * different result set per term, and caching each one forever would keep a
+ * directory of names in memory for as long as the tab is open.
+ */
+export function useCSUsers(search = ""): UseQueryResult<UserRef[]> {
   const api = usePlgApi();
   return useQuery({
-    queryKey: queryKeys.csUsers,
-    queryFn: async () => (await api.get<{ users: UserRef[] }>("/cs-users")).users,
-    ...referenceOptions,
+    queryKey: queryKeys.csUsers(search),
+    queryFn: async () => {
+      const query = search.trim() ? `?search=${encodeURIComponent(search.trim())}` : "";
+      return (await api.get<{ users: UserRef[] }>(`/cs-users${query}`)).users;
+    },
+    // Keep the previous page on screen while the next one loads, so the list
+    // does not blank out on every keystroke.
+    placeholderData: (previous) => previous,
+    staleTime: 5 * 60 * 1000,
   });
 }
 

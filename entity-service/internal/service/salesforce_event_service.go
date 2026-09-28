@@ -18,6 +18,7 @@ package service
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 	"unicode/utf8"
 
@@ -67,7 +68,7 @@ type salesforceEventService struct {
 
 // NewSalesforceEventService constructs a SalesforceEventService that ingests
 // Account events only; Project_Contact__c and Contact envelopes are
-// acknowledged and ignored.
+// acknowledged and ignored. A nil repo turns the Account branch off too.
 func NewSalesforceEventService(repo repository.AccountRepository, se SalesEntityCustomerClient) SalesforceEventService {
 	return &salesforceEventService{repo: repo, se: se}
 }
@@ -105,6 +106,11 @@ func (s *salesforceEventService) HandleEvent(ctx context.Context, req domain.Sal
 		// make ASB retry the envelope forever.
 		return nil
 	}
+	if s.repo == nil {
+		slog.InfoContext(ctx, "salesforce: account ingest disabled, ignoring account event",
+			"eventType", req.EventType, "referenceId", req.ReferenceID)
+		return nil
+	}
 	if req.EventType == domain.SalesforceEventUndefined {
 		return &apierror.ValidationError{Msg: "eventType UNDEFINED is not supported"}
 	}
@@ -126,6 +132,12 @@ func (s *salesforceEventService) upsertAccount(ctx context.Context, sfID string)
 	}
 	if strings.TrimSpace(derefString(cust.Name)) == "" {
 		return &apierror.ServiceUnavailableError{Msg: "sales/sales-entity-service customer is missing Name"}
+	}
+	// The Salesforce id is stored as both sf_id and account.number (NOT NULL,
+	// UNIQUE), so a record without one could only be inserted as an empty
+	// number, once.
+	if strings.TrimSpace(cust.ID) == "" {
+		return &apierror.ServiceUnavailableError{Msg: "sales/sales-entity-service customer is missing id"}
 	}
 
 	row := mapSalesEntityCustomer(cust)

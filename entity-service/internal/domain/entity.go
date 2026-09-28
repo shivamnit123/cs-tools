@@ -128,7 +128,7 @@ type UserSortBy struct {
 // Postgres data source. userType is never accepted here -- it is derived by
 // a database trigger from is_system_user and role membership (migration
 // 000007), never set directly by a caller. roles is optional; each name is
-// resolved against the role table (migration 000004) and rejected with a
+// resolved against the role table (migration 0008) and rejected with a
 // ServiceUnavailableError if any is not seeded there -- the same posture
 // syncGlobalRoles uses for the Salesforce membership ingest.
 type CreateUserRequest struct {
@@ -378,9 +378,14 @@ type PatchUserMeResponse struct {
 
 // SearchAccountsFilters holds the optional filter criteria for an account search.
 type SearchAccountsFilters struct {
-	SearchQuery    string `json:"searchQuery,omitempty"`
-	Active         *bool  `json:"active,omitempty"`
-	Pod            string `json:"pod,omitempty"`
+	SearchQuery string `json:"searchQuery,omitempty"`
+	Active      *bool  `json:"active,omitempty"`
+	Pod         string `json:"pod,omitempty"`
+	// OwnerEmail filters to accounts where this email is the technical
+	// owner, account manager, or renewal account manager (any of the
+	// three) — a "my accounts" filter for whichever of those roles the
+	// caller holds. Case-insensitive exact match.
+	OwnerEmail     string `json:"ownerEmail,omitempty"`
 	Classification string `json:"classification,omitempty"`
 }
 
@@ -396,23 +401,33 @@ type SearchAccountsRequest struct {
 // Fields not available from a given data source are left nil.
 // SupportTier is returned as a plain label string (no ID).
 type AccountView struct {
-	ID                    string     `json:"id"`
-	Name                  string     `json:"name"`
-	Classification        string     `json:"classification"`
-	Pod                   *string    `json:"pod"`
-	SfID                  *string    `json:"sfId"`
-	Region                *string    `json:"region"`
-	SupportTier           *string    `json:"supportTier"`
-	ArrToday              *string    `json:"arrToday"`
-	TechnicalOwner        *PersonRef `json:"technicalOwner"`
-	AccountManager        *PersonRef `json:"accountManager"`
-	RenewalAccountManager *PersonRef `json:"renewalAccountManager"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// Number is the account's ServiceNow-style identifier (e.g. "ACC0001") —
+	// present and populated on the Postgres data source (account.number, NOT
+	// NULL UNIQUE), unlike SupportTier/ArrToday below.
+	Number         string  `json:"number"`
+	Classification string  `json:"classification"`
+	Pod            *string `json:"pod"`
+	SfID           *string `json:"sfId"`
+	Region         *string `json:"region"`
+	Country        *string `json:"country"`
+	City           *string `json:"city"`
+	// DriveLocation is a free-text Google Drive folder reference — present
+	// on the Postgres data source (account.drive_location).
+	DriveLocation          *string    `json:"driveLocation"`
+	SupportTier            *string    `json:"supportTier"`
+	ArrToday               *string    `json:"arrToday"`
+	TechnicalOwner         *PersonRef `json:"technicalOwner"`
+	AccountManager         *PersonRef `json:"accountManager"`
+	RenewalAccountManager  *PersonRef `json:"renewalAccountManager"`
+	CustomerSuccessManager *PersonRef `json:"customerSuccessManager"`
 	// CreTeam is the account's CRE (customer relationship engineering) team,
 	// resolved to a named group reference -- account.cre_team_id (migration
 	// 000074) on the Postgres data source. Mirrors AccountRef.CreTeam.
 	CreTeam *EntityRef `json:"creTeam"`
 	// SreTeam is the account's SRE team, resolved to a named group reference
-	// -- account.sre_team_id (migration 000074) on the Postgres data
+	// -- account.sre_team_id (migration 0075) on the Postgres data
 	// source. Mirrors AccountRef.SreTeam.
 	SreTeam          *EntityRef `json:"sreTeam"`
 	ActivationDate   *string    `json:"activationDate"`
@@ -453,23 +468,28 @@ type SNSupportTierRef struct {
 // sources for GET /accounts/{id}. SupportTier is returned as an {id, label}
 // object. Fields not available from a given data source are left nil.
 type AccountDetail struct {
-	ID                    string            `json:"id"`
-	Name                  string            `json:"name"`
-	Classification        string            `json:"classification"`
-	Pod                   *string           `json:"pod"`
-	SfID                  *string           `json:"sfId"`
-	Region                *string           `json:"region"`
-	SupportTier           *SNSupportTierRef `json:"supportTier"`
-	ArrToday              *string           `json:"arrToday"`
-	TechnicalOwner        *PersonRef        `json:"technicalOwner"`
-	AccountManager        *PersonRef        `json:"accountManager"`
-	RenewalAccountManager *PersonRef        `json:"renewalAccountManager"`
+	ID                     string            `json:"id"`
+	Name                   string            `json:"name"`
+	Number                 string            `json:"number"`
+	Classification         string            `json:"classification"`
+	Pod                    *string           `json:"pod"`
+	SfID                   *string           `json:"sfId"`
+	Region                 *string           `json:"region"`
+	Country                *string           `json:"country"`
+	City                   *string           `json:"city"`
+	DriveLocation          *string           `json:"driveLocation"`
+	SupportTier            *SNSupportTierRef `json:"supportTier"`
+	ArrToday               *string           `json:"arrToday"`
+	TechnicalOwner         *PersonRef        `json:"technicalOwner"`
+	AccountManager         *PersonRef        `json:"accountManager"`
+	RenewalAccountManager  *PersonRef        `json:"renewalAccountManager"`
+	CustomerSuccessManager *PersonRef        `json:"customerSuccessManager"`
 	// CreTeam is the account's CRE (customer relationship engineering) team,
 	// resolved to a named group reference -- account.cre_team_id (migration
 	// 000074) on the Postgres data source. Mirrors AccountRef.CreTeam.
 	CreTeam *EntityRef `json:"creTeam"`
 	// SreTeam is the account's SRE team, resolved to a named group reference
-	// -- account.sre_team_id (migration 000074) on the Postgres data
+	// -- account.sre_team_id (migration 0075) on the Postgres data
 	// source. Mirrors AccountRef.SreTeam.
 	SreTeam          *EntityRef `json:"sreTeam"`
 	ActivationDate   *string    `json:"activationDate"`
@@ -533,6 +553,12 @@ const (
 	// DELETED, and this value makes a portal-originated write visible in the
 	// ledger for what it is.
 	PortalMembershipWriteEventType = "PORTAL_WRITE"
+	// SLAEngineActor is created_by/updated_by for every "sla" row the
+	// CSM-native SLA engine writes (source='CSM', migration 0134) --
+	// distinguishes its own rows in the audit columns from the ServiceNow
+	// sync's, which share the same table but never carry this value. See
+	// internal/service/sla_policy_resolver.go.
+	SLAEngineActor = "sla-engine"
 )
 
 // SalesforceEventRequest is the ASB envelope POSTed to /salesforce/events.
@@ -724,6 +750,75 @@ type CreateProjectMembershipRequest struct {
 	// existing contact keeps whatever Salesforce already says, which is the
 	// authority on what kind of contact it is.
 	IsCsIntegrationUser bool `json:"isCsIntegrationUser,omitempty"`
+	// InviterEmail is the address of the person sending the invitation, set
+	// by the Customer Portal backend from the signed-in user's verified token
+	// (never from its own request body). When present, the invitation is
+	// checked the way the project-contact onboarding service checked it:
+	// the inviter's account must own or partner the project, and the allowed
+	// email domains start from that account. The CSM Portal leaves it empty.
+	// Trusted only because every caller of this route is an allow-listed
+	// internal client.
+	InviterEmail string `json:"inviterEmail,omitempty"`
+}
+
+// ValidateProjectMembershipRequest is the body of
+// POST /projects/{id}/contacts/validate: the invitation to check, without
+// making it. InviterEmail means exactly what it means on
+// CreateProjectMembershipRequest.
+type ValidateProjectMembershipRequest struct {
+	Email        string `json:"email"`
+	InviterEmail string `json:"inviterEmail,omitempty"`
+}
+
+// Reasons a ProjectMembershipValidation gives for refusing an invitation.
+// Each names the status the invitation itself would have been refused with,
+// so a caller can keep answering its own users the way it did before.
+const (
+	// MembershipValidationConflict: the address is already an active contact
+	// on the project, or Salesforce holds more than one contact for it (409).
+	MembershipValidationConflict = "CONFLICT"
+	// MembershipValidationForbidden: the invitation is not allowed, e.g. a
+	// public email domain, a domain outside the allowed list, or an inviter
+	// whose account neither owns nor partners the project (403).
+	MembershipValidationForbidden = "FORBIDDEN"
+	// MembershipValidationInvalid: the invitation cannot be made as it
+	// stands, e.g. the account has no domain list defined (400).
+	MembershipValidationInvalid = "INVALID"
+)
+
+// ProjectMembershipValidation is the answer of
+// POST /projects/{id}/contacts/validate. A refused invitation is an ordinary
+// answer here (Valid false, with Reason and Message), not an error status:
+// the error statuses are kept for the call itself failing, so a caller can
+// tell "this person may not be invited" apart from "the check could not run".
+type ProjectMembershipValidation struct {
+	Valid bool `json:"valid"`
+	// Reason is one of the MembershipValidation* constants. Empty when Valid.
+	Reason string `json:"reason,omitempty"`
+	// Message says why, in words safe to show the person who is inviting:
+	// the wording the project-contact onboarding service used.
+	Message string `json:"message,omitempty"`
+	// ExistingMembershipState is the state of the membership this project
+	// already holds for the address, when there is one. On a valid answer it
+	// can only be DEACTIVATED, meaning the invitation would bring it back.
+	ExistingMembershipState string `json:"existingMembershipState,omitempty"`
+	// ExistingContact is the Salesforce contact the invitation would adopt,
+	// when one already exists. Set only on a valid answer.
+	ExistingContact *ValidatedInvitee `json:"existingContact,omitempty"`
+}
+
+// ValidatedInvitee is the existing Salesforce contact an invitation would
+// adopt rather than create.
+type ValidatedInvitee struct {
+	ContactSfID           string  `json:"contactSfId"`
+	Email                 string  `json:"email"`
+	FirstName             string  `json:"firstName,omitempty"`
+	LastName              string  `json:"lastName,omitempty"`
+	IsCsAdmin             bool    `json:"isCsAdmin"`
+	IsCsIntegrationUser   bool    `json:"isCsIntegrationUser"`
+	AccountSfID           *string `json:"accountSfId,omitempty"`
+	AccountClassification *string `json:"accountClassification,omitempty"`
+	IsPartnerAccount      *bool   `json:"isPartnerAccount,omitempty"`
 }
 
 // UpdateProjectMembershipRolesRequest is the body of
@@ -782,7 +877,7 @@ const (
 )
 
 // OnboardingStep is one row of onboarding_step — see migration
-// 000075_onboarding_step_table for the column semantics.
+// 0116_onboarding_step_table for the column semantics.
 type OnboardingStep struct {
 	ID               string               `json:"id"`
 	MembershipSfID   string               `json:"membershipSfId"`
@@ -876,7 +971,7 @@ const (
 // internal repository<->service handoff type for SearchProjects, never
 // serialized directly to a caller (ProjectView is). AccountID/StartDate/
 // EndDate are pointers because project.account_id/start_date/end_date
-// (migration 000009) are all nullable columns and genuinely NULL on live
+// (migration 0014) are all nullable columns and genuinely NULL on live
 // data (confirmed: 14/1956, 13/1956, 14/1956 rows respectively) -- matching
 // ProjectDetailsView's own StartDate/EndDate, which document the same
 // "may legitimately be unset" reality.
@@ -888,16 +983,26 @@ type Project struct {
 	Key              string           `json:"key"`
 	SubscriptionType SubscriptionType `json:"subscriptionType"`
 	ClosureStatus    *ClosureStatus   `json:"closureStatus"`
-	StartDate        *time.Time       `json:"startDate"`
-	EndDate          *time.Time       `json:"endDate"`
-	CreatedOn        time.Time        `json:"createdOn"`
-	UpdatedOn        time.Time        `json:"updatedOn"`
+	// ClosureState mirrors ProjectDetailsView's own field of the same name
+	// (project.wso2_closure_state) -- a distinct concept from ClosureStatus
+	// above despite the similar name: this is the raw enum label
+	// (e.g. "Suspended") SearchProjects' own ProjectView.ClosureState
+	// (ProjectClosureFields, embedded there) is populated from.
+	ClosureState *string    `json:"closureState"`
+	StartDate    *time.Time `json:"startDate"`
+	EndDate      *time.Time `json:"endDate"`
+	CreatedOn    time.Time  `json:"createdOn"`
+	UpdatedOn    time.Time  `json:"updatedOn"`
 }
 
 // ProjectAccountRef is the embedded account summary returned in project detail responses.
 type ProjectAccountRef struct {
-	ID                  string     `json:"id"`
-	Name                string     `json:"name"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// Number is the account's ServiceNow-style identifier — see
+	// AccountView.Number's own doc comment for why this is populated on the
+	// Postgres data source too, not just ServiceNow.
+	Number              string     `json:"number"`
 	ActivationDate      *time.Time `json:"activationDate"`
 	Tier                string     `json:"tier"`
 	Region              *string    `json:"region"`
@@ -921,7 +1026,8 @@ type ProjectAccountRef struct {
 // promotes its fields to the parent's JSON object, so the wire shape is
 // unaffected.
 type ProjectClosureFields struct {
-	// ClosureState is the project's closure/access state (ServiceNow data source only).
+	// ClosureState is the project's closure/access state (project.wso2_closure_state,
+	// migration 0014 -- populated on both data sources).
 	ClosureState *string `json:"closureState"`
 	// EndDateClosureState reflects the closure state driven by the project's end date
 	// (ServiceNow data source only).
@@ -1047,9 +1153,11 @@ type SearchProjectsRequest struct {
 	SortBy string `json:"sortBy"`
 	// SortOrder is the sort direction ("asc" or "desc", ServiceNow data source only).
 	SortOrder string `json:"sortOrder"`
-	// AccountID filters to projects belonging to this account. Platform UUID,
-	// converted to the backing data source's internal id before dispatch
-	// (ServiceNow data source only).
+	// AccountID filters to projects belonging to this account. Platform
+	// UUID. Supported on both data sources: the ServiceNow path converts it
+	// to that backing data source's internal id before dispatch; the
+	// Postgres path applies it directly against project.account_id
+	// (project_repo.go).
 	AccountID string `json:"accountId"`
 	// OnboardingStatus filters to projects whose onboarding status is one of
 	// the given values (ServiceNow data source only).
@@ -1074,7 +1182,7 @@ type SearchProjectsRequest struct {
 	// any of the given values, e.g. ["cloud_support", "cloud_evaluation_support"].
 	// Same "no upstream filter, applied in Go" caveat as ExcludeClosureStates
 	// for the ServiceNow data source. The Postgres data source applies it as a
-	// real SQL filter against project_type.name (migrations 000026/000027,
+	// real SQL filter against project_type.name (migrations 0031/0032,
 	// joined via project.project_type_id -- the same ServiceNow project
 	// "type" reference field, normalized the same way
 	// snTypeNameToSubscriptionType normalizes it) -- a project with no
@@ -1730,8 +1838,9 @@ type DeployedProductView struct {
 type ProductRef struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
-	// Abbreviation is absent on the Postgres data source, whose products table
-	// has no equivalent column — it is populated only from ServiceNow.
+	// Abbreviation is product.code on the Postgres data source (e.g. "wso2am"
+	// for "WSO2 API Manager") -- the exact vocabulary this field's own doc
+	// comment above describes the product-updates catalogue keying on.
 	Abbreviation *string `json:"abbreviation,omitempty"`
 }
 
@@ -1771,7 +1880,7 @@ type SearchDeployedProductsResponse struct {
 // than a product/version. Needed for EOL/product-version-targeted
 // announcements: there is no existing query path from "product X, version Y"
 // back to the projects running it. Supported on both data sources: Postgres
-// resolves it directly via deployed_product.project_id (migration 000014's
+// resolves it directly via deployed_product.project_id (migration 0019's
 // FK straight to project), ServiceNow via a platform-wide deployment scan
 // (see that data source's own implementation).
 //
@@ -2101,7 +2210,7 @@ type AccountRef struct {
 	// 000074) on the Postgres data source, see CaseRepository.GetCaseByID.
 	CreTeam *EntityRef `json:"creTeam,omitempty"`
 	// SreTeam is the account's SRE team, resolved to a named group reference
-	// -- account.sre_team_id (migration 000074) on the Postgres data
+	// -- account.sre_team_id (migration 0075) on the Postgres data
 	// source, see CaseRepository.GetCaseByID.
 	SreTeam *EntityRef `json:"sreTeam,omitempty"`
 }
@@ -2204,15 +2313,23 @@ type CaseView struct {
 	// Severity/IssueType/State are null in practice for a large share of
 	// real cases -- see domain.Case's own doc comment for the confirmed
 	// production null rates.
-	Severity       *CaseSeverity  `json:"severity"`
-	IssueType      *CaseIssueType `json:"issueType"`
-	State          *CaseState     `json:"state"`
-	WorkState      *CaseWorkState `json:"workState"`
-	Type           *string        `json:"type"`
-	EngagementType *string        `json:"engagementType"`
-	CreatedOn      time.Time      `json:"createdOn"`
-	UpdatedOn      time.Time      `json:"updatedOn"`
-	ClosedOn       *time.Time     `json:"closedOn"`
+	Severity  *CaseSeverity  `json:"severity"`
+	IssueType *CaseIssueType `json:"issueType"`
+	State     *CaseState     `json:"state"`
+	WorkState *CaseWorkState `json:"workState"`
+	Type      *string        `json:"type"`
+	// AnnouncementType is only meaningful when Type is "announcement" -- the
+	// real ServiceNow classification (u_announcement_type, migrated into
+	// Postgres' own announcement.announcement_type column) of "GENERAL" vs
+	// "SECURITY", set at creation time from CreateCaseRequest.IsSecurityAnnouncement
+	// (which already exists for a different purpose -- see that field's own
+	// doc comment -- reused here rather than adding a second flag for the
+	// same underlying yes/no). Nil for every other case-like type.
+	AnnouncementType *string    `json:"announcementType,omitempty"`
+	EngagementType   *string    `json:"engagementType"`
+	CreatedOn        time.Time  `json:"createdOn"`
+	UpdatedOn        time.Time  `json:"updatedOn"`
+	ClosedOn         *time.Time `json:"closedOn"`
 	// CreatedBy is the canonical user reference for the case creator. Its id is
 	// populated only where the backing data source already supplies one, and
 	// null otherwise: see UserReference.
@@ -2265,7 +2382,7 @@ type CaseView struct {
 	Cause           *CaseCause          `json:"cause"`
 	ResolutionNotes *string             `json:"resolutionNotes"`
 	// WatchList is the set of users watching the case. For the Postgres data
-	// source this is backed by work_item_watcher (migration 000040).
+	// source this is backed by work_item_watcher (migration 0042).
 	WatchList []WatchListUser `json:"watchList,omitempty"`
 	// AutoclosureStep indicates where the case sits in ServiceNow's staged auto-closure
 	// sequence: DEFAULT -> FIRST_COMMENT -> ON_HOLD -> SECOND_COMMENT. Read-only —
@@ -2728,8 +2845,12 @@ type UpdateCaseRequest struct {
 	// accepted and resolved to emails for CSM callers. It is a pointer so an
 	// absent field and an explicitly empty list are distinguishable: nil leaves
 	// the watch list untouched, while an empty list clears it.
-	WatchList      *[]string           `json:"watchList"`
-	AssigneeEmail  *string             `json:"assigneeEmail"`
+	WatchList *[]string `json:"watchList"`
+	// AssigneeEmail uses json.RawMessage to preserve three states: nil/empty = omit,
+	// "null" = clear (unassign), `"value"` = set -- mirroring
+	// UpdateAttachmentRequest.Description, since a plain *string cannot tell an omitted
+	// field apart from an explicit null.
+	AssigneeEmail  json.RawMessage     `json:"assigneeEmail"`
 	ResolutionCode *CaseResolutionCode `json:"resolutionCode"`
 	Cause          *CaseCause          `json:"cause"`
 	CloseNotes     *string             `json:"closeNotes"`
@@ -2798,6 +2919,14 @@ type UpdateCaseRequest struct {
 	// the provider and pauses the case's Workaround SLA clock in the backing data
 	// source; recalling clears both (ServiceNow data source only).
 	WorkaroundProvided *bool `json:"workaroundProvided"`
+	// MarkFixIssued, when true, records that a fix has been issued for the case:
+	// it stamps work_item.fix_issued_on with the current time if it isn't already set,
+	// and otherwise succeeds without changing anything (first-write-wins, same
+	// shape as Acknowledge -- there is no un-mark). Only true is accepted -- like
+	// Acknowledge, there is no unmark path -- and it cannot be combined with any
+	// other field in the same request (Postgres data source only; the mirrored
+	// ServiceNow write happens asynchronously through the dual-write mechanism).
+	MarkFixIssued *bool `json:"markFixIssued"`
 }
 
 // UpdateCaseResponse is the response for PATCH /cases/{id}.
@@ -2861,6 +2990,12 @@ type UpdatedCase struct {
 	// request set it or found it already set. Present only when the update set
 	// acknowledge.
 	AcknowledgedBy *AssignedEngineerRef `json:"acknowledgedBy,omitempty"`
+	// FixIssued echoes the case's fix-issued timestamp back on a successful
+	// markFixIssued update, whether this request just set it (first write) or it
+	// was already set (first-write-wins no-op). Present only when the update set
+	// markFixIssued -- not part of the general read model (CaseView/GetCaseByID/
+	// SearchCases), which is a separate, later piece of work.
+	FixIssued *time.Time `json:"fixIssued,omitempty"`
 	// WorkaroundProvidedOn/WorkaroundProvidedBy are not echoed here: ServiceNow's
 	// Update Case response only ever returns {id, updatedOn, updatedBy} for a plain
 	// field write like this one (same as Subject/Description/the fix-ETA fields
@@ -2883,6 +3018,21 @@ type WatchListUser struct {
 	UserName string `json:"userName"`
 	Name     string `json:"name,omitempty"`
 	Email    string `json:"email,omitempty"`
+	// Locked is true when this watcher is currently one of the case's
+	// project's account's four named stakeholders (customer success manager,
+	// technical owner, secondary technical owner, account manager --
+	// CaseRepository.AccountDefaultWatcherIDs). A caller cannot remove a
+	// locked watcher via UpdateCase's WatchList field -- see
+	// caseService.updateCaseWatchList's own doc comment -- so a UI should
+	// disable the remove control for these specifically, rather than let the
+	// removal silently fail to stick. Computed live from the account's
+	// current stakeholder columns, not stamped at the time the watcher was
+	// added, so it tracks a later stakeholder change (e.g. a reassigned CSM)
+	// automatically rather than going stale. Postgres-data-source only --
+	// this concept has no ServiceNow-side equivalent, so a ServiceNow-backed
+	// watcher is always Locked: false, which is accurate for that data
+	// source (nothing there enforces this rule).
+	Locked bool `json:"locked"`
 	// User is the canonical user reference for this watcher, a sibling of the
 	// flat id/userName/name/email fields. Its id is always null: a watch-list
 	// entry is not guaranteed to point at a user record (the list collapses
@@ -2952,6 +3102,11 @@ type CreateCaseRequest struct {
 	// For engagement type
 	EngagementType        EngagementType        `json:"engagementType"`
 	EngagementPaymentType EngagementPaymentType `json:"engagementPaymentType"`
+	// For announcement type only -- decides the case's default audience:
+	// true resolves to every project contact holding the SECURITY_CONTACT
+	// project role, false to every contact holding PORTAL_USER. Ignored for
+	// every other type. See publishCaseCreatedEvent's own doc comment.
+	IsSecurityAnnouncement bool `json:"isSecurityAnnouncement,omitempty"`
 }
 
 // CommentType classifies the type of a case comment.
@@ -3002,6 +3157,14 @@ type CreateCaseCommentRequest struct {
 	CreatedBy string      `json:"-"`
 	Type      CommentType `json:"type"`
 	Content   string      `json:"content"`
+	// ActorEmail is set only by an M2M caller that has no x-user-id-token to
+	// resolve an acting user from (e.g. UMT via csm-integration-service).
+	// The handler checks it against a configured allowlist of trusted
+	// service-account emails (config.Config.M2MTrustedActorEmails) before
+	// honoring it -- an arbitrary caller-supplied value is never trusted
+	// as-is, since that would let any caller claim to be any user. Mutually
+	// exclusive with a real x-user-id-token on the same request.
+	ActorEmail *string `json:"actorEmail,omitempty"`
 }
 
 // AddCaseTagRequest is the request body for POST /cases/{id}/tags. SN's tagging is
@@ -3010,6 +3173,14 @@ type CreateCaseCommentRequest struct {
 type AddCaseTagRequest struct {
 	CaseID string `json:"-"`
 	Label  string `json:"label"`
+	// ActorEmail is set only by an M2M caller that has no x-user-id-token to
+	// resolve an acting user from (e.g. UMT via csm-integration-service).
+	// The handler checks it against a configured allowlist of trusted
+	// service-account emails (config.Config.M2MTrustedActorEmails) before
+	// honoring it -- an arbitrary caller-supplied value is never trusted
+	// as-is, since that would let any caller claim to be any user. Mutually
+	// exclusive with a real x-user-id-token on the same request.
+	ActorEmail *string `json:"actorEmail,omitempty"`
 }
 
 // SearchTagsFilters holds the optional filters for a tag search.
@@ -3483,7 +3654,7 @@ const (
 	ChangeRequestTypeSiteReliabilityOps ChangeRequestType = "site_reliability_ops"
 	ChangeRequestTypeAzure              ChangeRequestType = "azure"
 	// The following four have no ServiceNow-data-source equivalent today --
-	// added for change_request.change_model (migration 000055), whose real
+	// added for change_request.change_model (migration 0056), whose real
 	// enum values only partially overlap this type's existing ones (see
 	// changeRequestChangeModelToType in change_request_repo.go).
 	ChangeRequestTypeChangeRegistration  ChangeRequestType = "change_registration"
@@ -3830,7 +4001,7 @@ type SearchContactsFilters struct {
 }
 
 // ProjectContact is a contact associated with a project. For the Postgres
-// data source, backed by the project_contact table (migration 000022).
+// data source, backed by the project_contact table (migration 0027).
 type ProjectContact struct {
 	// ID is the contact's user id, for linking a row to that user's profile. Nil when
 	// the row has no contact record linked, or when the backing instance predates the
@@ -3893,7 +4064,7 @@ type SearchProjectContactsResponse struct {
 }
 
 // AccountContact is a contact associated with an account. For the Postgres
-// data source, backed by the account_contact table (migration 000020).
+// data source, backed by the account_contact table (migration 0026).
 type AccountContact struct {
 	Name      string `json:"name"`
 	Email     string `json:"email"`
@@ -4401,7 +4572,7 @@ type ITService struct {
 	Class                 *string                `json:"class"`
 	BusinessCriticality   *BusinessCriticality   `json:"businessCriticality"`
 	ServiceClassification *ServiceClassification `json:"serviceClassification"`
-	SupportGroup          *EntityRef             `json:"supportGroup"`
+	AssignmentGroup       *EntityRef             `json:"assignmentGroup"`
 }
 
 // ConfigurationItem is a single CMDB configuration item returned in a search response.
@@ -4951,6 +5122,13 @@ type SearchIncidentsFilters struct {
 	// ServiceNow's `number` column, routed as a first-class filter rather
 	// than through the free-text SearchQuery scan.
 	Number *string `json:"number,omitempty"`
+	// CorrelationID filters to the incident whose ServiceNow `correlation_id`
+	// exactly matches (optional). Lets an external system (e.g. a monitoring
+	// integration) look up an incident it previously created by the same
+	// caller-supplied key it passed to CreateIncidentRequest.CorrelationID,
+	// without depending on free-text SearchQuery matching visible fields like
+	// Subject or WorkNotes.
+	CorrelationID *string `json:"correlationId,omitempty"`
 	// Filters is the generic field/op/values filter array. Supported fields:
 	//   - "state" (op in): domain IncidentState enum values (NEW,
 	//     IN_PROGRESS, ON_HOLD, RESOLVED, CLOSED, CANCELLED), translated to
@@ -5180,6 +5358,19 @@ type CreateIncidentRequest struct {
 	ChangeRequestID     *string              `json:"changeRequestId,omitempty"`
 	ProblemID           *string              `json:"problemId,omitempty"`
 	CausedByID          *string              `json:"causedById,omitempty"`
+	// CorrelationID is an optional caller-supplied external-system key, stored
+	// on ServiceNow's stock `correlation_id` field. Lets a monitoring
+	// integration find an incident it already created (SearchIncidentsFilters.
+	// CorrelationID) without depending on free-text search over Subject or
+	// WorkNotes, and without exposing an internal dedup tag in either of
+	// those human-visible fields.
+	CorrelationID *string `json:"correlationId,omitempty"`
+	// Environment is an optional caller-supplied label (e.g. "Staging",
+	// "Production") identifying the environment the source alert fired
+	// against. Maps to ServiceNow's own custom incident.u_enviroment field
+	// (max length 40; name kept as ServiceNow spells it, misspelling
+	// included). Also persisted on this service's own Postgres incident row.
+	Environment *string `json:"environment,omitempty"`
 }
 
 // CreateIncidentResponse is the output for POST /incidents.
@@ -5222,6 +5413,12 @@ type UpdateIncidentRequest struct {
 	AdditionalComments  *string                 `json:"additionalComments,omitempty"`
 	WorkNotes           *string                 `json:"workNotes,omitempty"`
 	WatchList           *[]string               `json:"watchList,omitempty"`
+	// Environment: see CreateIncidentRequest.Environment doc comment. Double
+	// pointer distinguishes "omitted" (nil) from an explicit `null` clear
+	// (non-nil outer, nil inner) from a new value (non-nil, non-nil) -- a
+	// single *string can't tell omitted apart from explicit null on decode,
+	// same convention as ChangeRequest's CustomerGroupID.
+	Environment **string `json:"environment"`
 }
 
 // UpdateIncidentResponse is the output for PATCH /incidents/{id}.
@@ -5258,6 +5455,7 @@ type IncidentView struct {
 	ContactType        *string                 `json:"contactType"`
 	Impact             *string                 `json:"impact"`
 	Urgency            *string                 `json:"urgency"`
+	Environment        *string                 `json:"environment"`
 	ChangeRequest      *EntityRef              `json:"changeRequest"`
 	Problem            *EntityRef              `json:"problem"`
 	CausedBy           *EntityRef              `json:"causedBy"`
@@ -5277,6 +5475,10 @@ type IncidentView struct {
 	ResolvedBy      *string `json:"resolvedBy"`
 	ResolvedOn      *string `json:"resolvedOn"`
 	IncidentReport  *string `json:"incidentReport"`
+	// Description is ServiceNow's incident.description field (separate from Subject, which
+	// maps to the shorter short_description), read from work_item.description -- the same
+	// column every other work_item type already uses for its own long-form description.
+	Description *string `json:"description"`
 	// SpecialistHandoff is the derived summary of a specialist-group handoff, null when the
 	// incident has never been handed off. Nothing is persisted for it: the backing data
 	// source recomputes it at read time, so a handoff performed through its own native UI
@@ -5458,6 +5660,7 @@ type ProblemDetail struct {
 	ID                  *string         `json:"id"`
 	Number              *string         `json:"number"`
 	Subject             *string         `json:"subject"`
+	Description         *string         `json:"description"`
 	State               *string         `json:"state"`
 	Priority            *string         `json:"priority"`
 	Category            *string         `json:"category"`
@@ -6397,7 +6600,7 @@ type DeployedProductUsageCountsResponse struct {
 	ChartData       []DeployedProductUsageCountsChartEntry `json:"chartData"`
 }
 
-// --- escalations (ServiceNow data source only) ---
+// --- escalations ---
 
 // EscalationAction identifies whether an escalation request escalates or
 // de-escalates a case.
@@ -7662,4 +7865,21 @@ type CreateServiceRequestFromIssueResponse struct {
 	// Created distinguishes a new record from one that already existed, so a
 	// caller retrying after a timeout can tell without parsing Message.
 	Created bool `json:"created"`
+}
+
+// TeamMember is one member of a team's roster (GET /teams/{id}/members).
+// Mirrors team_member joined to "user" (migrations 000028/000029). Role is
+// team_member.role -- "member" or "lead" only (a fixed two-value check
+// constraint), narrower than ServiceNow's free-form u_role on
+// sys_user_grmember, but always populated (NOT NULL with a default).
+type TeamMember struct {
+	ID    string  `json:"id"`
+	Name  string  `json:"name"`
+	Email *string `json:"email"`
+	Role  *string `json:"role"`
+}
+
+// GetTeamMembersResponse is the response for GET /teams/{id}/members.
+type GetTeamMembersResponse struct {
+	Members []TeamMember `json:"members"`
 }

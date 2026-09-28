@@ -1296,6 +1296,15 @@ type UserSearchFilters struct {
 	// pickers never want and an attribution lookup always does: a note written
 	// by someone who has since left must still render their name.
 	Active *bool `json:"active"`
+	// Search matches a fragment of the engineer's name or email address,
+	// case-insensitively. Empty means "everyone", which is what an owner picker
+	// asks for before anybody types.
+	//
+	// It exists because the picker cannot show them all: there are ~1,900 active
+	// internal users and the page limit is 100, so without a server-side search
+	// the other 95% are unreachable — the list is ordered by first name, so the
+	// cut falls somewhere in the A's.
+	Search string `json:"search"`
 }
 
 // PlgSearchUsersRequest is the body of POST /plg/users/search.

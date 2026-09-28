@@ -26,8 +26,8 @@ import (
 )
 
 // ProjectTypeRow is one row of the project_type table (migration
-// 000026_project_type_table), including the feature-entitlement columns
-// migration 000085 added -- a transcription of ServiceNow's
+// 0031_project_type_table), including the feature-entitlement columns
+// migration 0130 added -- a transcription of ServiceNow's
 // ProjectTypeFeatureManager.FEATURE_MATRIX. The has_* columns default FALSE
 // and AcceptedSeverityValues/*ProductCategories default nil/empty for a type
 // FEATURE_MATRIX itself has no entry for, so a caller needs no separate

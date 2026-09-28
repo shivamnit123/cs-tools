@@ -88,8 +88,8 @@ func TestCreateCaseGithubIssue_ViaEngineering(t *testing.T) {
 		if c.orgName != "example-org" || c.owner != "example-org" || c.repo != "alpha-repo" || c.title != "Crash on startup" || c.body != "It fails." {
 			t.Errorf("call = %+v", c)
 		}
-		if !slices.Equal(c.labels, []string{"Alpha"}) {
-			t.Errorf("labels = %v, want the repo option's own label", c.labels)
+		if !slices.Equal(c.labels, []string{"Origin/CS", "Alpha"}) {
+			t.Errorf("labels = %v, want Origin/CS and the repo option's own label", c.labels)
 		}
 		type resp struct {
 			Message string `json:"message"`
@@ -105,6 +105,25 @@ func TestCreateCaseGithubIssue_ViaEngineering(t *testing.T) {
 		}
 	})
 
+	t.Run("writes the issue URL back onto the case", func(t *testing.T) {
+		eng := &mockEngineeringClient{issue: entity.GitHubIssue{Number: 42}}
+		var note []byte
+		entityClient := &mockEntityCaseClient{
+			createCaseCommentFn: func(_ context.Context, id string, body []byte) ([]byte, error) {
+				if id != caseID {
+					t.Errorf("work note case = %s, want %s", id, caseID)
+				}
+				note = body
+				return []byte(`{}`), nil
+			},
+		}
+		w := post(t, newHandler(eng, entityClient), "{"+base+"}")
+		assertStatus(t, w, http.StatusCreated)
+		if !strings.Contains(string(note), `"type":"work_note"`) || !strings.Contains(string(note), "https://github.com/example-org/alpha-repo/issues/42") {
+			t.Errorf("work note = %s", note)
+		}
+	})
+
 	t.Run("the owner and repo match the catalogue case-insensitively", func(t *testing.T) {
 		eng := &mockEngineeringClient{issue: entity.GitHubIssue{Number: 1}}
 		w := post(t, newHandler(eng, &mockEntityCaseClient{}), `{"title":"t","description":"d","repoOverride":{"owner":"EXAMPLE-ORG","repo":"Alpha-Repo"}}`)
@@ -116,27 +135,35 @@ func TestCreateCaseGithubIssue_ViaEngineering(t *testing.T) {
 
 	t.Run("builds the body and labels from the optional fields", func(t *testing.T) {
 		eng := &mockEngineeringClient{issue: entity.GitHubIssue{Number: 1}}
-		w := post(t, newHandler(eng, &mockEntityCaseClient{}), "{"+base+`,"updateLevel":"U12","publicIssueUrl":"https://example.com/i/1","hotFixRequired":true,"regression":true,"issueTypeLabel":"Type/Incident","priorityLevel":"Priority/High"}`)
+		w := post(t, newHandler(eng, &mockEntityCaseClient{}), "{"+base+`,"updateLevel":"U12","publicIssueUrl":"https://example.com/i/1","hotFixRequired":true,"regression":true,"reason":"migration","onboardingInProgress":true,"issueTypeLabel":"Type/Discussion","priorityLevel":"Priority/High"}`)
 		assertStatus(t, w, http.StatusCreated)
 		c := eng.calls[0]
 		wantBody := "It fails.\n\nUpdate Level : U12\n\nPublic Issue : https://example.com/i/1\n\nHotfix Required : Yes"
 		if c.body != wantBody {
 			t.Errorf("body = %q, want %q", c.body, wantBody)
 		}
-		if want := []string{"Alpha", "Type/Incident", "Priority/High", "regression"}; !slices.Equal(c.labels, want) {
+		if want := []string{"Origin/CS", "U12", "Alpha", "Priority/High", "Require/Hotfix", "regression", "Affected/Migration", "Onboarding/affected"}; !slices.Equal(c.labels, want) {
 			t.Errorf("labels = %v, want %v", c.labels, want)
 		}
 	})
 
-	t.Run("a priority only applies to an incident, and labels are not duplicated", func(t *testing.T) {
+	t.Run("patch adds its labels and discussion is what carries priority", func(t *testing.T) {
 		eng := &mockEngineeringClient{issue: entity.GitHubIssue{Number: 1}}
 		post(t, newHandler(eng, &mockEntityCaseClient{}), "{"+base+`,"issueTypeLabel":"Type/Patch","priorityLevel":"Priority/High","regression":true}`)
-		post(t, newHandler(eng, &mockEntityCaseClient{}), "{"+base+`,"issueTypeLabel":"alpha"}`)
-		if want := []string{"Alpha", "Type/Patch", "regression"}; !slices.Equal(eng.calls[0].labels, want) {
+		post(t, newHandler(eng, &mockEntityCaseClient{}), "{"+base+`,"issueTypeLabel":"Type/Discussion","priorityLevel":"Priority/Critical"}`)
+		if want := []string{"Origin/CS", "Alpha", "Type/Patch", "patch", "regression"}; !slices.Equal(eng.calls[0].labels, want) {
 			t.Errorf("labels = %v, want %v", eng.calls[0].labels, want)
 		}
-		if want := []string{"Alpha"}; !slices.Equal(eng.calls[1].labels, want) {
-			t.Errorf("labels = %v, want %v (a repeat of the repo label, ignoring case, is dropped)", eng.calls[1].labels, want)
+		if want := []string{"Origin/CS", "Alpha", "Priority/Critical"}; !slices.Equal(eng.calls[1].labels, want) {
+			t.Errorf("labels = %v, want %v", eng.calls[1].labels, want)
+		}
+	})
+
+	t.Run("a priority string in the update level is not applied as a label", func(t *testing.T) {
+		eng := &mockEngineeringClient{issue: entity.GitHubIssue{Number: 1}}
+		post(t, newHandler(eng, &mockEntityCaseClient{}), "{"+base+`,"issueTypeLabel":"Type/Patch","updateLevel":"Priority/Critical"}`)
+		if want := []string{"Origin/CS", "Alpha", "Type/Patch", "patch"}; !slices.Equal(eng.calls[0].labels, want) {
+			t.Errorf("labels = %v, want %v", eng.calls[0].labels, want)
 		}
 	})
 

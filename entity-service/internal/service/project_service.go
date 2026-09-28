@@ -43,6 +43,11 @@ func (s *projectService) SearchProjects(ctx context.Context, req domain.SearchPr
 	if err := validateSearchQuery(req.SearchQuery); err != nil {
 		return domain.SearchProjectsResponse{}, err
 	}
+	if req.AccountID != "" {
+		if err := validateUUIDs("accountId", []string{req.AccountID}); err != nil {
+			return domain.SearchProjectsResponse{}, err
+		}
+	}
 	scope, err := s.access.ResolveScope(ctx)
 	if err != nil {
 		return domain.SearchProjectsResponse{}, err
@@ -68,6 +73,10 @@ func (s *projectService) SearchProjects(ctx context.Context, req domain.SearchPr
 			StartDate: p.StartDate,
 			EndDate:   p.EndDate,
 			CreatedOn: p.CreatedOn,
+			// ClosureState was previously dropped here the same way StartDate
+			// used to be (see the comment above) -- domain.Project already
+			// carried it from the repository, ProjectView just never read it.
+			ProjectClosureFields: domain.ProjectClosureFields{ClosureState: p.ClosureState},
 		}
 	}
 

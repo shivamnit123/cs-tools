@@ -24,7 +24,7 @@ import (
 )
 
 // TestChangeRequestChangeModelToType covers all eight real
-// change_request_change_model_enum labels (migration 000055) -- a coverage
+// change_request_change_model_enum labels (migration 0056) -- a coverage
 // gap here would let a mistyped or omitted label silently drop a real
 // change request's type on read.
 func TestChangeRequestChangeModelToType(t *testing.T) {
@@ -72,7 +72,7 @@ func TestChangeRequestTypeToChangeModel_SupportedTypesRoundTrip(t *testing.T) {
 
 // TestChangeRequestTypeToChangeModel_UnsupportedTypesRejected proves the
 // two pre-existing ChangeRequestType values that predate change_model
-// (migration 000055) have no reverse mapping -- PatchChangeRequest relies
+// (migration 0056) have no reverse mapping -- PatchChangeRequest relies
 // on this absence to reject them with a ValidationError instead of
 // silently writing a wrong or empty change_model value.
 func TestChangeRequestTypeToChangeModel_UnsupportedTypesRejected(t *testing.T) {
@@ -287,7 +287,7 @@ func TestChangeRequestApprovalStagePosition(t *testing.T) {
 }
 
 // TestNormalizeChangeRequestApprovalStatus covers all six real SN
-// sysapproval_approver.state values (migration 000087's own comment),
+// sysapproval_approver.state values (migration 0089's own comment),
 // the empty/nil -> UNKNOWN cases, and an unrecognized value falling back to
 // an uppercased passthrough rather than UNKNOWN -- domain.ChangeRequestApprover.
 // Status is deliberately an open string, not a closed enum.

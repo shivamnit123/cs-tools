@@ -21,6 +21,7 @@ import { DRY_RUN_TEST_PROJECT_KEY } from "@config/announcementDryRunConfig";
 import { useErrorBanner } from "@context/error-banner/ErrorBannerContext";
 import { useAddTagToCase } from "@features/csm-cases/api/useCaseTags";
 import { usePostCsmCase } from "@features/csm-cases/api/usePostCsmCase";
+import { SECURITY_ANNOUNCEMENT_TAG_LABEL } from "@features/csm-announcements/components/CreateCustomerAnnouncementForm";
 
 /**
  * Fixed tag attached to every dry-run case, regardless of which flow ran it,
@@ -140,6 +141,12 @@ export function useAnnouncementDryRun({
         projectId: testProject.id,
         subject: subject.trim(),
         description,
+        // Derived from tagLabels rather than a dedicated prop: the caller
+        // already encodes "is this a security announcement" as whether
+        // SECURITY_ANNOUNCEMENT_TAG_LABEL is in its tag set (see
+        // CreateCustomerAnnouncementForm's dryRunTagLabels), so this stays in
+        // sync with the same toggle without widening this hook's own props.
+        isSecurityAnnouncement: tagLabels.includes(SECURITY_ANNOUNCEMENT_TAG_LABEL),
       });
       // Best-effort: the dry-run case already exists even if a tag fails to
       // attach, so a tag failure here doesn't block reporting success — same

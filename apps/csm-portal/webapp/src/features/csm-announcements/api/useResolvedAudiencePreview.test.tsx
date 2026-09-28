@@ -109,6 +109,23 @@ describe("useResolvedAudiencePreview", () => {
     expect(result.current.truncated).toBe(true);
   });
 
+  it("resolves past AUDIENCE_PREVIEW_MAX_PROJECTS when the caller passes an explicit higher maxProjects", async () => {
+    authFetchMock.mockImplementation((url: string) => {
+      const id = decodeURIComponent(url.split("/").pop() as string);
+      return Promise.resolve(projectResponse(id));
+    });
+    const manyIds = Array.from({ length: AUDIENCE_PREVIEW_MAX_PROJECTS + 25 }, (_, i) => `p-${i}`);
+
+    const { result } = renderHook(() => useResolvedAudiencePreview());
+    await act(async () => {
+      await result.current.resolve(manyIds, manyIds.length);
+    });
+
+    expect(authFetchMock).toHaveBeenCalledTimes(manyIds.length);
+    expect(result.current.projects).toHaveLength(manyIds.length);
+    expect(result.current.truncated).toBe(false);
+  });
+
   it("sets isLoading true while resolving and false once settled", async () => {
     let resolveFetch: (v: unknown) => void = () => {};
     authFetchMock.mockImplementation(

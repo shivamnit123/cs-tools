@@ -15,7 +15,7 @@
 // under the License.
 
 import type { ReactElement } from "react";
-import { act, fireEvent, render as rtlRender, screen } from "@testing-library/react";
+import { act, fireEvent, render as rtlRender, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router";
 import "@testing-library/jest-dom/vitest";
@@ -431,6 +431,49 @@ describe("AnnouncementRequestDialog — approved", () => {
     expect(screen.getByRole("button", { name: /^publish$/i })).toBeInTheDocument();
   });
 
+  it("caps the Audience box at 100 chips by default, and 'Show all' reveals the rest", async () => {
+    const manyIds = Array.from({ length: 105 }, (_, i) => `p-${i}`);
+    mockGet({ state: "approved", resolvedProjectIds: manyIds, resolvedProjectCount: manyIds.length });
+    render(<AnnouncementRequestDialog requestId="req-1" onClose={vi.fn()} />);
+
+    const audienceBox = () => screen.getByRole("group", { name: "Audience projects" });
+    await vi.waitFor(() => expect(within(audienceBox()).getByText("P-0")).toBeInTheDocument());
+    expect(within(audienceBox()).queryByText("P-104")).not.toBeInTheDocument();
+    const showAllChip = within(audienceBox()).getByText("Show all (+5 more)");
+
+    fireEvent.click(showAllChip);
+    await vi.waitFor(() => expect(within(audienceBox()).getByText("P-104")).toBeInTheDocument());
+    expect(within(audienceBox()).queryByText(/show all/i)).not.toBeInTheDocument();
+
+    fireEvent.click(within(audienceBox()).getByText("Show fewer"));
+    // Collapsing doesn't re-trigger a resolve (every id it still shows was
+    // already fetched as part of the larger "Show all" set), so this
+    // shouldn't need to wait out a loading state -- vi.waitFor here is just
+    // the usual safety margin for a state update to flush, not a real delay.
+    await vi.waitFor(() => expect(within(audienceBox()).getByText("Show all (+5 more)")).toBeInTheDocument());
+    expect(within(audienceBox()).queryByText("P-104")).not.toBeInTheDocument();
+  });
+
+  it("resolves fresh audience keys when switching to a different request with the same resolved-project count", async () => {
+    // Both requests resolve to exactly 2 projects -- a count-only "already
+    // resolved enough" check can't tell these two apart, and would wrongly
+    // keep showing request A's resolved keys for request B.
+    mockGet({ id: "req-1", state: "approved", resolvedProjectIds: ["p-1", "p-2"], resolvedProjectCount: 2 });
+    const { rerender } = render(<AnnouncementRequestDialog requestId="req-1" onClose={vi.fn()} />);
+    const audienceBox = () => screen.getByRole("group", { name: "Audience projects" });
+    await vi.waitFor(() => expect(within(audienceBox()).getByText("P-1")).toBeInTheDocument());
+
+    mockGet({ id: "req-2", state: "approved", resolvedProjectIds: ["q-1", "q-2"], resolvedProjectCount: 2 });
+    rerender(
+      <MemoryRouter>
+        <AnnouncementRequestDialog requestId="req-2" onClose={vi.fn()} />
+      </MemoryRouter>,
+    );
+
+    await vi.waitFor(() => expect(within(audienceBox()).getByText("Q-1")).toBeInTheDocument());
+    expect(within(audienceBox()).queryByText("P-1")).not.toBeInTheDocument();
+  });
+
   it("opens a confirmation popup before calling handlePublish, showing what's about to be sent", async () => {
     mockGet({ state: "approved", resolvedProjectIds: ["p-1"], resolvedProjectCount: 1 });
     const handlePublish = vi.fn();
@@ -561,9 +604,15 @@ describe("AnnouncementRequestDialog — approved", () => {
     render(<AnnouncementRequestDialog requestId="req-1" onClose={vi.fn()} />);
     // Resolved to its real short key ("P-2", per this file's own
     // useAuthApiClient mock returning key: id.toUpperCase()), not the raw
-    // frozen project id — both in the send-progress card's own chip and the
-    // confirmation dialog's list of what's about to be permanently skipped.
-    await vi.waitFor(() => expect(screen.getByText("P-2")).toBeInTheDocument());
+    // frozen project id. Scoped to the Audience box specifically (not just
+    // "P-2" anywhere on screen) -- the send-progress card renders its own
+    // "P-2" chip too, so an unscoped query could pass even if the Audience
+    // box itself fell back to the raw project id.
+    await vi.waitFor(() =>
+      expect(
+        within(screen.getByRole("group", { name: "Audience projects" })).getByText("P-2"),
+      ).toBeInTheDocument(),
+    );
 
     fireEvent.click(screen.getByRole("button", { name: /publish anyway/i }));
     expect(screen.getByText(/publish without the failed projects/i)).toBeInTheDocument();

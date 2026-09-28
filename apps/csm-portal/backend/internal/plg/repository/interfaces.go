@@ -21,7 +21,9 @@ import (
 // ReferenceRepository serves the data that changes only with a migration.
 type ReferenceRepository interface {
 	ListProducts(ctx context.Context) ([]domain.Product, error)
-	ListCSUsers(ctx context.Context) ([]domain.UserRef, error)
+	// ListCSUsers returns the engineers an owner picker may offer. A non-empty
+	// search narrows by name or email; empty is the default first page.
+	ListCSUsers(ctx context.Context, search string) ([]domain.UserRef, error)
 	GetCSUser(ctx context.Context, email string) (*domain.UserRef, error)
 	LifecycleCatalogue(ctx context.Context) (*domain.LifecycleCatalogue, error)
 }

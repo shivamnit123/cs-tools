@@ -224,6 +224,12 @@ type ProjectMembershipWriteService interface {
 	// systems, and a project_contact.invited event. A ConflictError when the
 	// address is already an active contact on the project.
 	Invite(ctx context.Context, projectID string, req domain.CreateProjectMembershipRequest) (domain.ProjectMembership, error)
+	// ValidateInvitation is Invite's dry run: the same checks, in the same
+	// order, against the same project and membership, with nothing written
+	// and nothing published. A refused invitation comes back as a
+	// ProjectMembershipValidation with Valid false; an error means the check
+	// itself could not be made.
+	ValidateInvitation(ctx context.Context, projectID string, req domain.ValidateProjectMembershipRequest) (domain.ProjectMembershipValidation, error)
 	// UpdateRoles replaces the membership's Salesforce roles, and with them
 	// its project groups. The state is untouched.
 	UpdateRoles(ctx context.Context, projectID, email string, req domain.UpdateProjectMembershipRolesRequest) (domain.ProjectMembership, error)
@@ -469,48 +475,9 @@ type ProjectStatsService interface {
 	GetProjectChangeRequestStats(ctx context.Context, projectID string) (domain.ProjectChangeRequestStatsResponse, error)
 }
 
-// ProjectConsumptionService defines the operations on a project's
-// product-consumption provisioning state — the resumable sequence that creates
-// a Choreo application for the project, subscribes it to the tracking API and
-// mints the credentials a deployment's license is built from.
-//
-// The two halves need different things, and neither is gated on DATA_SOURCE —
-// staging and production both run DATA_SOURCE=servicenow and need both.
-//
-//   - GetProjectConsumption and UpdateProjectConsumption read and write the
-//     Postgres mirror, so they need a pool. A pool enables them on either
-//     data source.
-//   - ProcessLicenseDownload needs neither. It reads status from ServiceNow
-//     through the configured Choreo subscription operation and touches
-//     Postgres only to mirror what it did, which is best-effort and skipped
-//     entirely when there is no repository.
-//
-// ServiceNow remains the source of truth for the status itself. There it lives
-// on the customer_project record, reached through the product-consumption
-// scripted REST API that the Choreo subscription operation calls directly —
-// neither this service nor the ServiceNow integration service sits in that
-// path at all.
-//
-// Every method is scoped to the caller (see AccessService): the project id
-// comes from the request path, so a caller who cannot see a project can
-// neither read its provisioning state nor drive provisioning for it.
-type ProjectConsumptionService interface {
-	// GetProjectConsumption returns the project's current provisioning state.
-	// A project that has never entered the flow reports status 1 (pending)
-	// rather than a not-found error; an unknown project ID is not found.
-	GetProjectConsumption(ctx context.Context, projectID string) (domain.ProjectConsumptionView, error)
-	// UpdateProjectConsumption records the completion of one provisioning step.
-	// The status may only move forward; a status that is not ahead of what is
-	// stored returns the stored state unchanged instead of failing.
-	UpdateProjectConsumption(ctx context.Context, projectID string, req domain.UpdateProjectConsumptionRequest) (domain.UpdateProjectConsumptionResponse, error)
-	// ProcessLicenseDownload executes the 5-step resumable provisioning sequence
-	// and issues the signed deployment license.
-	ProcessLicenseDownload(ctx context.Context, projectID, deploymentID, email string) (domain.License, error)
-}
-
 // ProjectContactService defines the operations available on project contacts.
 // The Postgres-backed implementation (projectContactService) reads from
-// project_contact (migration 000022), joined through account_contact to
+// project_contact (migration 0027), joined through account_contact to
 // "user" and through project_contact_group/project_group_role/project_role
 // (migrations 000023-000025) for roles.
 type ProjectContactService interface {
@@ -525,7 +492,7 @@ type ProjectContactService interface {
 
 // AccountContactService defines the operations available on account contacts.
 // The Postgres-backed implementation (accountContactService) reads from the
-// account_contact table (migration 000020), joined against "user" to
+// account_contact table (migration 0026), joined against "user" to
 // resolve a display name/email where possible.
 type AccountContactService interface {
 	// SearchAccountContacts returns a paginated list of contacts associated with
@@ -626,13 +593,18 @@ type DeployedProductService interface {
 	// ValidationError is returned for invalid input. Supported by the
 	// ServiceNow data source only.
 	SearchProjectsByProductVersion(ctx context.Context, req domain.SearchProjectsByProductVersionRequest) (domain.SearchProjectsByProductVersionResponse, error)
-	// CreateDeployedProduct creates a new deployed product in ServiceNow.
-	// Supported by the ServiceNow data source only.
+	// CreateDeployedProduct creates a new deployed product. Supported by the
+	// ServiceNow data source, and by DATA_SOURCE=postgres-servicenow-dual-write
+	// (SN-first, synchronous -- see deployedProductService.createDeployedProductSNFirst).
+	// Not supported by plain DATA_SOURCE=postgres.
 	CreateDeployedProduct(ctx context.Context, req domain.CreateDeployedProductRequest) (domain.CreateDeployedProductResponse, error)
 	// UpdateDeployedProduct updates a deployed product's cores, tps, description, update-level
 	// history, or deactivates it. Either detail fields (which now include Updates, a whole-array
 	// replace of the update-level history) or Active=false must be provided, but not both.
-	// Supported by the ServiceNow data source only.
+	// Supported by the ServiceNow data source, and by
+	// DATA_SOURCE=postgres-servicenow-dual-write (Postgres-first, ServiceNow
+	// mirrored asynchronously afterward). Not supported by plain
+	// DATA_SOURCE=postgres.
 	UpdateDeployedProduct(ctx context.Context, req domain.UpdateDeployedProductRequest) (domain.UpdateDeployedProductResponse, error)
 	// SearchDeployedProductMetrics returns core-count metrics for the deployed product
 	// identified by id, charted over req's date range. A ValidationError is returned for
@@ -656,6 +628,17 @@ type CaseService interface {
 	// caller's AccessScope -- see ProjectService.GetProjectByID's identical
 	// note and CLAUDE.md for the full rule.
 	GetCaseByID(ctx context.Context, id string) (domain.CaseView, error)
+	// ProjectContactEmailsByRole returns the distinct project_contact email
+	// addresses for projectID whose contact currently holds role (a
+	// project_role_enum label, e.g. "SECURITY_CONTACT" or "PORTAL_USER") --
+	// see CaseRepository.ProjectContactEmailsByRole's own doc comment for the
+	// full join. Used by publishCaseCreatedEvent to resolve an announcement
+	// case's recipients. A deployment with no Postgres access at all (a pure
+	// ServiceNow data source with no pgFallback configured) returns an empty
+	// slice and no error -- this schema is Postgres-only, and an announcement
+	// case there simply falls back to the account's default watchers, same
+	// as an empty real result.
+	ProjectContactEmailsByRole(ctx context.Context, projectID, role string) ([]string, error)
 	// SearchCases returns a paginated list of cases filtered by optional project IDs,
 	// deployment IDs, deployed product IDs, state keys, severity keys, and search query.
 	// A ValidationError is returned for invalid input; any other error indicates an
@@ -669,16 +652,33 @@ type CaseService interface {
 	// CreateCaseComment creates a new comment on the case identified by req.CaseID.
 	// A ValidationError is returned for invalid input or constraint violations.
 	CreateCaseComment(ctx context.Context, req domain.CreateCaseCommentRequest) (domain.CreateCaseCommentResponse, error)
+	// CreateCaseCommentAs is CreateCaseComment for a caller that already
+	// knows who is acting (actorEmail) and has no live x-user-id-token to
+	// resolve it from -- see domain.CreateCaseCommentRequest.ActorEmail's
+	// own doc comment. Skips the token-based actor resolution
+	// CreateCaseComment does; everything else is identical.
+	CreateCaseCommentAs(ctx context.Context, req domain.CreateCaseCommentRequest, actorEmail string) (domain.CreateCaseCommentResponse, error)
 	// SearchCaseComments returns a paginated list of comments for the case identified
 	// by req.CaseID. A ValidationError is returned for invalid input.
 	SearchCaseComments(ctx context.Context, req domain.SearchCaseCommentsRequest) (domain.SearchCaseCommentsResponse, error)
-	// UpdateCase updates the state, severity, watch list, assignee, or internal-only
-	// fix-ETA estimate (best-case/most-likely/worst-case) of a case.
+	// UpdateCase updates the state, severity, watch list, assignee, fix-issued mark, or
+	// combinable-field-bundle (subject/description/deployment/deployed product/fix-ETA
+	// estimates/related case/workaround-provided) of a case.
 	// A ValidationError is returned for invalid values or malformed UUID; a NotFoundError if no case matches.
 	// WatchList is supported by both data sources (Postgres via work_item_watcher,
-	// migration 000040) and is mutually exclusive with State/Severity/WorkState.
-	// AssigneeEmail, BestCaseFixEta, MostLikelyFixEta, and WorstCaseFixEta are
-	// only supported for the ServiceNow data source.
+	// migration 0042) and is mutually exclusive with State/Severity/WorkState.
+	// BestCaseFixEta/MostLikelyFixEta/WorstCaseFixEta are supported by both data sources
+	// (Postgres via work_item.best_case_eta/most_likely_eta/worst_case_eta, part of the
+	// combinable-field-bundle CaseRepository.UpdateCaseFields writes); any subset of the
+	// three may be combined with the bundle's other fields in one request, but the bundle
+	// as a whole is mutually exclusive with State/Severity/WorkState/WatchList/
+	// MarkFixIssued/Acknowledge/AssigneeEmail/ParentID.
+	// MarkFixIssued (Postgres/postgres-servicenow-dual-write only) is a true-only,
+	// first-write-wins mark of the case's fix-issued timestamp, mutually exclusive with
+	// every other field on this request.
+	// Acknowledge, AssigneeEmail, and ParentID are each their own exclusive branch,
+	// supported on the Postgres data source (not ServiceNow-only, despite this method's
+	// older doc history saying otherwise).
 	// Transitioning State to closed is rejected with a ValidationError if the case has any
 	// open task that is visible to the customer (the authoritative case-close gate).
 	UpdateCase(ctx context.Context, req domain.UpdateCaseRequest) (domain.UpdateCaseResponse, error)
@@ -808,7 +808,7 @@ type FeedbackService interface {
 
 // CallRequestService defines the operations available on call requests. The
 // Postgres-backed implementation (callRequestService) reads and writes
-// customer_call (migration 000072) -- see call_request_repo.go for the fields
+// customer_call (migration 0073) -- see call_request_repo.go for the fields
 // with no backing column.
 type CallRequestService interface {
 	// CreateCallRequest creates a new call request for the given case.
@@ -831,7 +831,7 @@ type CallRequestService interface {
 
 // ChangeRequestService defines the operations available on the change_requests
 // entity. The Postgres-backed implementation (changeRequestService) reads
-// from change_request (migration 000047), a shared-PK extension of
+// from change_request (migration 0043), a shared-PK extension of
 // work_item -- see that repository's own doc comment for the fields with no
 // real column at all (ServiceID/ServiceOfferingID/ConfigurationItemID/
 // GroupID/AssignedTeamID/Type/ApprovedBy/ApprovedOn/LegalNextStates).
@@ -909,7 +909,7 @@ type ConfigurationItemService interface {
 }
 
 // GroupService defines the operations available on the groups entity. On
-// Postgres this is backed by the team table (migration 000028); Group.Active
+// Postgres this is backed by the team table (migration 0033); Group.Active
 // is always true and Group.Parent always nil there -- see
 // GroupRepository's own doc comment.
 type GroupService interface {
@@ -919,7 +919,7 @@ type GroupService interface {
 
 // ServiceOfferingService defines the operations available on the service
 // offerings entity. On Postgres this is backed by the service_offering
-// table (migration 000049).
+// table (migration 0045).
 type ServiceOfferingService interface {
 	// SearchServiceOfferings returns a paginated list of service offerings filtered by
 	// optional service IDs.
@@ -941,7 +941,7 @@ type ITServiceService interface {
 // "case", "conversation", "change_request", and "incident" -- every work_item
 // subtype the comment table's work_item_id foreign key can point at (see
 // repository.ReferenceTypeToWorkItemType). "deployment" is ServiceNow-only:
-// deployment is its own standalone table (migration 000013), not a work_item
+// deployment is its own standalone table (migration 0018), not a work_item
 // subtype, so a Postgres-backed comment can never reference one.
 type CommentService interface {
 	// SearchComments returns a paginated list of comments for the given reference entity.
@@ -965,7 +965,7 @@ type CommentService interface {
 }
 
 // TaskSlaService defines the operations available on the task-slas entity.
-// On Postgres this is backed by sla/sla_policy (migrations 000051/000052) --
+// On Postgres this is backed by sla/sla_policy (migrations 0047/0048) --
 // see TaskSlaRepository's own doc comment for the fields with no confirmed
 // rendering format that are left nil there.
 type TaskSlaService interface {
@@ -1002,7 +1002,7 @@ type TaskService interface {
 
 // ProductVulnerabilityService defines the operations available on product vulnerabilities.
 // The Postgres-backed implementation (productVulnerabilityService) reads
-// from the product_vulnerability table (migration 000034), which mirrors
+// from the product_vulnerability table (migration 0038), which mirrors
 // ServiceNow's own record 1:1 -- see that migration's own doc comment.
 // SyncProductVulnerabilities is the one method with no Postgres equivalent
 // (see its own doc comment for why).
@@ -1066,6 +1066,9 @@ type IncidentService interface {
 
 	// UpdateIncident partially updates an existing incident. At least one field must be
 	// provided. A NotFoundError is returned if the incident does not exist.
+	// On DATA_SOURCE=postgres-servicenow-dual-write only WorkNotes and AdditionalComments
+	// are supported -- every other field is rejected with a ValidationError (see
+	// incidentService.UpdateIncident's own doc comment for why).
 	UpdateIncident(ctx context.Context, req domain.UpdateIncidentRequest) (domain.UpdateIncidentResponse, error)
 
 	// SearchIncidentActivities returns a paginated activity feed for an incident.
@@ -1167,7 +1170,7 @@ type GlobalService interface {
 
 // EscalationService defines the operations available on the escalations
 // entity. On Postgres, SearchEscalations is backed by case_escalation/
-// case_escalation_notification_list (migration 000053); CreateEscalation
+// case_escalation_notification_list (migration 0054); CreateEscalation
 // requires the ServiceNow data source -- see EscalationRepository's own doc
 // comment for why.
 type EscalationService interface {

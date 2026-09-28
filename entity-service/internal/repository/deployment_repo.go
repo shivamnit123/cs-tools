@@ -32,7 +32,7 @@ import (
 )
 
 // DeploymentRepository defines the persistence operations for the
-// deployment table (migration 000013).
+// deployment table (migration 0018).
 type DeploymentRepository interface {
 	// SearchDeployments returns a filtered, paginated slice of enriched deployment
 	// views together with the total count of matching rows before pagination.
@@ -66,7 +66,7 @@ func (r *deploymentRepo) SearchDeployments(ctx context.Context, req domain.Searc
 	filterArgs := []any{}
 	argIdx := 1
 
-	// deployment.project_id is nullable (migration 000013 sets it NULL when
+	// deployment.project_id is nullable (migration 0018 sets it NULL when
 	// the owning project is deleted). The data query below inner-joins
 	// project and so can never return such a row; without this predicate
 	// the count query would still include it, inflating total relative to
@@ -170,7 +170,7 @@ func (r *deploymentRepo) SearchDeployments(ctx context.Context, req domain.Searc
 			); err != nil {
 				return fmt.Errorf("scan deployment: %w", err)
 			}
-			// deployment.type (migration 000013) has no NOT NULL constraint --
+			// deployment.type (migration 0018) has no NOT NULL constraint --
 			// 38 of 2859 rows are NULL on staging, checked live -- but
 			// DeploymentView.Type is a required (non-pointer) field on the
 			// wire, matching the OpenAPI contract every consumer already

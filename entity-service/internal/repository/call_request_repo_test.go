@@ -31,7 +31,7 @@ import (
 // added, renamed, or misspelled there (e.g. CANCELED vs CANCELLED) fails here
 // rather than at runtime.
 func TestCallRequestStatesMatchMigration(t *testing.T) {
-	sql, err := os.ReadFile("../../migrations/000072_customer_call_table.up.sql")
+	sql, err := os.ReadFile("../../migrations/0073_customer_call_table.sql")
 	if err != nil {
 		t.Fatalf("read migration: %v", err)
 	}

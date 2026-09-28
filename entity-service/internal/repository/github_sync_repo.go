@@ -79,7 +79,7 @@ type GithubSyncRepository interface {
 	//
 	// THIS IS WHAT OPENS GATE 2. Until a case carries an issue number the
 	// outbound triggers enqueue nothing for it, so this single write is what
-	// switches on sync for that case -- see migration 000069.
+	// switches on sync for that case -- see migration 0112.
 	SetCaseGithubIssueNumber(ctx context.Context, caseID string, issueNumber int) (changed bool, err error)
 	// ChangeRequestByGitReference finds the change request linked to an issue.
 	ChangeRequestByGitReference(ctx context.Context, issueURL string) (*GithubChangeRequest, error)

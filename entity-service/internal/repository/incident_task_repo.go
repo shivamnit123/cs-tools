@@ -31,7 +31,7 @@ import (
 )
 
 // IncidentTaskRepository defines the read operations for incident_task
-// (migration 000066), a work_item type extension (id IS work_item.id) --
+// (migration 0066), a work_item type extension (id IS work_item.id) --
 // same shared-PK pattern as "case"/change_request. There is no Postgres
 // write path at all: no CreateIncidentTask/UpdateIncidentTask exists on
 // IncidentTaskService in the first place (it's read-only on every data

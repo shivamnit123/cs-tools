@@ -101,11 +101,10 @@ func run() error {
 	return nil
 }
 
-// buildDSN follows sre-alert-ingestion-service's precedent (see that
-// service's cmd/server/main.go and this repo's docker-compose.yml comment on
-// it): discrete DB_* environment variables, not a single connection-string
-// var, matching entity-service's own DB_HOST/DB_PORT/DB_USER/DB_PASSWORD/
-// DB_NAME/DB_SSLMODE naming since this tool populates that same database.
+// buildDSN uses discrete DB_* environment variables, not a single
+// connection-string var, matching entity-service's own DB_HOST/DB_PORT/
+// DB_USER/DB_PASSWORD/DB_NAME/DB_SSLMODE naming since this tool populates
+// that same database.
 func buildDSN() string {
 	host := envOrDefault("DB_HOST", "postgres")
 	port := envOrDefault("DB_PORT", "5432")

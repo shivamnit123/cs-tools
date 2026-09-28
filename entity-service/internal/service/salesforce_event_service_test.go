@@ -18,6 +18,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -161,6 +162,51 @@ func TestHandleEvent_Deleted(t *testing.T) {
 	}
 	if repo.deleteCalls != 1 || repo.lastDeleteID != "001xx0000001" {
 		t.Errorf("soft-delete calls = %d id = %q", repo.deleteCalls, repo.lastDeleteID)
+	}
+}
+
+// A customer record without its Salesforce id is refused before any write:
+// the id is also the account number, which must be unique and non-empty.
+func TestHandleEvent_CustomerWithoutIDIsRefused(t *testing.T) {
+	se := &stubSalesEntityClient{customer: salesentity.Customer{ID: "  ", Name: sampleStr("Acme")}}
+	repo := &stubSalesforceAccountRepo{}
+	svc := NewSalesforceEventService(repo, se)
+
+	err := svc.HandleEvent(context.Background(), domain.SalesforceEventRequest{
+		EventType: domain.SalesforceEventUpdated, Entity: "Account", ReferenceID: "001xx0000001",
+	})
+	var sue *apierror.ServiceUnavailableError
+	if !errors.As(err, &sue) {
+		t.Fatalf("err = %v, want ServiceUnavailableError", err)
+	}
+	if repo.upsertCalls != 0 {
+		t.Errorf("upsert calls = %d, want 0", repo.upsertCalls)
+	}
+}
+
+// With the account ingest flag off, routes.go passes a nil repository: every
+// Account envelope is acknowledged without a Sales Entity read or a write.
+func TestHandleEvent_AccountIngestDisabledIgnoresAccountEvents(t *testing.T) {
+	se := &stubSalesEntityClient{}
+	svc := NewSalesforceEventService(nil, se)
+
+	for _, eventType := range []string{
+		domain.SalesforceEventCreated,
+		domain.SalesforceEventUpdated,
+		domain.SalesforceEventDeleted,
+		domain.SalesforceEventUndefined,
+	} {
+		t.Run(eventType, func(t *testing.T) {
+			err := svc.HandleEvent(context.Background(), domain.SalesforceEventRequest{
+				EventType: eventType, Entity: "Account", ReferenceID: "001xx0000001",
+			})
+			if err != nil {
+				t.Fatalf("HandleEvent: %v", err)
+			}
+		})
+	}
+	if se.calls != 0 {
+		t.Errorf("GetCustomer calls = %d, want 0", se.calls)
 	}
 }
 

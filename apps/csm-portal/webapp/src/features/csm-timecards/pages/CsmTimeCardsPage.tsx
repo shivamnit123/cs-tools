@@ -58,6 +58,16 @@ function formatDateOnly(date: Date): string {
   const d = String(date.getDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
 }
+
+/** Today's local calendar date, as a local-midnight Date — the upper bound
+ * for both work-date range fields, since a card can't log time in the
+ * future. `workDate` is a plain calendar date with no UTC labeling (unlike
+ * `ChangeRequestsFilterBar`'s "Closed" dates, which the backend interprets
+ * as UTC), so "today" here is the viewer's own local date, not UTC's. */
+function todayDateOnly(): Date {
+  const now = new Date();
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+}
 import {
   useAllTimeCards,
   useApprovalQueue,
@@ -375,13 +385,16 @@ export default function CsmTimeCardsPage(): JSX.Element {
     resetAllPages();
   };
   const handleFilterFromChange = (v: string): void => {
-    setFilterFrom(v);
     // min/max on the date inputs only guide the picker UI — typing a date
-    // directly can still commit an inverted range, so clamp here too.
+    // directly can still commit an inverted or future-dated range, so
+    // clamp/reject here too.
+    if (v && v > formatDateOnly(todayDateOnly())) return;
+    setFilterFrom(v);
     if (filterTo && v > filterTo) setFilterTo(v);
     resetAllPages();
   };
   const handleFilterToChange = (v: string): void => {
+    if (v && v > formatDateOnly(todayDateOnly())) return;
     setFilterTo(v);
     if (filterFrom && v < filterFrom) setFilterFrom(v);
     resetAllPages();
@@ -1156,6 +1169,14 @@ function FilterBar({
 }): JSX.Element {
   const [isFiltersOpen, setIsFiltersOpen] = useState(true);
 
+  // Recomputed every render (not memoized) — a `useMemo(..., [])` would
+  // freeze this at the component's mount date and stop matching "today" for
+  // any session left open past midnight.
+  const today = todayDateOnly();
+  const parsedFilterFrom = parseDateOnly(filterFrom);
+  const parsedFilterTo = parseDateOnly(filterTo);
+  const fromMaxDate = parsedFilterTo && parsedFilterTo < today ? parsedFilterTo : today;
+
   const isStateActive = stateActive ?? !!filterState;
   const activeCount =
     (filterProject.length > 0 ? 1 : 0) +
@@ -1267,8 +1288,8 @@ function FilterBar({
                 <Box sx={{ flex: "1 1 0", minWidth: 160 }}>
                   <DatePicker
                     label="From"
-                    value={parseDateOnly(filterFrom)}
-                    maxDate={parseDateOnly(filterTo) ?? undefined}
+                    value={parsedFilterFrom}
+                    maxDate={fromMaxDate}
                     onChange={(date) =>
                       setFilterFrom(
                         date instanceof Date && !Number.isNaN(date.getTime())
@@ -1285,8 +1306,9 @@ function FilterBar({
                 <Box sx={{ flex: "1 1 0", minWidth: 160 }}>
                   <DatePicker
                     label="To"
-                    value={parseDateOnly(filterTo)}
-                    minDate={parseDateOnly(filterFrom) ?? undefined}
+                    value={parsedFilterTo}
+                    minDate={parsedFilterFrom ?? undefined}
+                    maxDate={today}
                     onChange={(date) =>
                       setFilterTo(
                         date instanceof Date && !Number.isNaN(date.getTime())

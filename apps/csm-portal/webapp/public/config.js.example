@@ -42,6 +42,23 @@ window.config = {
   CSM_PORTAL_THEME: "acrylicOrange",
   CSM_PORTAL_LOG_LEVEL: "ERROR",
 
+  // TEMPORARY / LOCAL DEV ONLY. Bypasses the post-sign-in *authorization*
+  // checks (portal-role gate, per-section capabilities, SPL audience gate)
+  // for an account the real backend hasn't provisioned a portal role for
+  // yet — does NOT touch Asgardeo sign-in itself. See
+  // src/config/authConfig.ts's devBypassAccessCheck. Leave unset/false here
+  // and in any committed config — only set true in your own local,
+  // gitignored config.js.
+  // CSM_PORTAL_DEV_BYPASS_ACCESS_CHECK: true,
+
+  // TEMPORARY / LOCAL DEV ONLY. Forces which of the two independent views
+  // ("cs-abt" or "sales-sa") the app renders — see
+  // src/context/current-user/usePortalView.ts. Leave unset to let it decide
+  // for itself (defaults to "cs-abt" under the bypass above, or the real
+  // Asgardeo-groups check once that flag is off). Leave unset/false here and
+  // in any committed config.
+  // CSM_PORTAL_DEV_VIEW_OVERRIDE: "sales-sa",
+
   // Per-page visibility. Keys are nav-node ids from src/config/csmNavItems.ts:
   // a section id ("operations") or one of its tabs ("operations.incidents").
   // Values:
@@ -101,6 +118,23 @@ window.config = {
   // CSM_PORTAL_MOBILE_APP_ANDROID_STORE_URL: "https://play.google.com/store/apps/details?id=com.example.app",
   // Also show the banner on tablets, not just phones (default false).
   // CSM_PORTAL_MOBILE_APP_INCLUDE_TABLETS: false,
+
+  // SPL (Support Portal Lite) section — ported from the former standalone
+  // apps/support-portal-lite/webapp, now served by this app against the
+  // same CSM_PORTAL_BACKEND_BASE_URL above (its /spl/* routes). Access is
+  // driven entirely by the signed-in user's GET /users/me roles (the
+  // sales_solutions role for the section itself, plus escalator/
+  // attachment_downloader/usage_metrics_viewer for its fine-grained
+  // actions — see AUTH_SALES_SOLUTIONS_ROLES etc. in the backend's own
+  // .env.example) — no separate frontend config needed.
+
+  // Customer-onboarding status column on a project's Contacts tab: per
+  // contact, how far their Customer Portal invitation got (IDENTITY /
+  // DATABASE / EMAIL / REGISTRATION), with the failing step and its last
+  // error on hover. Off by default; only `true` turns it on, and the backend
+  // must have the env var of the same name set to "true" too, or the column
+  // reads "Unavailable". Off means no column and no request.
+  CSM_MIGRATION_ONBOARDING_STATUS_ENABLED: false,
 
   // Project key an announcement's "Send test" dry run creates its one real
   // test case in (mirrors the ServiceNow flow's own hardcoded

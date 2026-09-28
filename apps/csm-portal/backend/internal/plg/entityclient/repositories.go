@@ -3,6 +3,7 @@ package entityclient
 import (
 	"context"
 	"net/url"
+	"strings"
 
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/plg/apierror"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/plg/domain"
@@ -27,7 +28,12 @@ func (c *Client) ListProducts(ctx context.Context) ([]domain.Product, error) {
 }
 
 // ListCSUsers returns the active engineers, for the owner pickers.
-func (c *Client) ListCSUsers(ctx context.Context) ([]domain.UserRef, error) {
+//
+// The page stays at 100 whether or not a search is given. There are ~1,900
+// active internal users, so the unsearched list has always been the first 100
+// by first name — what search adds is a way to reach the rest, not a longer
+// list. A term matching hundreds is still cut at 100; typing more narrows it.
+func (c *Client) ListCSUsers(ctx context.Context, search string) ([]domain.UserRef, error) {
 	active := true
 	var out domain.SearchUsersResponse
 	body := domain.SearchUsersRequest{
@@ -35,7 +41,11 @@ func (c *Client) ListCSUsers(ctx context.Context) ([]domain.UserRef, error) {
 		// every user query to INTERNAL anyway, so this is belt and braces — but
 		// a stale lowercase value here would have been a filter that matched
 		// nothing and an owner picker that was simply empty.
-		Filters:    domain.UserSearchFilters{Active: &active, UserTypes: []string{"INTERNAL"}},
+		Filters: domain.UserSearchFilters{
+			Active:    &active,
+			UserTypes: []string{"INTERNAL"},
+			Search:    strings.TrimSpace(search),
+		},
 		Pagination: domain.Pagination{Limit: 100},
 	}
 	if err := c.post(ctx, "/plg/users/search", body, &out); err != nil {

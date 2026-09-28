@@ -19,19 +19,21 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/auth"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/middleware"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/repository"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/validate"
 )
-
-var uuidRE = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // emailRE matches the Ballerina `Email` constraint used by the Customer Portal
 // backend (`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`).
@@ -55,7 +57,7 @@ func validateEmail(email string) error {
 // validateUUIDs returns a ValidationError if any element of ids is not a valid UUID.
 func validateUUIDs(field string, ids []string) error {
 	for _, id := range ids {
-		if !uuidRE.MatchString(id) {
+		if !validate.IsUUID(id) {
 			return &apierror.ValidationError{Msg: fmt.Sprintf("%s contains invalid UUID: %q", field, id)}
 		}
 	}
@@ -261,7 +263,7 @@ func (s *userService) SearchUsers(ctx context.Context, req domain.SearchUsersReq
 // matching row. See case_service.go's identical pattern for CreateCase /
 // CreateCaseComment.
 //
-// Postgres has role/user_role tables (migrations 000004/000006 -- see
+// Postgres has role/user_role tables (migrations 0008/0010 -- see
 // SearchUsers' roleIds filter, which does query them) and no group-membership
 // table at all. GetMe doesn't resolve either here: Roles is left empty rather
 // than queried, since no caller has asked for it on this path yet, and Groups
@@ -279,6 +281,15 @@ func (s *userService) GetMe(ctx context.Context) (domain.GetUserMeResponse, erro
 	}
 	user, err := s.repo.GetUserByEmail(ctx, email)
 	if err != nil {
+		var nfe *apierror.NotFoundError
+		if errors.As(err, &nfe) {
+			// callerId, not email — see user_repo.go's GetUserByEmail for why
+			// no log line on this path may carry the caller's email address.
+			// UserID is Asgardeo's own stable per-account identifier (the
+			// validated x-user-id-token's "userid" claim), already resolved
+			// into context by auth.Middleware earlier in the chain.
+			slog.WarnContext(ctx, "get me: no user found for caller", "callerId", auth.IdentityFromContext(ctx).UserID)
+		}
 		return domain.GetUserMeResponse{}, err
 	}
 	roles, err := s.repo.GetUserRoles(ctx, user.ID)

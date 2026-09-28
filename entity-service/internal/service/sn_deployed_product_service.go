@@ -167,7 +167,23 @@ type snCreateDeployedProductPayload struct {
 type snCreateDeployedProductResponse struct {
 	Message         string `json:"message"`
 	DeployedProduct struct {
-		ID        string `json:"id"`
+		ID string `json:"id"`
+		// Number is not exposed on the public CreateDeployedProduct response
+		// (domain.CreatedDeployedProduct has no Number field, matching
+		// backend-v2's own mirror struct and deployment's identical
+		// omission -- see snCreateDeploymentResponse's own doc comment) --
+		// it exists on this wire struct only for
+		// createDeployedProductSNFirstDetails' dual-write use: deployed_product.number
+		// is NOT NULL UNIQUE (migration 0019) and Postgres has no generator
+		// for it, the same unresolved problem deployment.number had before
+		// createDeploymentSNFirstDetails. This mirrors deployment's shape
+		// (id/number/createdOn/createdBy) exactly, on the assumption the
+		// Choreo/Ballerina integration service assigns deployed_product a
+		// number the same way it does deployment -- unconfirmed against a
+		// live response since nothing previously needed this field; if wrong,
+		// createDeployedProductSNFirstDetails' own empty-number guard below
+		// fails the request loudly rather than writing a bad row.
+		Number    string `json:"number"`
 		CreatedOn string `json:"createdOn"`
 		CreatedBy string `json:"createdBy"`
 	} `json:"deployedProduct"`
@@ -198,19 +214,24 @@ type snUpdateDeployedProductResponse struct {
 	} `json:"deployedProduct"`
 }
 
-// CreateDeployedProduct implements DeployedProductService for the ServiceNow data source.
-func (s *snDeployedProductService) CreateDeployedProduct(ctx context.Context, req domain.CreateDeployedProductRequest) (domain.CreateDeployedProductResponse, error) {
+// createDeployedProductSN validates req and performs the actual ServiceNow
+// POST /deployed-products call, parsing its response. Shared by
+// CreateDeployedProduct (below, the public ServiceNow-data-source path) and
+// deployedProductService.createDeployedProductSNFirst (dual-write's Postgres
+// insert, which needs Number too -- see snCreateDeployedProductResponse's own
+// doc comment).
+func (s *snDeployedProductService) createDeployedProductSN(ctx context.Context, req domain.CreateDeployedProductRequest) (snCreateDeployedProductResponse, error) {
 	if err := validateUUIDs("projectId", []string{req.ProjectID}); err != nil {
-		return domain.CreateDeployedProductResponse{}, err
+		return snCreateDeployedProductResponse{}, err
 	}
 	if err := validateUUIDs("deploymentId", []string{req.DeploymentID}); err != nil {
-		return domain.CreateDeployedProductResponse{}, err
+		return snCreateDeployedProductResponse{}, err
 	}
 	if err := validateUUIDs("productId", []string{req.ProductID}); err != nil {
-		return domain.CreateDeployedProductResponse{}, err
+		return snCreateDeployedProductResponse{}, err
 	}
 	if err := validateUUIDs("versionId", []string{req.VersionID}); err != nil {
-		return domain.CreateDeployedProductResponse{}, err
+		return snCreateDeployedProductResponse{}, err
 	}
 
 	token := middleware.UserIDTokenFromContext(ctx)
@@ -227,12 +248,21 @@ func (s *snDeployedProductService) CreateDeployedProduct(ctx context.Context, re
 
 	raw, err := s.client.Post(ctx, "/deployed-products", token, payload)
 	if err != nil {
-		return domain.CreateDeployedProductResponse{}, err
+		return snCreateDeployedProductResponse{}, err
 	}
 
 	var snResp snCreateDeployedProductResponse
 	if err := json.Unmarshal(raw, &snResp); err != nil {
-		return domain.CreateDeployedProductResponse{}, fmt.Errorf("sn create deployed product: parse response: %w", err)
+		return snCreateDeployedProductResponse{}, fmt.Errorf("sn create deployed product: parse response: %w", err)
+	}
+	return snResp, nil
+}
+
+// CreateDeployedProduct implements DeployedProductService for the ServiceNow data source.
+func (s *snDeployedProductService) CreateDeployedProduct(ctx context.Context, req domain.CreateDeployedProductRequest) (domain.CreateDeployedProductResponse, error) {
+	snResp, err := s.createDeployedProductSN(ctx, req)
+	if err != nil {
+		return domain.CreateDeployedProductResponse{}, err
 	}
 
 	createdOn, err := time.Parse(snCreatedOnLayout, snResp.DeployedProduct.CreatedOn)
@@ -250,28 +280,37 @@ func (s *snDeployedProductService) CreateDeployedProduct(ctx context.Context, re
 	}, nil
 }
 
+// createDeployedProductSNFirstDetails implements deployedProductSNCreator
+// (see deployed_product_service.go) -- the dual-write CREATE path's entry
+// point into this service, returning the fields Postgres's own insert needs
+// (including Number, which the public CreateDeployedProduct above does not
+// expose) rather than the wire-shaped domain.CreateDeployedProductResponse.
+func (s *snDeployedProductService) createDeployedProductSNFirstDetails(ctx context.Context, req domain.CreateDeployedProductRequest) (id, number, createdBy string, createdOn time.Time, err error) {
+	snResp, err := s.createDeployedProductSN(ctx, req)
+	if err != nil {
+		return "", "", "", time.Time{}, err
+	}
+	createdOn, err = time.Parse(snCreatedOnLayout, snResp.DeployedProduct.CreatedOn)
+	if err != nil {
+		return "", "", "", time.Time{}, fmt.Errorf("sn create deployed product: parse createdOn %q: %w", snResp.DeployedProduct.CreatedOn, err)
+	}
+	// deployed_product.number is NOT NULL UNIQUE on the Postgres side (see
+	// createDeployedProductSNFirst's own doc comment) -- an empty id/number
+	// here would either fail the Postgres insert with an opaque constraint
+	// violation or, worse, succeed with a blank number that later collides
+	// with a real one. Caught here, before it ever reaches the repository.
+	if snResp.DeployedProduct.ID == "" {
+		return "", "", "", time.Time{}, &apierror.ValidationError{Msg: "sn create deployed product: response id is required"}
+	}
+	if snResp.DeployedProduct.Number == "" {
+		return "", "", "", time.Time{}, &apierror.ValidationError{Msg: "sn create deployed product: response number is required"}
+	}
+	return sysidToUUID(snResp.DeployedProduct.ID), snResp.DeployedProduct.Number, snResp.DeployedProduct.CreatedBy, createdOn, nil
+}
+
 // UpdateDeployedProduct implements DeployedProductService for the ServiceNow data source.
 func (s *snDeployedProductService) UpdateDeployedProduct(ctx context.Context, req domain.UpdateDeployedProductRequest) (domain.UpdateDeployedProductResponse, error) {
-	if err := validateUUIDs("id", []string{req.ID}); err != nil {
-		return domain.UpdateDeployedProductResponse{}, err
-	}
-	if req.DeploymentID != nil {
-		if err := validateUUIDs("deploymentId", []string{*req.DeploymentID}); err != nil {
-			return domain.UpdateDeployedProductResponse{}, err
-		}
-	}
-
-	hasDetailFields := req.Cores != nil || req.TPS != nil || len(req.Description) > 0 || req.Updates != nil
-	if !hasDetailFields && req.Active == nil {
-		return domain.UpdateDeployedProductResponse{}, &apierror.ValidationError{Msg: "at least one of cores, tps, or description must be provided, or active must be set to false"}
-	}
-	if req.Active != nil && *req.Active {
-		return domain.UpdateDeployedProductResponse{}, &apierror.ValidationError{Msg: "active can only be set to false"}
-	}
-	if req.Active != nil && hasDetailFields {
-		return domain.UpdateDeployedProductResponse{}, &apierror.ValidationError{Msg: "cores, tps, and description must not be provided when deactivating"}
-	}
-	if err := validateProductUpdates(req.Updates); err != nil {
+	if err := validateUpdateDeployedProductRequest(req); err != nil {
 		return domain.UpdateDeployedProductResponse{}, err
 	}
 

@@ -121,12 +121,12 @@ record.
                           ┌──────────────────┐  ┌───────────┐   ┌───────────────────────┐
                           │ csm-integration-  │  │ Postgres  │   │  Kafka (case-events)   │
                           │ service (M2M API) │  │           │   │  (stands in for Azure  │
-                          └────────▲──────────┘  └───────────┘   │  Event Hub locally)    │
-                                   │                              └────────┬──────┬───────┘
-                    ┌──────────────┴───────────┐                          │      │
-                    │ sre-alert-ingestion-      │                consumed by      consumed by
-                    │ service (external alerts) │                          │      │
-                    └───────────────────────────┘             notification- activity-stream
+                          └───────────────────┘  └───────────┘   │  Event Hub locally)    │
+                                                                  └────────┬──────┬───────┘
+                                                                           │      │
+                                                                  consumed by      consumed by
+                                                                           │      │
+                                                              notification- activity-stream
                                                                 service     services (x2, one
                                                                             per webapp) -> SSE
 ```
@@ -144,12 +144,11 @@ specific identity provider — the platform is IdP-agnostic by design.
 | `apps/customer-portal/webapp` | React | Customer-facing portal UI. Calls customer-portal backend-v2 only. |
 | `apps/customer-portal/backend-v2` | Go | Customer portal's BFF (the current, Postgres-era backend — **not** the legacy Ballerina `apps/customer-portal/backend`, which is a separate, older stack). |
 | `entity-service` | Go | Shared entity service both BFFs talk to. PostgreSQL-backed (`DATA_SOURCE=postgres`) — the platform's system of record. Publishes domain events (`case.created`, `comment.added`, ...) to the event bus. Does not itself validate JWTs; it trusts whatever caller invoked it (the BFFs sit in front of it). |
-| `integrations/csm-integration-service` | Go | M2M-only REST API (accounts/projects/contacts/incidents) for machine callers, e.g. `sre-alert-ingestion-service`. No inbound JWT validation — trust is delegated to the API gateway in every real environment. |
+| `integrations/csm-integration-service` | Go | M2M-only REST API (accounts/projects/contacts/incidents) for machine callers. No inbound JWT validation — trust is delegated to the API gateway in every real environment. |
 | `integrations/csm-notification-service` | Go | Consumes case/incident events from Kafka and turns them into email / Google Chat / voice-call notifications. |
 | `integrations/csm-portal-activity-stream-service` | Go | Consumes the same event stream and re-exposes it as a per-case Server-Sent-Events (SSE) feed for this portal's live activity tab. |
 | `integrations/customer-portal-activity-stream-service` | Go | Same idea, for the customer portal webapp. |
-| `integrations/sre-alert-ingestion-service` | Go | Accepts inbound alerts from external monitoring tools (Site24x7, Grafana, etc.), buffers them in its **own** dedicated Postgres database, and forwards them to `csm-integration-service` to create platform incidents. |
-| PostgreSQL | — | System of record for entity-service, and separately for `sre-alert-ingestion-service`'s alert buffer. |
+| PostgreSQL | — | System of record for entity-service. |
 | Kafka | — | Local stand-in for Azure Event Hub's Kafka-compatible endpoint (production). See below. |
 
 ### Event backbone: Kafka standing in for Azure Event Hub
@@ -183,8 +182,8 @@ is needed.
 ### Prerequisites
 
 - Docker and Docker Compose v2 (`docker compose version`).
-- About 4 GB of free RAM for the stack (Postgres, Kafka, 9 Go services, 2 webapps).
-- Ports free on the host: `3000`, `3001`, `5433`, `8081`–`8087`, `8090`, `8092`, `9095`,
+- About 4 GB of free RAM for the stack (Postgres, Kafka, 8 Go services, 2 webapps).
+- Ports free on the host: `3000`, `3001`, `5433`, `8081`–`8086`, `8090`, `8092`, `9095`,
   `9096`, `9100`, `19094`. If any of these collide with something else you're already
   running, edit the `ports:` mappings in `docker-compose.yml` (only the **host** side,
   left of the `:`, needs to change).
@@ -202,9 +201,9 @@ First run builds every image (a few minutes — mostly Go module downloads and t
 
 1. Starts PostgreSQL and Kafka (KRaft mode).
 2. Generates a throwaway TLS CA + broker certificate (`certgen`).
-3. Applies `entity-service`'s and `sre-alert-ingestion-service`'s raw SQL migrations, and
-   loads dummy seed data — one account, project, deployment, case, comment, and time
-   card — into a fresh `csm_platform` database (`migrate` service; see
+3. Applies `entity-service`'s raw SQL migrations, and loads dummy seed data — one
+   account, project, deployment, case, comment, and time card — into a fresh
+   `csm_platform` database (`migrate` service; see
    `scripts/csm-compose/seed-entity-service.sql`).
 4. Creates the `case-events` / `case-events-dlq` Kafka topics.
 5. Starts every backend, then both webapps.
@@ -225,9 +224,8 @@ Watch progress with `docker compose logs -f`, and check everything is up with
 | csm-notification-service (health only, no UI) | http://localhost:8083/health |
 | csm-portal-activity-stream-service | health `:8085`, SSE `:9095` |
 | customer-portal-activity-stream-service | health `:8086`, SSE `:9096` |
-| sre-alert-ingestion-service | http://localhost:8087 |
 | mock-oidc (discovery, JWKS, token, login) | http://localhost:9100 |
-| Postgres | `localhost:5433` (`postgres` / `devpassword`, databases `csm_platform` and `sre_alerts`) |
+| Postgres | `localhost:5433` (`postgres` / `devpassword`, database `csm_platform`) |
 | Kafka (external listener, SASL_SSL) | `localhost:19094` |
 
 ### Bring it down
@@ -324,26 +322,6 @@ You should see `dispatch: email sending disabled ... not sending` (notification-
 logs a real dispatch decision without needing real email credentials) and `caseevents:
 received case event` from both activity-stream services.
 
-**sre-alert-ingestion-service creates a real row:**
-
-This service authenticates `POST /alerts` itself via HTTP Basic Auth (no gateway in front
-of it locally, matching its real AKS deployment) — the `-u` flag below is required, not
-optional. The dev-only credential (`devuser` / `devpassword`) is set via
-`SRE_ALERT_AUTH_USERS` in `docker-compose.yml`.
-
-```sh
-curl -X POST http://localhost:8087/alerts -H 'Content-Type: application/json' \
-  -u devuser:devpassword -d '{
-  "source": "prometheus", "severity": "critical",
-  "service": "smoke-test", "metricName": "test_metric",
-  "description": "verification"
-}'
-# -> 202 {"alertNumber":"ALT0000001","id":"..."}
-
-docker exec $(docker ps -qf name=csm-platform-postgres-1) \
-  psql -U postgres -d sre_alerts -c "SELECT alert_number, status FROM alert_buffer;"
-```
-
 ### Troubleshooting
 
 - **A container keeps restarting right after `up`**: `docker compose logs <service>`.
@@ -404,13 +382,6 @@ defect in the Docker/compose setup itself.
   steps above route around the six broken ones deliberately (seeding rows directly in
   Postgres, and verifying Kafka/SSE delivery with a directly-published synthetic event
   instead of a real case-creation call).
-- **`sre-alert-ingestion-service`'s delivery to `csm-integration-service` requires an
-  HTTPS endpoint** (`internal/csmclient` refuses non-HTTPS URLs outright). The compose
-  stack runs `csm-integration-service` over plain HTTP, so a buffered alert is created and
-  persisted correctly, but the worker's subsequent delivery attempt to create the
-  downstream incident will retry and fail locally. This is a deliberate security control
-  in that client, not a bug — fully exercising it locally would require fronting
-  `csm-integration-service` with TLS, which the compose stack does not currently set up.
 
 ## Reporting Issues
 

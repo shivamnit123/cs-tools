@@ -27,7 +27,7 @@ import (
 )
 
 // AccountContactRow is the raw shape of one row read from account_contact
-// (migration 000020), joined against "user" to resolve a display name/email
+// (migration 0026), joined against "user" to resolve a display name/email
 // where possible. account_contact has no name/email column of its own --
 // only user_name, a free-text identifying string -- so ResolvedName/
 // ResolvedEmail are nil whenever no "user" row's own user_name matches it

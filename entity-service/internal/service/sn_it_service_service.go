@@ -40,7 +40,11 @@ type snITService struct {
 	Class                 *string           `json:"class"`
 	BusinessCriticality   *snITServiceLabel `json:"businessCriticality"`
 	ServiceClassification *snITServiceLabel `json:"serviceClassification"`
-	SupportGroup          *snITServiceLabel `json:"supportGroup"`
+	// AssignmentGroup maps from the integration service's "supportGroup" wire
+	// field (unchanged here - that response shape belongs to the ServiceNow
+	// integration service, not this repo) into the domain-level
+	// ITService.AssignmentGroup field.
+	AssignmentGroup *snITServiceLabel `json:"supportGroup"`
 }
 
 type snITServiceLabel struct {
@@ -110,10 +114,10 @@ func (s *snITServiceService) SearchITServices(ctx context.Context, req domain.Se
 				item.ServiceClassification = &sc
 			}
 		}
-		if svc.SupportGroup != nil {
-			item.SupportGroup = &domain.EntityRef{
-				ID:   sysidToUUID(svc.SupportGroup.ID),
-				Name: svc.SupportGroup.Label,
+		if svc.AssignmentGroup != nil {
+			item.AssignmentGroup = &domain.EntityRef{
+				ID:   sysidToUUID(svc.AssignmentGroup.ID),
+				Name: svc.AssignmentGroup.Label,
 			}
 		}
 		services = append(services, item)

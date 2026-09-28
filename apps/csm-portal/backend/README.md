@@ -133,7 +133,7 @@ Backs `entity.CustomerEntityClient` (this repo's entity-service; cases, accounts
 
 ### Engineering entity service (optional)
 
-Backs `entity.EngineeringEntityClient.CreateGitIssue` (a separate internal engineering entity service). When `ENGINEERING_ENTITY_BASE_URL` is set, `POST /cases/{id}/github-issues` files the issue through it instead of forwarding to the entity service; unset, that endpoint behaves exactly as before. It uses the same shared OAuth2 credentials above (`OAUTH2_CLIENT_ID`/`_CLIENT_SECRET`/`_TOKEN_URL`) — only its base URL and scopes are its own.
+Backs `entity.EngineeringEntityClient.CreateGitIssue` (a separate internal engineering entity service). When `ENGINEERING_ENTITY_BASE_URL` is set, `POST /cases/{id}/github-issues` files the issue through it instead of forwarding to the entity service; unset, that endpoint behaves exactly as before. It uses the same shared OAuth2 credentials above (`OAUTH2_CLIENT_ID`/`_CLIENT_SECRET`/`_TOKEN_URL`) — only its base URL and scopes are its own. The same configuration also backs its `GET /health/dependencies` check (see [Health](#health) above); unset, that dependency reports `not_configured` there too.
 
 | Variable | Description |
 |---|---|
@@ -141,6 +141,14 @@ Backs `entity.EngineeringEntityClient.CreateGitIssue` (a separate internal engin
 | `ENGINEERING_ENTITY_SCOPES` | Comma-separated OAuth2 scopes (optional) |
 
 On this path the target must be `repoOverride` and must match an entry of `GITHUB_ISSUE_REPO_OPTIONS` (owner/repo, case-insensitive), so the service account can only file in the curated repositories; the catalogue's `owner` is passed as both the GitHub organisation and owner (the engineering service selects its GitHub access token by that organisation name, so it must be one it is configured with). The service's response has no issue URL, so the URL returned to the web app is built as `https://github.com/<owner>/<repo>/issues/<number>`. The title (max 256 characters) and description are sent, with `updateLevel`, `publicIssueUrl` and `hotFixRequired` appended to the body, and the labels are the repo option's `githubLabel`, `issueTypeLabel`, `priorityLevel` (only for `Type/Incident`) and `regression`. `reason` is ignored, since it only steers the entity service's own routing. Unlike the entity service's implementation, this path does **not** write the issue URL back into the case's work notes or tag the case as a regression.
+
+### Customer-onboarding status (optional, off by default)
+
+Backs `GET /projects/{id}/onboarding-steps` — the per-contact onboarding status the CSM Portal's project Contacts tab shows (which of IDENTITY / DATABASE / EMAIL / REGISTRATION succeeded, failed or was skipped for each invited email, with the attempt count and last error). It reads the entity service's onboarding ledger (`POST /onboarding-steps/search`) through the existing `CustomerEntityClient`; no extra URL or credential is needed.
+
+| Variable | Description |
+|---|---|
+| `CSM_MIGRATION_ONBOARDING_STATUS_ENABLED` | Exactly `true` registers the route. Unset, empty or any other value (including `1`, `TRUE`, `yes`) keeps it off: the route is not registered (the path 404s) and nothing else in the backend changes. Stricter than the `strconv.ParseBool` parsing `SFTPGO_*` uses on purpose — every `CSM_MIGRATION_*` flag is a cutover switch |
 
 ### Updates service
 
@@ -155,6 +163,17 @@ On this path the target must be `repoOverride` and must match an entry of `GITHU
 |---|---|
 | `SCIM_BASE_URL` | Base URL of the SCIM operations service |
 | `SCIM_SCOPES` | Comma-separated OAuth2 scopes (optional) |
+
+### csm-notification-service / csm-integration-service (health check only)
+
+Both optional — used only to back `GET /health/dependencies` today (see "Health" under [API Endpoints](#health) above). Unset leaves that dependency reported as `not_configured` rather than failing startup. Uses the shared `OAUTH2_*` credentials above.
+
+| Variable | Description |
+|---|---|
+| `CSM_NOTIFICATION_SERVICE_BASE_URL` | Base URL of `integrations/csm-notification-service`. Optional |
+| `CSM_NOTIFICATION_SERVICE_SCOPES` | Comma-separated OAuth2 scopes (optional) |
+| `CSM_INTEGRATION_SERVICE_BASE_URL` | Base URL of `integrations/csm-integration-service`. Optional |
+| `CSM_INTEGRATION_SERVICE_SCOPES` | Comma-separated OAuth2 scopes (optional) |
 
 ### Notifications — email channel (not yet wired in)
 
@@ -301,7 +320,9 @@ engineer (see `CreateCaseComment`); the role is necessary, not sufficient.
 holding no portal role. It comes from the same guard that authorises the routes, so what the frontend
 is told and what the backend enforces cannot disagree. This is the portal roles only: the entity
 service's own role data is no longer returned. The frontend decides what to show or hide from these
-roles; the backend's `403` is the real gate.
+roles; the backend's `403` is the real gate. `GET /users/{id}` reports the same vocabulary for an
+internal target (see that endpoint's own entry below) — sourced from SCIM instead of a JWT, since
+this endpoint is looking at someone *other* than the caller.
 
 ### Server
 
@@ -320,6 +341,7 @@ backend/
 │   │   ├── doc.go               # Package overview — one config/client pair per entity service
 │   │   ├── customer_client.go   # OAuth2 HTTP client for the customer entity service (this repo's entity-service)
 │   │   ├── customer.go          # CustomerEntityClient operations (cases, accounts, projects, ...)
+│   │   ├── onboarding.go        # CustomerEntityClient.SearchOnboardingSteps — typed onboarding-ledger search
 │   │   └── engineering.go       # EngineeringEntityClient — CreateGitIssue (wired when ENGINEERING_ENTITY_BASE_URL is set)
 │   ├── githubissue/
 │   │   ├── options.go          # RepoOption + ParseRepoOptions (GITHUB_ISSUE_REPO_OPTIONS)
@@ -329,6 +351,10 @@ backend/
 │   ├── updates/
 │   │   ├── client.go           # OAuth2 HTTP client for the updates service
 │   │   └── updates.go          # Updates service operations
+│   ├── csmnotification/
+│   │   └── client.go           # OAuth2 HTTP client for csm-notification-service (health check only)
+│   ├── csmintegration/
+│   │   └── client.go           # OAuth2 HTTP client for csm-integration-service (health check only)
 │   ├── middleware/
 │   │   ├── auth.go             # JWT validation; injects UserInfo into context
 │   │   ├── correlation.go      # X-CSM-Correlation-ID propagation + slog enrichment
@@ -344,15 +370,22 @@ backend/
 │       ├── deployments.go                # HTTP handlers for deployment endpoints
 │       ├── products.go                   # HTTP handlers for product endpoints
 │       ├── projects.go                   # HTTP handlers for project endpoints
+│       ├── onboarding_steps.go           # GET /projects/{id}/onboarding-steps (behind CSM_MIGRATION_ONBOARDING_STATUS_ENABLED)
 │       ├── incidents.go                  # HTTP handlers for incident endpoints (ServiceNow only)
 │       ├── problems.go                   # HTTP handlers for problem endpoints (ServiceNow only)
 │       ├── updates.go                    # HTTP handlers for updates endpoints
+│       ├── health.go                     # GET /health/dependencies — aggregating dependency health check
 │       └── users.go                      # HTTP handlers for user endpoints
 ├── .env                        # Local config (git-ignored)
 └── go.mod
 ```
 
 ## API Endpoints
+
+### Health
+
+- `GET /health` — Liveness probe; always `200`, no dependency calls. Wire this up as the restart/drain-triggering probe
+- `GET /health/dependencies` — Aggregating dependency check: SCIM Service, Updates Service, CSM Notification Service, CSM Integration Service and Engineering Entity Service (each independently optional except SCIM/Updates). This backend's own core entity-service is not checked here. `200` when every checked dependency is `ok`, `503` if any is `down`. Do **not** wire this one up as a liveness/restart probe — see [Configuration](#configuration) and `internal/handler/health.go`'s own doc comment for why the two are kept separate
 
 ### Cases
 
@@ -380,7 +413,7 @@ backend/
 - `GET /users/me` — Get current user profile (`id`, `email`, `firstName`, `lastName`, `timeZone` from entity service; `roles` are the portal roles granted by the caller's token; `phoneNumber` from SCIM)
 - `PATCH /users/me` — Update current user profile (`phoneNumber` via SCIM, `timeZone` via entity service)
 - `POST /users/search` — Search users; optional `filters` (`searchQuery`, `roles`, `userNames`, `emails`, `active`) and `sortBy` (`field`, `order`); response shape depends on data source (`User` for postgres, `SNUser` for ServiceNow)
-- `GET /users/{id}` — Get one user's full profile (ServiceNow data source only); adds `teams` (derived from `groups`) and, for external contacts only, `externalAccount` (`exists`/`locked`, from SCIM's "external" org search). Both are best-effort — absent rather than failing the request if their lookup fails
+- `GET /users/{id}` — Get one user's full profile (both data sources); adds `teams` (derived from `groups`) and, for external contacts only, `externalAccount` (`exists`/`locked`, from SCIM's "external" org search). For an internal (WSO2 staff) target, `roles` is replaced with the same portal-role vocabulary `GET /users/me` reports (`viewer`/`escalator`/.../`admin`), sourced from that user's own SCIM role assignment (filtered to this portal's `app-csm-*` roles) rather than entity-service's own role data — entity-service's `roles` is left as-is for an external contact, a genuinely different vocabulary. All three enrichments (teams, externalAccount, roles) are best-effort — absent/unchanged rather than failing the request if their lookup fails
 - `POST /users` — Create a new user (`firstName`, `lastName`, `email` required to have at least one of firstName/lastName; optional `roles`, validated against the configured role allow-list). **Admin-only** (`admin` permission — see "Access control" above); Postgres data source only
 
 ### Accounts
@@ -392,6 +425,7 @@ backend/
 
 - `GET /projects/{id}` — Get project by ID
 - `POST /projects/search` — Search projects
+- `GET /projects/{id}/onboarding-steps` — Customer-onboarding steps of the project's contacts, grouped per membership (invited email) in flow order; only registered when `CSM_MIGRATION_ONBOARDING_STATUS_ENABLED=true` (see Configuration)
 
 ### Products
 

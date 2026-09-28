@@ -98,6 +98,12 @@ export interface BackendApi {
   ): Promise<TResponse>;
   patch<TRequest, TResponse>(path: string, body: TRequest): Promise<TResponse>;
   delete(path: string, body?: unknown): Promise<void>;
+  /**
+   * Authenticated PUT. Added for the /spl/customer-health/* endpoints
+   * (risk close, action-item status/update) — the only current callers of
+   * a full-replace verb in this app; every other mutation here uses PATCH
+   * or POST.
+   */
   put<TRequest, TResponse>(path: string, body: TRequest): Promise<TResponse>;
   postEmpty<TResponse>(path: string): Promise<TResponse>;
   /** Authenticated DELETE. Returns the parsed JSON body (`null` on 204). */

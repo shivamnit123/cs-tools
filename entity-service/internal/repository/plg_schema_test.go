@@ -114,18 +114,26 @@ func swapDatabase(url, name string) string {
 	return url
 }
 
-// applyMigrations runs the .up.sql files in order — the same files
-// create-database.sh applies, read from disk rather than copied here, so a
-// schema change cannot pass these tests without being in the migration.
+// applyMigrations runs the migrations/*.sql files in order, read from disk
+// rather than copied here, so a schema change cannot pass these tests without
+// being in the migration.
 func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
-	files, err := filepath.Glob(filepath.Join("..", "..", "migrations", "*.up.sql"))
+	files, err := filepath.Glob(filepath.Join("..", "..", "migrations", "*.sql"))
 	if err != nil {
 		return err
 	}
 	if len(files) == 0 {
 		return errors.New("no migrations found — has the directory moved?")
 	}
-	for _, f := range files { // Glob returns them sorted, and the names are ordered
+	// No migration file references this table (see CLAUDE.md's "Database
+	// migrations" section: `make migrate` tracks each file externally, in a
+	// separate statement after that file's own statements succeed) — created
+	// here anyway, unconditionally, purely so this test's schema matches what
+	// a real `make migrate` run leaves behind.
+	if _, err := pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS csm_migration_applied_migration (filename TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())`); err != nil {
+		return fmt.Errorf("csm_migration_applied_migration: %w", err)
+	}
+	for _, f := range files { // Glob returns them sorted, and the 4-digit names are ordered
 		sql, err := os.ReadFile(f)
 		if err != nil {
 			return err
@@ -594,7 +602,7 @@ func TestUserSearchIgnoresAnAttemptToWidenTheType(t *testing.T) {
 //     csm-portal expects its application to supply all three.
 //
 //  2. `user_type` CANNOT BE WRITTEN. A trigger installed by
-//     000007_users_add_user_type recomputes it from role membership on every
+//     0011_users_add_user_type recomputes it from role membership on every
 //     insert, so a value passed here is silently replaced by NOT_AVAILABLE.
 //     The only way to make a user INTERNAL is to give them a role named
 //     `internal` or `admin` — which is what this does, and what any real

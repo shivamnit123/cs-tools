@@ -34,17 +34,17 @@ import (
 // write to:
 //   - EndDateClosureState/InvoiceDueDateClosureState/
 //     ComplianceViolationClosureState -- project table columns of the same
-//     name (migration 000009).
+//     name (migration 0014).
 //   - HasAgent/HasKbReferences -- the linked account's
 //     ai_gen_response_enabled/smart_knowledge_base_suggestions_enabled
-//     columns (migration 000008), the same mapping
+//     columns (migration 0012), the same mapping
 //     ProjectRepository.GetProjectByID already reads from (see that file's
 //     own doc comment for why the name doesn't match).
 //
 // SuspensionProcessState has no Postgres column anywhere for project:
 // confirmed against every migration file and cross-checked against a live
 // local dev schema on 2026-09-24. account.suspension_process_state
-// (migration 000015) is a same-named but unrelated column for the
+// (migration 0020) is a same-named but unrelated column for the
 // account's own ACP suspension flow, not project's (ServiceNow's project
 // suspensionProcessState is a project-level field there, per
 // sn_project_service.go). A request naming it is rejected with a

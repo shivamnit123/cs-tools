@@ -37,6 +37,38 @@ paths:
         "200":
           description: Ok
 
+  /health/dependencies:
+    get:
+      summary: >-
+        Aggregating dependency health check. Distinct from GET /health (a pure
+        liveness probe): this checks SCIM Service, Updates Service, CSM
+        Notification Service, CSM Integration Service and Engineering Entity
+        Service (each optional except SCIM/Updates). This backend's own core
+        entity-service is not checked here. Do not wire this up as the
+        liveness/restart probe — a downstream blip here must not restart or
+        drain an otherwise-healthy instance.
+      operationId: getHealthDependencies
+      security: []
+      responses:
+        "200":
+          description: Every checked dependency is healthy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthDependenciesResponse'
+        "503":
+          description: At least one dependency is down.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthDependenciesResponse'
+        "403":
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
   /cases:
     post:
       summary: Create a new case.
@@ -1676,8 +1708,12 @@ paths:
       description: >
         Returns the user row plus every group they belong to, the subset of those that are
         teams, and for external contacts their per-project access with the reason access is
-        or is not granted. ServiceNow data source only. A deactivated user is still
-        returned — that state is usually the answer the caller is looking for.
+        or is not granted. Available on both data sources. A deactivated user is still
+        returned — that state is usually the answer the caller is looking for. For an
+        internal (WSO2 staff) target, `roles` is replaced with the same portal-role
+        vocabulary `GET /users/me` reports (sourced from that user's own SCIM role
+        assignment, not entity-service's own role data); an external contact's `roles`
+        is left as entity-service returned it.
       operationId: getUserById
       parameters:
         - name: id
@@ -3388,6 +3424,67 @@ paths:
                 $ref: '#/components/schemas/ErrorPayload'
         "413":
           description: RequestEntityTooLarge
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /projects/{id}/onboarding-steps:
+    get:
+      summary: Customer-onboarding status of a project's contacts.
+      description: >
+        The recorded onboarding steps of every membership (Salesforce
+        Project_Contact__c — one invited email on this project), grouped per
+        membership with the steps in flow order (IDENTITY, DATABASE, EMAIL,
+        REGISTRATION). Backed by the entity service's onboarding ledger
+        (`POST /onboarding-steps/search` filtered to this project), paged
+        through server-side; `truncated` is true if the ledger held more
+        pages than the server was willing to walk. A project with no recorded
+        steps returns an empty list. Only registered when the
+        `CSM_MIGRATION_ONBOARDING_STATUS_ENABLED` feature flag is exactly
+        `true` — otherwise the path is unknown to the server and 404s.
+      operationId: getProjectsIdOnboardingSteps
+      parameters:
+        - name: id
+          in: path
+          description: UUID of the project.
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectOnboardingStepsResponse'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: NotFound
           content:
             application/json:
               schema:
@@ -7906,8 +8003,26 @@ paths:
   /plg/cs-users:
     get:
       summary: PLG CS engineers, for the owner pickers.
-      description: "Active internal staff only. Customers and partner contacts share the `user` table and are never returned."
+      description: >-
+        Active internal staff only. Customers and partner contacts share the
+        `user` table and are never returned.
+
+
+        Returns at most 100 engineers, ordered by first name. There are far more
+        than that, so `search` is how the rest are reached — without it the
+        answer is always the same first page.
       operationId: plgListCSUsers
+      parameters:
+        - name: search
+          in: query
+          required: false
+          description: >-
+            Matches a fragment of the engineer's name or email address,
+            case-insensitively. Omitted or blank returns the default first page.
+            A term matching more than 100 is still cut at 100.
+          schema:
+            type: string
+          example: ayesha
       responses:
         "200":
           description: Assignable engineers.
@@ -9083,6 +9198,32 @@ components:
       properties:
         message:
           type: string
+
+    HealthDependenciesResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        dependencies:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+                enum: [SCIM Service, Updates Service, CSM Notification Service, CSM Integration Service, Engineering Entity Service]
+              status:
+                type: string
+                description: >-
+                  "down" only ever means a real check failed; "not_configured"
+                  means this deployment has no base URL for that dependency
+                  (SCIM/Updates are always configured, so only see "ok"/"down").
+                  No failure detail is included — this endpoint is
+                  unauthenticated and public. This backend's own core
+                  entity-service is never listed here — see this path's own
+                  summary for why.
+                enum: [ok, down, not_configured]
 
     PatchChangeRequestPayload:
       type: object
@@ -12267,6 +12408,91 @@ components:
         total:
           type: integer
           description: Total number of matching contacts
+
+    ProjectOnboardingStep:
+      type: object
+      description: >
+        The latest recorded outcome of one onboarding step for one membership,
+        exactly as the entity service's ledger holds it — nothing is derived
+        here.
+      required: [step, status, attemptCount, eventType, eventModifiedOn, updatedOn]
+      properties:
+        step:
+          type: string
+          enum: [IDENTITY, DATABASE, EMAIL, REGISTRATION]
+          description: >
+            DATABASE is the csm-platform write done by the Salesforce membership
+            ingest; IDENTITY the Asgardeo user provisioned via the SCIM service;
+            EMAIL the invitation email; REGISTRATION the member's first sign-in.
+        status:
+          type: string
+          enum: [SUCCEEDED, FAILED, SKIPPED]
+          description: SKIPPED marks a step that does not apply (e.g. IDENTITY and EMAIL for an integration user).
+        attemptCount:
+          type: integer
+          description: How many times this step has been recorded for the membership; 1 on first write.
+        lastError:
+          type: string
+          nullable: true
+          description: >
+            The error of the most recent FAILED write, null once the step
+            succeeds. Upstream error text — render as plain text.
+        eventType:
+          type: string
+          description: The Salesforce event type (CREATED, UPDATED, RESTORED, ...) or caller-defined trigger that produced this write.
+        eventModifiedOn:
+          type: string
+          format: date-time
+        updatedOn:
+          type: string
+          format: date-time
+
+    ProjectOnboardingMembership:
+      type: object
+      description: >
+        Every recorded onboarding step of one Salesforce Project_Contact__c
+        membership (one invited email on this project), in flow order. Match
+        to a project contact row by lower-cased `email`.
+      required: [membershipSfId, email, steps]
+      properties:
+        membershipSfId:
+          type: string
+          description: Salesforce Project_Contact__c Id.
+        contactSfId:
+          type: string
+          nullable: true
+          description: Salesforce Contact Id of the member, when recorded.
+        email:
+          type: string
+          description: The invited email, lower-cased.
+        projectContactId:
+          type: string
+          format: uuid
+          nullable: true
+          description: csm-platform project_contact row, set once DATABASE succeeded.
+        steps:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProjectOnboardingStep'
+
+    ProjectOnboardingStepsResponse:
+      type: object
+      required: [memberships, total, truncated]
+      properties:
+        memberships:
+          type: array
+          description: Ordered by email, then membership id.
+          items:
+            $ref: '#/components/schemas/ProjectOnboardingMembership'
+        total:
+          type: integer
+          description: Number of memberships returned (not of step rows).
+        truncated:
+          type: boolean
+          description: >
+            True when the project's ledger had more step rows than the server
+            walks (40 upstream pages of 50 rows), so some memberships may be
+            missing or incomplete.
 
     ProjectClosureFields:
       type: object

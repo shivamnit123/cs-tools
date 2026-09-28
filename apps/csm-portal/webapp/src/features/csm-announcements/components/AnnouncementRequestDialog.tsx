@@ -14,13 +14,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { useEffect, useMemo, useState, type JSX, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type JSX, type ReactNode } from "react";
 import {
   AdapterDateFns,
   Box,
   Button,
   Checkbox,
   Chip,
+  CircularProgress,
   DatePickers,
   Dialog,
   DialogActions,
@@ -188,20 +189,76 @@ export default function AnnouncementRequestDialog({
   const failedProjectLabel = (projectId: string): string =>
     failedProjectsPreview.projects.find((p) => p.id === projectId)?.key ?? projectId;
 
-  // Resolves the frozen resolvedProjectIds snapshot to real short keys for
-  // the Audience box below -- otherwise shown as raw, meaningless UUIDs to
-  // whoever's reviewing/approving the request. Same resolve-on-change
-  // pattern as failedProjectsPreview above; any id that fails to resolve (a
-  // fetch error, or past the 200-project preview cap) just falls back to its
-  // raw id rather than blocking the rest of the list.
+  // Caps how many audience projects get resolved and shown as chips below,
+  // by default. A large "All customer projects" send can resolve into well
+  // over a thousand ids, and dumping all of them into one review box is
+  // unreadable regardless of whether each one shows a real key or a raw id.
+  // showFullAudience is an explicit opt-in (a "Show all" click, never
+  // automatic) past this default -- an approver reviewing a large send has
+  // no way to inspect who's actually in it beyond the default cap
+  // otherwise, even though Publish still targets the complete frozen
+  // audience regardless of what this box displays.
+  const AUDIENCE_DISPLAY_CAP = 100;
+  const [showFullAudience, setShowFullAudience] = useState(false);
+  // Reset showFullAudience *during render* when request?.id changes, not in
+  // a useEffect -- an effect-based reset still commits one render late: the
+  // very first render for a new request would compute
+  // visibleAudienceProjectIds from the *previous* request's leftover
+  // showFullAudience=true before the reset effect gets a chance to run,
+  // potentially kicking off a full-audience resolve for the wrong request.
+  // This is React's own documented pattern for adjusting state in response
+  // to a prop change without an effect (bail out and re-render immediately,
+  // never committing the stale value).
+  const [showFullAudienceForRequestId, setShowFullAudienceForRequestId] = useState(request?.id);
+  if (showFullAudienceForRequestId !== request?.id) {
+    setShowFullAudienceForRequestId(request?.id);
+    setShowFullAudience(false);
+  }
+  const visibleAudienceProjectIds = showFullAudience
+    ? (request?.resolvedProjectIds ?? [])
+    : (request?.resolvedProjectIds?.slice(0, AUDIENCE_DISPLAY_CAP) ?? []);
+  const hiddenAudienceProjectCount = Math.max(
+    (request?.resolvedProjectIds?.length ?? 0) - visibleAudienceProjectIds.length,
+    0,
+  );
+
+  // Resolves the visible slice above to real short keys -- otherwise shown
+  // as raw, meaningless UUIDs to whoever's reviewing/approving the request.
+  // Same resolve-on-change pattern as failedProjectsPreview above; any id
+  // that fails to resolve (a fetch error) just falls back to its raw id
+  // rather than blocking the rest of the list. maxProjects is passed
+  // explicitly as however many are actually visible right now (100, or
+  // every one of them once showFullAudience is set) -- resolving anything
+  // beyond what's displayed would just be wasted round trips.
+  //
+  // Only skips resolving when collapsing back within the *same* request
+  // (fewer ids than what's already been resolved for it) -- switching to a
+  // different request always resolves fresh, even if it happens to have the
+  // same resolved-project count as the last one (comparing count alone,
+  // ignoring which request it belongs to, would wrongly keep showing the
+  // previous request's resolved keys). Collapsing via "Show fewer" skips
+  // re-resolving because every id it still shows was already fetched as
+  // part of the larger set -- audiencePreview.resolve replaces its result
+  // wholesale rather than remembering earlier calls, so without this guard
+  // "Show fewer" would re-fetch the first 100 projects from scratch,
+  // flashing back to "Resolving project names…" for data already in hand.
   const audiencePreview = useResolvedAudiencePreview();
-  const resolvedProjectIdsKey = request?.resolvedProjectIds?.join(",") ?? "";
+  const visibleAudienceProjectIdsKey = visibleAudienceProjectIds.join(",");
+  const lastAudienceResolve = useRef<{ requestId: string | undefined; count: number }>({
+    requestId: undefined,
+    count: 0,
+  });
   useEffect(() => {
-    if (request?.resolvedProjectIds && request.resolvedProjectIds.length > 0) {
-      void audiencePreview.resolve(request.resolvedProjectIds);
+    const isSameRequest = lastAudienceResolve.current.requestId === request?.id;
+    const needsResolve =
+      visibleAudienceProjectIds.length > 0 &&
+      (!isSameRequest || visibleAudienceProjectIds.length > lastAudienceResolve.current.count);
+    if (needsResolve) {
+      lastAudienceResolve.current = { requestId: request?.id, count: visibleAudienceProjectIds.length };
+      void audiencePreview.resolve(visibleAudienceProjectIds, visibleAudienceProjectIds.length);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [resolvedProjectIdsKey]);
+  }, [visibleAudienceProjectIdsKey, request?.id]);
   const audienceProjectLabel = (projectId: string): string =>
     audiencePreview.projects.find((p) => p.id === projectId)?.key ?? projectId;
 
@@ -587,24 +644,56 @@ export default function AnnouncementRequestDialog({
 
             {request.resolvedProjectIds && request.resolvedProjectIds.length > 0 && (
               <Box
+                role="group"
+                aria-label="Audience projects"
                 sx={{
                   border: 1,
                   borderColor: "divider",
                   borderRadius: 1,
-                  maxHeight: 120,
+                  maxHeight: 220,
                   overflowY: "auto",
-                  p: 1,
+                  p: 1.5,
                 }}
               >
-                <Typography
-                  variant="caption"
-                  color="text.secondary"
-                  sx={{ fontFamily: "monospace", whiteSpace: "pre-wrap" }}
-                >
-                  {audiencePreview.isLoading
-                    ? "Resolving project names…"
-                    : request.resolvedProjectIds.map(audienceProjectLabel).join(", ")}
-                </Typography>
+                {audiencePreview.isLoading ? (
+                  <Box role="status" aria-live="polite" sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+                    <CircularProgress size={14} />
+                    <Typography variant="body2" color="text.secondary">
+                      {showFullAudience
+                        ? `Resolving all ${visibleAudienceProjectIds.length} projects — this can take a moment for a large audience…`
+                        : "Resolving project names…"}
+                    </Typography>
+                  </Box>
+                ) : (
+                  <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.75 }}>
+                    {visibleAudienceProjectIds.map((projectId) => (
+                      <Chip
+                        key={projectId}
+                        label={audienceProjectLabel(projectId)}
+                        size="small"
+                        variant="outlined"
+                      />
+                    ))}
+                    {hiddenAudienceProjectCount > 0 && (
+                      <Chip
+                        label={`Show all (+${hiddenAudienceProjectCount} more)`}
+                        size="small"
+                        variant="outlined"
+                        color="default"
+                        onClick={() => setShowFullAudience(true)}
+                      />
+                    )}
+                    {showFullAudience && visibleAudienceProjectIds.length > AUDIENCE_DISPLAY_CAP && (
+                      <Chip
+                        label="Show fewer"
+                        size="small"
+                        variant="outlined"
+                        color="default"
+                        onClick={() => setShowFullAudience(false)}
+                      />
+                    )}
+                  </Box>
+                )}
               </Box>
             )}
 

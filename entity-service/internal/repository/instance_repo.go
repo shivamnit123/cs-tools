@@ -29,7 +29,7 @@ import (
 
 // InstanceRepository defines the persistence operations for the "instance"
 // concept -- a single running deployment node, backed by deployment_node
-// (migration 000054) and its satellite facts tables (deployment_information,
+// (migration 0054) and its satellite facts tables (deployment_information,
 // hourly_usage_summary, daily_usage_summary). See instanceRefJoins' own doc comment
 // for the caveats around resolving an instance's project/deployment/
 // deployed-product references.
@@ -95,6 +95,13 @@ func NewInstanceRepository(db *pgxpool.Pool) InstanceRepository {
 // Verified against staging's 16 nodes: 14 resolve to a project and 11 to a
 // deployment (each within the node's own project), and none resolves to a
 // deployment of another project.
+//
+// project_key/deployment_number are staging's real (sync-built) column
+// names -- migration 0054 (post-restructure) creates deployment_node under
+// these same names directly, rather than the stale subscription_key/
+// deployment_ref its pre-restructure version used, so a database built
+// purely from migrations/, applied in order, can run this query too. See
+// CLAUDE.md's "Staging schema drift".
 const instanceRefJoins = `
 	LEFT JOIN product_version pv ON pv.id = dn.product_version_id
 	LEFT JOIN product p ON p.id = pv.product_id
@@ -541,7 +548,7 @@ func (r *instanceRepo) SearchInstanceUsageStats(ctx context.Context, filters dom
 
 	query := fmt.Sprintf(
 		// daily_usage_summary.usage_type was renamed to count_type after
-		// this was first written (migration 000054 was edited in place
+		// this was first written (migration 0054 was edited in place
 		// post-merge) -- matching hourly_usage_summary.count_type's own column name
 		// for the same open-ended count-type concept.
 		`SELECT dus.summary_date, dn.id, dus.count_type, SUM(dus.value)

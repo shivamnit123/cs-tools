@@ -1,0 +1,40 @@
+/**
+ * Copyright (c) 2026 WSO2 LLC. (https://www.wso2.com).
+ *
+ * WSO2 LLC. licenses this file to you under the Apache License,
+ * Version 2.0 (the "License"); you may not use this file except
+ * in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+import { createContext, useContext } from "react";
+import { teamColour } from "./rotaHues";
+
+/**
+ * A team's colour, by its position in the list the catalogue serves.
+ *
+ * A context rather than a prop because the colour is wanted deep inside these
+ * cards -- a name row, an off-rota stack, a team split -- and threading a
+ * lookup through every one of them would be a lot of plumbing for a value
+ * that does not change while the page is open.
+ *
+ * Defaults to a neutral for every team, so a card rendered outside the
+ * provider draws in grey rather than throwing.
+ */
+export const TeamColourContext = createContext<(teamKey: string) => string>(() =>
+  teamColour(undefined),
+);
+
+/** The colour for a team, from whatever list the page was given. */
+export function useTeamColour(): (teamKey: string) => string {
+  return useContext(TeamColourContext);
+}

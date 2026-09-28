@@ -142,70 +142,81 @@ func boolOrFalse(b *bool) bool {
 // accountRowCommonFields maps the fields shared between the search view and
 // the account detail response. SupportTier and ArrToday are not available
 // in the Postgres schema and are always nil.
-func accountRowCommonFields(row repository.AccountRow) (classification string, technicalOwner, accountManager, renewalAccountManager *domain.PersonRef, creTeam, sreTeam *domain.EntityRef) {
+func accountRowCommonFields(row repository.AccountRow) (classification string, technicalOwner, accountManager, renewalAccountManager, customerSuccessManager *domain.PersonRef, creTeam, sreTeam *domain.EntityRef) {
 	if row.Classification != nil {
 		classification = *row.Classification
 	}
 	technicalOwner = accountPersonRef(row.TechnicalOwnerID, row.TechnicalOwnerName, row.TechnicalOwnerEmail)
 	accountManager = accountPersonRef(row.AccountManagerID, row.AccountManagerName, row.AccountManagerEmail)
 	renewalAccountManager = accountPersonRef(row.RenewalAccountManagerID, row.RenewalAccountManagerName, row.RenewalAccountManagerEmail)
+	customerSuccessManager = accountPersonRef(row.CustomerSuccessManagerID, row.CustomerSuccessManagerName, row.CustomerSuccessManagerEmail)
 	creTeam = accountTeamRef(row.CreTeamID, row.CreTeamName)
 	sreTeam = accountTeamRef(row.SreTeamID, row.SreTeamName)
 	return
 }
 
 func accountRowToView(row repository.AccountRow) domain.AccountView {
-	classification, technicalOwner, accountManager, renewalAccountManager, creTeam, sreTeam := accountRowCommonFields(row)
+	classification, technicalOwner, accountManager, renewalAccountManager, customerSuccessManager, creTeam, sreTeam := accountRowCommonFields(row)
 	createdBy := row.CreatedBy
 
 	return domain.AccountView{
-		ID:                    row.ID,
-		Name:                  row.Name,
-		Classification:        classification,
-		Pod:                   row.Pod,
-		SfID:                  row.SfID,
-		Region:                row.Region,
-		SupportTier:           nil,
-		ArrToday:              nil,
-		TechnicalOwner:        technicalOwner,
-		AccountManager:        accountManager,
-		RenewalAccountManager: renewalAccountManager,
-		CreTeam:               creTeam,
-		SreTeam:               sreTeam,
-		ActivationDate:        dateOnlyOrNil(row.ActivationDate),
-		DeactivationDate:      dateOnlyOrNil(row.DeactivationDate),
-		HasAgent:              boolOrFalse(row.HasAgent),
-		HasKbReferences:       boolOrFalse(row.HasKbReferences),
-		CreatedOn:             row.CreatedOn.Format(time.RFC3339),
-		CreatedBy:             &createdBy,
-		UpdatedOn:             row.UpdatedOn.Format(time.RFC3339),
+		ID:                     row.ID,
+		Name:                   row.Name,
+		Number:                 row.Number,
+		Classification:         classification,
+		Pod:                    row.Pod,
+		SfID:                   row.SfID,
+		Region:                 row.Region,
+		Country:                row.Country,
+		City:                   row.City,
+		DriveLocation:          row.DriveLocation,
+		SupportTier:            nil,
+		ArrToday:               nil,
+		TechnicalOwner:         technicalOwner,
+		AccountManager:         accountManager,
+		RenewalAccountManager:  renewalAccountManager,
+		CustomerSuccessManager: customerSuccessManager,
+		CreTeam:                creTeam,
+		SreTeam:                sreTeam,
+		ActivationDate:         dateOnlyOrNil(row.ActivationDate),
+		DeactivationDate:       dateOnlyOrNil(row.DeactivationDate),
+		HasAgent:               boolOrFalse(row.HasAgent),
+		HasKbReferences:        boolOrFalse(row.HasKbReferences),
+		CreatedOn:              row.CreatedOn.Format(time.RFC3339),
+		CreatedBy:              &createdBy,
+		UpdatedOn:              row.UpdatedOn.Format(time.RFC3339),
 	}
 }
 
 func accountRowToDetail(row repository.AccountRow) domain.AccountDetail {
-	classification, technicalOwner, accountManager, renewalAccountManager, creTeam, sreTeam := accountRowCommonFields(row)
+	classification, technicalOwner, accountManager, renewalAccountManager, customerSuccessManager, creTeam, sreTeam := accountRowCommonFields(row)
 	createdBy := row.CreatedBy
 
 	return domain.AccountDetail{
-		ID:                    row.ID,
-		Name:                  row.Name,
-		Classification:        classification,
-		Pod:                   row.Pod,
-		SfID:                  row.SfID,
-		Region:                row.Region,
-		SupportTier:           nil,
-		ArrToday:              nil,
-		TechnicalOwner:        technicalOwner,
-		AccountManager:        accountManager,
-		RenewalAccountManager: renewalAccountManager,
-		CreTeam:               creTeam,
-		SreTeam:               sreTeam,
-		ActivationDate:        dateOnlyOrNil(row.ActivationDate),
-		DeactivationDate:      dateOnlyOrNil(row.DeactivationDate),
-		HasAgent:              boolOrFalse(row.HasAgent),
-		HasKbReferences:       boolOrFalse(row.HasKbReferences),
-		CreatedOn:             row.CreatedOn.Format(time.RFC3339),
-		CreatedBy:             &createdBy,
-		UpdatedOn:             row.UpdatedOn.Format(time.RFC3339),
+		ID:                     row.ID,
+		Name:                   row.Name,
+		Number:                 row.Number,
+		Classification:         classification,
+		Pod:                    row.Pod,
+		SfID:                   row.SfID,
+		Region:                 row.Region,
+		Country:                row.Country,
+		City:                   row.City,
+		DriveLocation:          row.DriveLocation,
+		SupportTier:            nil,
+		ArrToday:               nil,
+		TechnicalOwner:         technicalOwner,
+		AccountManager:         accountManager,
+		RenewalAccountManager:  renewalAccountManager,
+		CustomerSuccessManager: customerSuccessManager,
+		CreTeam:                creTeam,
+		SreTeam:                sreTeam,
+		ActivationDate:         dateOnlyOrNil(row.ActivationDate),
+		DeactivationDate:       dateOnlyOrNil(row.DeactivationDate),
+		HasAgent:               boolOrFalse(row.HasAgent),
+		HasKbReferences:        boolOrFalse(row.HasKbReferences),
+		CreatedOn:              row.CreatedOn.Format(time.RFC3339),
+		CreatedBy:              &createdBy,
+		UpdatedOn:              row.UpdatedOn.Format(time.RFC3339),
 	}
 }

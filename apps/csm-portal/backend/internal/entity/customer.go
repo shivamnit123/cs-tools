@@ -581,6 +581,35 @@ func (c *CustomerEntityClient) SearchGroups(ctx context.Context, body []byte) ([
 	return c.do(ctx, http.MethodPost, "/groups/search", body)
 }
 
+// GetScheduleCatalogue calls GET /team-schedule/catalogue on the entity service.
+// The Team Schedule zones, windows and absence kinds, in one payload: a client
+// needs all three to draw a single day. Response is returned as raw JSON.
+func (c *CustomerEntityClient) GetScheduleCatalogue(ctx context.Context) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, "/team-schedule/catalogue", nil)
+}
+
+// SearchScheduleAssignments calls POST /team-schedule/assignments/search on the
+// entity service. Response is returned as raw JSON.
+func (c *CustomerEntityClient) SearchScheduleAssignments(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/team-schedule/assignments/search", body)
+}
+
+// SearchScheduleAbsences calls POST /team-schedule/absences/search on the entity
+// service. Response is returned as raw JSON.
+func (c *CustomerEntityClient) SearchScheduleAbsences(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/team-schedule/absences/search", body)
+}
+
+// GetScheduleOnDuty calls GET /team-schedule/on-duty on the entity service, passing
+// the optional `at` instant through unchanged. Response is raw JSON.
+func (c *CustomerEntityClient) GetScheduleOnDuty(ctx context.Context, at string) ([]byte, error) {
+	path := "/team-schedule/on-duty"
+	if at != "" {
+		path += "?at=" + url.QueryEscape(at)
+	}
+	return c.do(ctx, http.MethodGet, path, nil)
+}
+
 // SearchConfigurationItems calls POST /configuration-items/search on the entity service.
 // Response is returned as raw JSON.
 func (c *CustomerEntityClient) SearchConfigurationItems(ctx context.Context, body []byte) ([]byte, error) {
@@ -909,4 +938,59 @@ func (c *CustomerEntityClient) RecordAnnouncementRequestDeliveries(ctx context.C
 // Response is returned as raw JSON; typed response structs are deferred.
 func (c *CustomerEntityClient) ListAnnouncementRequestDeliveries(ctx context.Context, id string) ([]byte, error) {
 	return c.do(ctx, http.MethodGet, fmt.Sprintf("/announcement-requests/%s/deliveries", url.PathEscape(id)), nil)
+}
+
+// CreateScheduleAssignment calls POST /team-schedule/assignments on the entity
+// service. Lead edit; the entity service enforces that the caller leads the team.
+func (c *CustomerEntityClient) CreateScheduleAssignment(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/team-schedule/assignments", body)
+}
+
+// UpdateScheduleAssignment calls PATCH /team-schedule/assignments/{id}.
+func (c *CustomerEntityClient) UpdateScheduleAssignment(ctx context.Context, id string, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPatch, "/team-schedule/assignments/"+url.PathEscape(id), body)
+}
+
+// DeleteScheduleAssignment calls DELETE /team-schedule/assignments/{id}, passing
+// the optional note through unchanged.
+func (c *CustomerEntityClient) DeleteScheduleAssignment(ctx context.Context, id, note string) ([]byte, error) {
+	path := "/team-schedule/assignments/" + url.PathEscape(id)
+	if note != "" {
+		path += "?note=" + url.QueryEscape(note)
+	}
+	return c.do(ctx, http.MethodDelete, path, nil)
+}
+
+// GetScheduleActivity calls GET /team-schedule/activity for one team and window.
+func (c *CustomerEntityClient) GetScheduleActivity(ctx context.Context, teamKey, from, to string) ([]byte, error) {
+	q := url.Values{}
+	q.Set("teamKey", teamKey)
+	q.Set("from", from)
+	q.Set("to", to)
+	return c.do(ctx, http.MethodGet, "/team-schedule/activity?"+q.Encode(), nil)
+}
+
+// GetMyLeadTeams calls GET /team-schedule/my-lead-teams on the entity service.
+func (c *CustomerEntityClient) GetMyLeadTeams(ctx context.Context) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, "/team-schedule/my-lead-teams", nil)
+}
+
+// ApplyScheduleRange calls POST /team-schedule/assignments/apply on the entity
+// service -- how the roster's picker edits a span of days in one call.
+func (c *CustomerEntityClient) ApplyScheduleRange(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/team-schedule/assignments/apply", body)
+}
+
+// ApplyScheduleAbsence calls POST /team-schedule/absences/apply on the entity
+// service -- the picker marking somebody away, or bringing them back.
+func (c *CustomerEntityClient) ApplyScheduleAbsence(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/team-schedule/absences/apply", body)
+}
+
+// GetScheduleEditMarkers calls GET /team-schedule/edit-markers on the entity
+// service -- which roster cells a person has changed, in a window.
+func (c *CustomerEntityClient) GetScheduleEditMarkers(ctx context.Context, from, to string) ([]byte, error) {
+	return c.do(ctx, http.MethodGet,
+		fmt.Sprintf("/team-schedule/edit-markers?from=%s&to=%s",
+			url.QueryEscape(from), url.QueryEscape(to)), nil)
 }

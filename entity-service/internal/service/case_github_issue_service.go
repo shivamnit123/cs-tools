@@ -55,7 +55,7 @@ type caseGithubIssueRepo interface {
 // two things before they enqueue anything: an active account_github_repo row,
 // and an issue number on the case. This writes the second, so there is no
 // separate "enable sync for this case" step -- it falls out of the gate model
-// (see migration 000069).
+// (see migration 0112).
 //
 // The validation and the state gate below are lifted unchanged from
 // snCaseGithubIssueService. Only the delivery mechanism differs, and a caller

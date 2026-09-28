@@ -32,17 +32,17 @@ import (
 )
 
 // ChangeRequestRepository defines the persistence operations for the change
-// request entity, split across work_item (migration 000016, fields common
-// to every work_item type) and change_request (migration 000047, a
+// request entity, split across work_item (migration 0021, fields common
+// to every work_item type) and change_request (migration 0043, a
 // shared-PK extension -- change_request.id IS work_item.id, same pattern
 // as "case").
 //
 // ServiceID/ServiceOfferingID are backed by change_request.service_id/
-// service_offering_id (migration 000050), FKs into service/service_offering
-// (migrations 000048/000049).
+// service_offering_id (migration 0046), FKs into service/service_offering
+// (migrations 0044/0045).
 //
 // Type (domain.ChangeRequestType) is backed by change_request.change_model
-// (migration 000055) -- NOT change_request.change_request_type, whose real
+// (migration 0056) -- NOT change_request.change_request_type, whose real
 // enum values are INFRA/GENERAL, a completely different, unrelated
 // classification. See changeRequestChangeModelToType/changeRequestTypeToChangeModel
 // for the mapping, including the four ChangeRequestType values added
@@ -57,7 +57,7 @@ import (
 // established mapping and are always left unset rather than guessed at:
 // ConfigurationItemID (no CMDB table exists at all in this schema); GroupID
 // and AssignedTeamID (distinct from CustomerGroupID -- these would need
-// work_item.assignment_group_id, migration 000074, which nothing in this
+// work_item.assignment_group_id, migration 0075, which nothing in this
 // file joins or reads yet); ApprovedBy/ApprovedOn/LegalNextStates on
 // domain.ChangeRequest (there is a summary change_request.approval enum
 // but no approver/date columns, and LegalNextStates is a ServiceNow
@@ -71,7 +71,7 @@ import (
 // comment.
 //
 // GetChangeRequestApprovals/DecideChangeRequestApproval ARE implemented
-// against approval_stage/approval_stage_approver (migration 000087), which
+// against approval_stage/approval_stage_approver (migration 0089), which
 // mirror ServiceNow's generic sysapproval_group/sysapproval_approver tables
 // -- see that migration's own comment. Stage label/approverType have no
 // backing column (ServiceNow derives them from two hardcoded group sys_ids
@@ -115,7 +115,7 @@ type ChangeRequestRepository interface {
 	// creation (see changeRequestService.createChangeRequestSNFirst's own doc
 	// comment). Unlike CaseRepository.CreateCaseFromServiceNow, no wso2ID
 	// parameter exists here: work_item.wso2_id is only required (by the
-	// work_item_wso2_id_required_by_type CHECK constraint, migration 000016)
+	// work_item_wso2_id_required_by_type CHECK constraint, migration 0021)
 	// for CASE/SERVICE_REQUEST/ANNOUNCEMENT/ENGAGEMENT/
 	// SECURITY_REPORT_ANALYSIS -- CHANGE_REQUEST is deliberately excluded
 	// from that list (the same table's own inline comment: "change_request
@@ -224,7 +224,7 @@ const changeRequestSelectColumns = `
 	wi.created_on, wi.updated_on`
 
 // changeRequestChangeModelToType/changeRequestTypeToChangeModel map between
-// change_request.change_model's real enum labels (migration 000055) and
+// change_request.change_model's real enum labels (migration 0056) and
 // domain.ChangeRequestType. Unlike change_request.change_request_type
 // (INFRA/GENERAL -- a genuinely different, unrelated classification, see
 // this file's own package doc comment), change_model's vocabulary overlaps
@@ -778,7 +778,7 @@ var changeRequestPatchFKField = map[string]string{
 }
 
 // changeRequestPatchCRFKField mirrors changeRequestPatchFKField for the
-// change_request table's own FK columns (migration 000050).
+// change_request table's own FK columns (migration 0046).
 var changeRequestPatchCRFKField = map[string]string{
 	"change_request_service_id_fkey":          "serviceId",
 	"change_request_service_offering_id_fkey": "serviceOfferingId",
@@ -878,7 +878,7 @@ func (r *changeRequestRepo) PatchChangeRequest(ctx context.Context, id string, r
 		enumValue, ok := changeRequestTypeToChangeModel[*req.Type]
 		if !ok {
 			// "model"/"site_reliability_ops" predate change_model
-			// (migration 000055) and have no real enum label there --
+			// (migration 0056) and have no real enum label there --
 			// see changeRequestChangeModelToType's own doc comment.
 			return domain.ChangeRequest{}, &apierror.ValidationError{Msg: fmt.Sprintf("type %q is not supported on the PostgreSQL data source", *req.Type)}
 		}
@@ -1059,7 +1059,7 @@ const changeRequestApprovalStagesQuery = `
 // user_repo.go's userSortColumns one, since there's no user_name fallback
 // need here -- an approver with no resolvable name still reads as "" rather
 // than falling back to a login handle. Filtered by work_item_id (denormalized
-// onto approval_stage_approver, migration 000087's own comment on why)
+// onto approval_stage_approver, migration 0089's own comment on why)
 // rather than joining through approval_stage, same reasoning as that
 // column's own comment.
 const changeRequestApprovalApproversQuery = `
@@ -1080,7 +1080,7 @@ type changeRequestApprovalStageRow struct {
 // changeRequestApprovalApproverRow is one row of
 // changeRequestApprovalApproversQuery. rawStatus/stageID are nullable
 // pointers because both approval_stage_approver.status and .stage_id are
-// (migration 000087's own comment on nullable FKs throughout, plus status
+// (migration 0089's own comment on nullable FKs throughout, plus status
 // having no NOT NULL/DEFAULT).
 type changeRequestApprovalApproverRow struct {
 	id           string
@@ -1155,7 +1155,7 @@ func changeRequestApprovalStagePosition(pos int) (string, domain.ChangeRequestAp
 }
 
 // changeRequestApprovalStatusByRaw normalizes approval_stage_approver.status
-// (a ServiceNow sysapproval_approver.state passthrough -- migration 000087's
+// (a ServiceNow sysapproval_approver.state passthrough -- migration 0089's
 // own comment) to the UPPER_SNAKE_CASE values domain.ChangeRequestApprover.
 // Status already carries for the ServiceNow data source (see
 // snChangeRequestService.GetChangeRequestApprovals, which passes ServiceNow's

@@ -172,7 +172,16 @@ A separate service (not entity-service, not SCIM) — see
 | `AUTH_ISSUER` | Expected `iss` claim value |
 | `AUTH_AUDIENCE` | Comma-separated accepted `aud` values |
 | `AUTH_TOKEN_VALIDATOR_ENABLED` | `false` skips JWT signature verification — **local development only**; `.env.example` ships `false` for local convenience. Production **must** set this to `true` with a real `AUTH_JWKS_ENDPOINT`/`AUTH_ISSUER`/`AUTH_AUDIENCE` |
-| `AUTH_ADMIN_ROLE` | The role string (from entity-service's `GET /users/me` `roles`) that grants admin privileges for registry-token and project-contact management |
+| `AUTH_ADMIN_ROLE` | The role string (from entity-service's `GET /users/me` `roles`) that grants admin privileges for registry-token management. Project-contact writes under `CSM_MIGRATION_PORTAL_CONTACTS_ENABLED` use the account admin roles `customer_admin` and `partner_admin` instead, together with an active membership on the project |
+
+### ServiceNow-to-CSM cutover
+
+Every flag for that cutover is named `CSM_MIGRATION_*`, is opt-in (on only when the value is exactly `true`), and is off in every environment until cutover day. Off means the portal behaves exactly as it does today: the guarded code is never entered, so no extra request leaves the process.
+
+| Variable | Description |
+|---|---|
+| `CSM_MIGRATION_FIRST_ACCESS_ENABLED` | After a profile load, ask entity-service (`POST /users/me/memberships/register`) to complete the caller's onboarding: clear their Salesforce lockout flag, set the membership to `REGISTERED`, refresh the CSM database. Runs after the response is written, on its own context; a failure is logged and dropped. entity-service only registers that route when its own `CSM_MIGRATION_MEMBERSHIP_REGISTRATION_ENABLED` and membership-ingest flags are on |
+| `CSM_MIGRATION_PORTAL_CONTACTS_ENABLED` | Read the project contact list (`GET /projects/{id}/contacts`) and the admin check behind every contact write from the CSM database through entity-service, and send the writes (invite, role change, remove, and `POST /projects/{id}/contacts/{email}/resend-invitation`) to entity-service, which updates Postgres and Salesforce in one transaction. The invite pre-check `POST /projects/{id}/contacts/validate` asks entity-service's invitation dry run, which runs the same checks as the invite and writes nothing. Off, the list, validate, invite, role change and remove go to the pre-cutover onboarding service unchanged and resend answers `404`. entity-service only registers these routes when its own `CSM_MIGRATION_PORTAL_WRITES_ENABLED` is on and its `DATA_SOURCE` is exactly `postgres` |
 
 ### Server
 

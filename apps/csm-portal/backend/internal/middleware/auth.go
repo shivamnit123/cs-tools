@@ -79,6 +79,10 @@ type jwtClaims struct {
 // one value and as an array when it holds several (its "roles" claim does
 // this). A plain []string would reject a single-role user's whole token, so
 // both shapes are accepted; anything else fails the token.
+//
+// SCIM's own "roles" attribute was assumed to follow this same convention but
+// does not -- observed in practice as an array of {value, ...} objects, a
+// different-enough shape (see scim.scimRoles) that it isn't reused here.
 type stringList []string
 
 func (l *stringList) UnmarshalJSON(b []byte) error {
@@ -119,8 +123,8 @@ func Auth(cfg Config) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			addSecurityHeaders(w)
 
-			// Skip auth for the health check endpoint.
-			if r.Method == http.MethodGet && r.URL.Path == "/health" {
+			// Skip auth for both health check endpoints.
+			if r.Method == http.MethodGet && (r.URL.Path == "/health" || r.URL.Path == "/health/dependencies") {
 				next.ServeHTTP(w, r)
 				return
 			}

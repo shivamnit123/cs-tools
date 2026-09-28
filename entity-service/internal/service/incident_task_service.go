@@ -27,7 +27,7 @@ import (
 )
 
 // incidentTaskStateEnumSet is the real incident_task_state_enum label set
-// (migration 000066). Unlike ParseIncidentTaskFieldFilters (which treats
+// (migration 0066). Unlike ParseIncidentTaskFieldFilters (which treats
 // "state" filter values as raw ServiceNow integers -- see
 // parsedIncidentTaskFilters.StateKeys' own doc comment for why that data
 // source's state choice list has no unambiguous enum to translate through),

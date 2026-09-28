@@ -28,7 +28,7 @@ import (
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/repository"
 )
 
-// case_state_enum labels (migration 000018) this aggregation classifies by.
+// case_state_enum labels (migration 0023) this aggregation classifies by.
 // Spelled as the raw enum labels because that is what caseLikeStateColumn
 // returns, and what GET /projects/{id}/metadata's caseStates already exposes
 // in Postgres mode -- so a caller can join stateCount to that list directly.

@@ -165,6 +165,8 @@ func (m *mockEntityProjectClient) UpdateProject(ctx context.Context, id string, 
 type mockEntityCaseClient struct {
 	patchCaseFn         func(ctx context.Context, id string, body []byte) ([]byte, error)
 	createCaseCommentFn func(ctx context.Context, caseID string, body []byte) ([]byte, error)
+	searchCasesFn       func(ctx context.Context, body []byte) ([]byte, error)
+	addCaseTagFn        func(ctx context.Context, caseID string, body []byte) ([]byte, error)
 }
 
 func (m *mockEntityCaseClient) PatchCase(ctx context.Context, id string, body []byte) ([]byte, error) {
@@ -177,6 +179,20 @@ func (m *mockEntityCaseClient) PatchCase(ctx context.Context, id string, body []
 func (m *mockEntityCaseClient) CreateCaseComment(ctx context.Context, caseID string, body []byte) ([]byte, error) {
 	if m.createCaseCommentFn != nil {
 		return m.createCaseCommentFn(ctx, caseID, body)
+	}
+	return []byte(`{}`), nil
+}
+
+func (m *mockEntityCaseClient) SearchCases(ctx context.Context, body []byte) ([]byte, error) {
+	if m.searchCasesFn != nil {
+		return m.searchCasesFn(ctx, body)
+	}
+	return []byte(`{}`), nil
+}
+
+func (m *mockEntityCaseClient) AddCaseTag(ctx context.Context, caseID string, body []byte) ([]byte, error) {
+	if m.addCaseTagFn != nil {
+		return m.addCaseTagFn(ctx, caseID, body)
 	}
 	return []byte(`{}`), nil
 }

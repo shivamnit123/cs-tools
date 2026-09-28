@@ -34,7 +34,7 @@ import (
 // "Catalog" in this data source's response is an sr_category row: it's the
 // only catalog-level entity here with both a UUID and a display name.
 // ServiceNow's own sc_catalog level was collapsed into sr_category.catalog, a
-// plain enum (migration 000067), so there is no per-catalog UUID to return
+// plain enum (migration 0068), so there is no per-catalog UUID to return
 // instead -- and the customer portal renders each "catalog" as a card of
 // catalog items, which is what an sr_category is.
 type CatalogRepository interface {
@@ -59,7 +59,7 @@ func NewCatalogRepository(db *pgxpool.Pool) CatalogRepository {
 }
 
 // availableCatalogItemsCTE resolves, for the deployed product bound to $1,
-// which catalog items sr_category_routing_rule (migration 000071) makes
+// which catalog items sr_category_routing_rule (migration 0072) makes
 // available. A rule matches when its product_unit equals the deployed
 // product's product.unit AND its classification equals
 // deployed_product.product_category -- both pairs share a label set
@@ -191,7 +191,7 @@ func (r *catalogRepo) SearchCatalogs(ctx context.Context, deployedProductID stri
 
 // GetCatalogItemVariables implements CatalogRepository.
 //
-// catalog_variable (migration 000070) carries only id/name/question_text/
+// catalog_variable (migration 0071) carries only id/name/question_text/
 // type/order/is_mandatory/is_active/default_value. ReadOnly, Hidden,
 // MaxLength, ReferenceTable, Validation and Choices have no backing column
 // yet, so they stay at their zero value (false/nil/omitted). TODO: populate

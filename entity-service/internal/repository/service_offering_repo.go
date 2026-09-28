@@ -27,8 +27,8 @@ import (
 )
 
 // ServiceOfferingRepository defines the read operations for service_offering
-// (migration 000049), a shared-PK-free standalone table with an optional
-// parent_id FK into service (migration 000048).
+// (migration 0045), a shared-PK-free standalone table with an optional
+// parent_id FK into service (migration 0044).
 type ServiceOfferingRepository interface {
 	// SearchServiceOfferings returns a filtered, paginated slice of service
 	// offerings together with the total count of matching rows before

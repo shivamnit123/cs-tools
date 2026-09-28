@@ -29,7 +29,12 @@ import (
 // unconfigured methods panic if called -- same convention as
 // stubCallRequestRepo (call_request_service_test.go).
 type stubTimeCardRepo struct {
-	createTimeCard func(ctx context.Context, req domain.CreateTimeCardRequest, userID string) (domain.TimeCardView, error)
+	createTimeCard        func(ctx context.Context, req domain.CreateTimeCardRequest, userID string) (domain.TimeCardView, error)
+	updateTimeCardFields  func(ctx context.Context, req domain.UpdateTimeCardRequest, actorID string) (domain.TimeCardView, error)
+	transitionTimeCardState func(ctx context.Context, id string, state domain.TimeCardState, leadComment *string, actorID string) (domain.TimeCardView, error)
+	deleteTimeCard        func(ctx context.Context, id, submitterID string) error
+	setTimeCardSNSysID    func(ctx context.Context, id, snSysID string) error
+	getTimeCardSNSysID    func(ctx context.Context, id string) (*string, error)
 }
 
 func (s *stubTimeCardRepo) SearchTimeCards(context.Context, domain.SearchTimeCardsRequest, string) ([]domain.TimeCardView, int, error) {
@@ -44,14 +49,35 @@ func (s *stubTimeCardRepo) CreateTimeCard(ctx context.Context, req domain.Create
 	}
 	panic("not implemented")
 }
-func (s *stubTimeCardRepo) UpdateTimeCardFields(context.Context, domain.UpdateTimeCardRequest, string) (domain.TimeCardView, error) {
+func (s *stubTimeCardRepo) UpdateTimeCardFields(ctx context.Context, req domain.UpdateTimeCardRequest, actorID string) (domain.TimeCardView, error) {
+	if s.updateTimeCardFields != nil {
+		return s.updateTimeCardFields(ctx, req, actorID)
+	}
 	panic("not implemented")
 }
-func (s *stubTimeCardRepo) TransitionTimeCardState(context.Context, string, domain.TimeCardState, *string, string) (domain.TimeCardView, error) {
+func (s *stubTimeCardRepo) TransitionTimeCardState(ctx context.Context, id string, state domain.TimeCardState, leadComment *string, actorID string) (domain.TimeCardView, error) {
+	if s.transitionTimeCardState != nil {
+		return s.transitionTimeCardState(ctx, id, state, leadComment, actorID)
+	}
 	panic("not implemented")
 }
-func (s *stubTimeCardRepo) DeleteTimeCard(context.Context, string, string) error {
+func (s *stubTimeCardRepo) DeleteTimeCard(ctx context.Context, id, submitterID string) error {
+	if s.deleteTimeCard != nil {
+		return s.deleteTimeCard(ctx, id, submitterID)
+	}
 	panic("not implemented")
+}
+func (s *stubTimeCardRepo) SetTimeCardSNSysID(ctx context.Context, id, snSysID string) error {
+	if s.setTimeCardSNSysID != nil {
+		return s.setTimeCardSNSysID(ctx, id, snSysID)
+	}
+	return nil
+}
+func (s *stubTimeCardRepo) GetTimeCardSNSysID(ctx context.Context, id string) (*string, error) {
+	if s.getTimeCardSNSysID != nil {
+		return s.getTimeCardSNSysID(ctx, id)
+	}
+	return nil, nil
 }
 
 // stubMirrorTimeCardService embeds TimeCardService (nil) and overrides only
@@ -59,10 +85,20 @@ func (s *stubTimeCardRepo) DeleteTimeCard(context.Context, string, string) error
 type stubMirrorTimeCardService struct {
 	TimeCardService
 	createTimeCard func(ctx context.Context, req domain.CreateTimeCardRequest) (domain.TimeCardMutationResponse, error)
+	updateTimeCard func(ctx context.Context, req domain.UpdateTimeCardRequest) (domain.TimeCardMutationResponse, error)
+	deleteTimeCard func(ctx context.Context, req domain.DeleteTimeCardRequest) (domain.DeleteTimeCardResponse, error)
 }
 
 func (s *stubMirrorTimeCardService) CreateTimeCard(ctx context.Context, req domain.CreateTimeCardRequest) (domain.TimeCardMutationResponse, error) {
 	return s.createTimeCard(ctx, req)
+}
+
+func (s *stubMirrorTimeCardService) UpdateTimeCard(ctx context.Context, req domain.UpdateTimeCardRequest) (domain.TimeCardMutationResponse, error) {
+	return s.updateTimeCard(ctx, req)
+}
+
+func (s *stubMirrorTimeCardService) DeleteTimeCard(ctx context.Context, req domain.DeleteTimeCardRequest) (domain.DeleteTimeCardResponse, error) {
+	return s.deleteTimeCard(ctx, req)
 }
 
 func validCreateTimeCardRequest() domain.CreateTimeCardRequest {
@@ -145,3 +181,281 @@ func TestTimeCardService_CreateTimeCard_MirrorFailureRecordsWritebackFailure(t *
 
 	waitFor(t, func() bool { return failures.count() == 1 })
 }
+
+// TestTimeCardService_CreateTimeCard_MirrorSuccessPersistsSNSysID covers the
+// id-mapping half of the CREATE mirror: on success, the ServiceNow-returned
+// time card id (converted to its raw sys_id form) is persisted back onto the
+// Postgres row via SetTimeCardSNSysID.
+func TestTimeCardService_CreateTimeCard_MirrorSuccessPersistsSNSysID(t *testing.T) {
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	req := validCreateTimeCardRequest()
+
+	mirror := &stubMirrorTimeCardService{
+		createTimeCard: func(context.Context, domain.CreateTimeCardRequest) (domain.TimeCardMutationResponse, error) {
+			return domain.TimeCardMutationResponse{TimeCard: &domain.TimeCardView{ID: testSNSysID2}}, nil
+		},
+	}
+	type setCall struct{ id, snSysID string }
+	setCalls := make(chan setCall, 1)
+	repo := &stubTimeCardRepo{
+		createTimeCard: func(context.Context, domain.CreateTimeCardRequest, string) (domain.TimeCardView, error) {
+			return domain.TimeCardView{ID: testUUID}, nil
+		},
+		setTimeCardSNSysID: func(_ context.Context, id, snSysID string) error {
+			setCalls <- setCall{id: id, snSysID: snSysID}
+			return nil
+		},
+	}
+	failures := &recordingSNWritebackFailures{}
+	dispatcher := NewSNWritebackDispatcher(failures)
+	svc := NewTimeCardServiceWithSNWriteback(repo, stubUserRepo{
+		getUserByEmail: func(context.Context, string) (domain.User, error) { return domain.User{ID: testUUID, Email: "jane.doe@example.com"}, nil },
+	}, dispatcher, mirror)
+
+	if _, err := svc.CreateTimeCard(ctx, req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case got := <-setCalls:
+		if got.id != testUUID {
+			t.Errorf("SetTimeCardSNSysID id = %q, want %q (the Postgres row id)", got.id, testUUID)
+		}
+		wantSysID := uuidToSysid(testSNSysID2)
+		if got.snSysID != wantSysID {
+			t.Errorf("SetTimeCardSNSysID snSysID = %q, want %q", got.snSysID, wantSysID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("SetTimeCardSNSysID was never called")
+	}
+}
+
+// TestTimeCardService_UpdateTimeCard_MirrorsWithStoredSNSysID covers the
+// UPDATE mirror's happy path (field-edit branch): when a ServiceNow sys_id
+// is already stored, the mirror fires against it.
+func TestTimeCardService_UpdateTimeCard_MirrorsWithStoredSNSysID(t *testing.T) {
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	req := domain.UpdateTimeCardRequest{ID: testUUID, WorkLogComment: strPtrTC("updated")}
+
+	storedSysID := uuidToSysid(testSNSysID2)
+	repo := &stubTimeCardRepo{
+		updateTimeCardFields: func(context.Context, domain.UpdateTimeCardRequest, string) (domain.TimeCardView, error) {
+			return domain.TimeCardView{ID: testUUID}, nil
+		},
+		getTimeCardSNSysID: func(context.Context, string) (*string, error) {
+			return &storedSysID, nil
+		},
+	}
+	called := make(chan domain.UpdateTimeCardRequest, 1)
+	mirror := &stubMirrorTimeCardService{
+		updateTimeCard: func(_ context.Context, mirrorReq domain.UpdateTimeCardRequest) (domain.TimeCardMutationResponse, error) {
+			called <- mirrorReq
+			return domain.TimeCardMutationResponse{}, nil
+		},
+	}
+	failures := &recordingSNWritebackFailures{}
+	dispatcher := NewSNWritebackDispatcher(failures)
+	svc := NewTimeCardServiceWithSNWriteback(repo, stubUserRepo{
+		getUserByEmail: func(context.Context, string) (domain.User, error) { return domain.User{ID: testUUID, Email: "jane.doe@example.com"}, nil },
+	}, dispatcher, mirror)
+
+	if _, err := svc.UpdateTimeCard(ctx, req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case got := <-called:
+		if got.ID != testSNSysID2 {
+			t.Errorf("mirror UpdateTimeCard ID = %q, want %q (sysidToUUID of the stored sys_id)", got.ID, testSNSysID2)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mirror.UpdateTimeCard was never called")
+	}
+	if got := failures.count(); got != 0 {
+		t.Errorf("expected 0 sn_writeback_failures records for a successful mirror, got %d", got)
+	}
+}
+
+// TestTimeCardService_UpdateTimeCard_SkipsMirrorWhenNoSNSysIDStored covers
+// the pre-migration-row case: a NULL sn_sys_id must make the UPDATE mirror
+// skip silently.
+func TestTimeCardService_UpdateTimeCard_SkipsMirrorWhenNoSNSysIDStored(t *testing.T) {
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	req := domain.UpdateTimeCardRequest{ID: testUUID, WorkLogComment: strPtrTC("updated")}
+
+	repo := &stubTimeCardRepo{
+		updateTimeCardFields: func(context.Context, domain.UpdateTimeCardRequest, string) (domain.TimeCardView, error) {
+			return domain.TimeCardView{ID: testUUID}, nil
+		},
+		getTimeCardSNSysID: func(context.Context, string) (*string, error) {
+			return nil, nil
+		},
+	}
+	mirrorCalled := make(chan struct{}, 1)
+	mirror := &stubMirrorTimeCardService{
+		updateTimeCard: func(context.Context, domain.UpdateTimeCardRequest) (domain.TimeCardMutationResponse, error) {
+			mirrorCalled <- struct{}{}
+			return domain.TimeCardMutationResponse{}, nil
+		},
+	}
+	failures := &recordingSNWritebackFailures{}
+	dispatcher := NewSNWritebackDispatcher(failures)
+	svc := NewTimeCardServiceWithSNWriteback(repo, stubUserRepo{
+		getUserByEmail: func(context.Context, string) (domain.User, error) { return domain.User{ID: testUUID, Email: "jane.doe@example.com"}, nil },
+	}, dispatcher, mirror)
+
+	if _, err := svc.UpdateTimeCard(ctx, req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case <-mirrorCalled:
+		t.Fatal("mirror.UpdateTimeCard was called despite no ServiceNow mapping being stored")
+	case <-time.After(300 * time.Millisecond):
+		// expected: no mirror call
+	}
+	if got := failures.count(); got != 0 {
+		t.Errorf("expected 0 sn_writeback_failures records for a deliberate skip, got %d", got)
+	}
+}
+
+// TestTimeCardService_DeleteTimeCard_MirrorsWithStoredSNSysID covers the
+// DELETE mirror's happy path: the sys_id lookup happens BEFORE the Postgres
+// delete (the row disappears afterward), and the mirror fires with it.
+func TestTimeCardService_DeleteTimeCard_MirrorsWithStoredSNSysID(t *testing.T) {
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	req := domain.DeleteTimeCardRequest{ID: testUUID}
+
+	storedSysID := uuidToSysid(testSNSysID2)
+	repo := &stubTimeCardRepo{
+		deleteTimeCard: func(context.Context, string, string) error { return nil },
+		getTimeCardSNSysID: func(context.Context, string) (*string, error) {
+			return &storedSysID, nil
+		},
+	}
+	called := make(chan domain.DeleteTimeCardRequest, 1)
+	mirror := &stubMirrorTimeCardService{
+		deleteTimeCard: func(_ context.Context, mirrorReq domain.DeleteTimeCardRequest) (domain.DeleteTimeCardResponse, error) {
+			called <- mirrorReq
+			return domain.DeleteTimeCardResponse{}, nil
+		},
+	}
+	failures := &recordingSNWritebackFailures{}
+	dispatcher := NewSNWritebackDispatcher(failures)
+	svc := NewTimeCardServiceWithSNWriteback(repo, stubUserRepo{
+		getUserByEmail: func(context.Context, string) (domain.User, error) { return domain.User{ID: testUUID, Email: "jane.doe@example.com"}, nil },
+	}, dispatcher, mirror)
+
+	if _, err := svc.DeleteTimeCard(ctx, req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case got := <-called:
+		if got.ID != testSNSysID2 {
+			t.Errorf("mirror DeleteTimeCard ID = %q, want %q (sysidToUUID of the stored sys_id)", got.ID, testSNSysID2)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mirror.DeleteTimeCard was never called")
+	}
+	if got := failures.count(); got != 0 {
+		t.Errorf("expected 0 sn_writeback_failures records for a successful mirror, got %d", got)
+	}
+}
+
+// TestTimeCardService_DeleteTimeCard_SkipsMirrorWhenNoSNSysIDStored covers
+// the pre-migration-row case for DELETE: a NULL sn_sys_id must make the
+// mirror skip silently, and the Postgres delete must still succeed.
+func TestTimeCardService_DeleteTimeCard_SkipsMirrorWhenNoSNSysIDStored(t *testing.T) {
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	req := domain.DeleteTimeCardRequest{ID: testUUID}
+
+	repo := &stubTimeCardRepo{
+		deleteTimeCard: func(context.Context, string, string) error { return nil },
+		getTimeCardSNSysID: func(context.Context, string) (*string, error) {
+			return nil, nil
+		},
+	}
+	mirrorCalled := make(chan struct{}, 1)
+	mirror := &stubMirrorTimeCardService{
+		deleteTimeCard: func(context.Context, domain.DeleteTimeCardRequest) (domain.DeleteTimeCardResponse, error) {
+			mirrorCalled <- struct{}{}
+			return domain.DeleteTimeCardResponse{}, nil
+		},
+	}
+	failures := &recordingSNWritebackFailures{}
+	dispatcher := NewSNWritebackDispatcher(failures)
+	svc := NewTimeCardServiceWithSNWriteback(repo, stubUserRepo{
+		getUserByEmail: func(context.Context, string) (domain.User, error) { return domain.User{ID: testUUID, Email: "jane.doe@example.com"}, nil },
+	}, dispatcher, mirror)
+
+	if _, err := svc.DeleteTimeCard(ctx, req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case <-mirrorCalled:
+		t.Fatal("mirror.DeleteTimeCard was called despite no ServiceNow mapping being stored")
+	case <-time.After(300 * time.Millisecond):
+		// expected: no mirror call
+	}
+	if got := failures.count(); got != 0 {
+		t.Errorf("expected 0 sn_writeback_failures records for a deliberate skip, got %d", got)
+	}
+}
+
+// TestTimeCardService_DeleteTimeCard_RecordsSNWritebackFailureOnLookupError
+// covers the real-error half of the same lookup: unlike a genuinely
+// successful lookup that finds no mapping (nil, nil -- see
+// TestTimeCardService_DeleteTimeCard_SkipsMirrorWhenNoSNSysIDStored), a
+// lookup that fails outright must not be silently discarded. The Postgres
+// delete still succeeds and is still authoritative, but the lookup failure
+// is recorded to sn_writeback_failures for manual backfill instead of
+// vanishing.
+func TestTimeCardService_DeleteTimeCard_RecordsSNWritebackFailureOnLookupError(t *testing.T) {
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	req := domain.DeleteTimeCardRequest{ID: testUUID}
+
+	lookupErr := errors.New("sn sys id lookup: connection reset")
+	repo := &stubTimeCardRepo{
+		deleteTimeCard: func(context.Context, string, string) error { return nil },
+		getTimeCardSNSysID: func(context.Context, string) (*string, error) {
+			return nil, lookupErr
+		},
+	}
+	mirrorCalled := make(chan struct{}, 1)
+	mirror := &stubMirrorTimeCardService{
+		deleteTimeCard: func(context.Context, domain.DeleteTimeCardRequest) (domain.DeleteTimeCardResponse, error) {
+			mirrorCalled <- struct{}{}
+			return domain.DeleteTimeCardResponse{}, nil
+		},
+	}
+	failures := &recordingSNWritebackFailures{}
+	dispatcher := NewSNWritebackDispatcher(failures)
+	svc := NewTimeCardServiceWithSNWriteback(repo, stubUserRepo{
+		getUserByEmail: func(context.Context, string) (domain.User, error) { return domain.User{ID: testUUID, Email: "jane.doe@example.com"}, nil },
+	}, dispatcher, mirror)
+
+	if _, err := svc.DeleteTimeCard(ctx, req); err != nil {
+		t.Fatalf("Postgres delete must still be reported as a success despite the lookup error, got: %v", err)
+	}
+
+	select {
+	case <-mirrorCalled:
+		t.Fatal("mirror.DeleteTimeCard was called despite the sys_id lookup having failed")
+	case <-time.After(300 * time.Millisecond):
+		// expected: no mirror call, the lookup error means we don't know
+		// what to delete
+	}
+
+	waitFor(t, func() bool { return failures.count() == 1 })
+	failReq := failures.calls[0]
+	if failReq.EntityType != "time_card" || failReq.EntityID != testUUID || failReq.Operation != "delete" {
+		t.Errorf("unexpected failure record: %+v", failReq)
+	}
+	if failReq.Error != lookupErr.Error() {
+		t.Errorf("failure record Error = %q, want %q", failReq.Error, lookupErr.Error())
+	}
+}
+
+func strPtrTC(s string) *string { return &s }

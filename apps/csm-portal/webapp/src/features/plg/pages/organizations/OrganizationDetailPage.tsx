@@ -3,11 +3,9 @@ import {
   Button,
   Chip,
   Grid,
-  MenuItem,
   Stack,
   Tab,
   Tabs,
-  TextField,
   Tooltip,
   Typography,
 } from "@wso2/oxygen-ui";
@@ -19,7 +17,7 @@ import { useNavigate, useParams } from "react-router";
 
 
 
-import { useCSUsers, useOrganization, useSetOrganizationOwner } from "@features/plg/api/hooks";
+import { useOrganization, useSetOrganizationOwner } from "@features/plg/api/hooks";
 import type { UserRef } from "@features/plg/api/types";
 import {
   EmptyState,
@@ -32,7 +30,7 @@ import {
 } from "@features/plg/components/common";
 import { formatDate } from "@features/plg/utils/format";
 import { ProductTab } from "./ProductTab";
-import { selectLabelProps } from "@features/plg/components/selectLabelProps";
+import { CSUserSelect } from "@features/plg/components/CSUserSelect";
 import { AXIS_BUTTON_SX } from "@features/plg/components/controls";
 
 /**
@@ -53,12 +51,19 @@ import { AXIS_BUTTON_SX } from "@features/plg/components/controls";
  */
 function OwnerEditor({
   current,
-  owners,
+  currentUser,
   pending,
   onSave,
 }: {
   current: string;
-  owners: UserRef[];
+  /**
+   * The engineer `current` names, from the organisation itself.
+   *
+   * The picker shows one page of ~1,900 engineers, so the present owner is
+   * often not in it; without this they would render as blank and the
+   * organisation would look unassigned.
+   */
+  currentUser?: UserRef | null;
   pending: boolean;
   onSave: (id: string) => void;
 }) {
@@ -67,22 +72,14 @@ function OwnerEditor({
 
   return (
     <Stack direction={{ xs: "column", sm: "row" }} spacing={1} alignItems={{ sm: "flex-start" }}>
-      <TextField
-        select
-        {...selectLabelProps(draft)}
-        size="small"
+      <CSUserSelect
         label="PLG CS owner"
-        sx={{ minWidth: 280 }}
         value={draft}
-        onChange={(e) => setDraft(e.target.value)}
+        onChange={setDraft}
+        selected={currentUser}
         disabled={pending}
-      >
-        {owners.map((u) => (
-          <MenuItem key={u.id} value={u.id}>
-            {u.name}
-          </MenuItem>
-        ))}
-      </TextField>
+        sx={{ minWidth: 280 }}
+      />
       <Button
         variant="contained"
         size="small"
@@ -181,7 +178,6 @@ export default function OrganizationDetailPage() {
 function OverviewTab({ organizationId }: { organizationId: string }) {
   const navigate = useNavigate();
   const { data: org } = useOrganization(organizationId);
-  const { data: owners } = useCSUsers();
   const setOwner = useSetOrganizationOwner(organizationId);
 
   if (!org) return <LoadingSpinner />;
@@ -223,7 +219,7 @@ function OverviewTab({ organizationId }: { organizationId: string }) {
             <OwnerEditor
               key={org.owner?.id ?? ""}
               current={org.owner?.id ?? ""}
-              owners={owners ?? []}
+              currentUser={org.owner}
               pending={setOwner.isPending}
               onSave={(id) => setOwner.mutate(id || null)}
             />

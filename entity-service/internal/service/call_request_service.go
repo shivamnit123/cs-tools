@@ -19,6 +19,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -31,31 +32,29 @@ import (
 type callRequestService struct {
 	repo     repository.CallRequestRepository
 	userRepo repository.UserRepository
-	// snWriteback/snMirror back CreateCallRequest's best-effort, asynchronous
-	// ServiceNow mirror write under DATA_SOURCE=postgres-servicenow-dual-write
-	// -- both nil in every other mode. Set only via
-	// NewCallRequestServiceWithSNWriteback.
+	// snWriteback/snMirror back CreateCallRequest's and UpdateCallRequest's
+	// best-effort, asynchronous ServiceNow mirror writes under
+	// DATA_SOURCE=postgres-servicenow-dual-write -- both nil in every other
+	// mode. Set only via NewCallRequestServiceWithSNWriteback.
 	//
-	// UpdateCallRequest is deliberately NOT mirrored here (see that method's
-	// own doc comment): unlike case/change_request/incident (whose CREATE is
+	// UpdateCallRequest's mirror needs an id mapping CreateCallRequest didn't
+	// used to record: unlike case/change_request/incident (whose CREATE is
 	// ServiceNow-first under this data source, so their Postgres id IS the
 	// real ServiceNow sys_id round-tripped through sysidToUUID),
 	// CreateCallRequest is Postgres-first -- customer_call.id is a plain
-	// Postgres-generated UUID with no ServiceNow counterpart recorded
-	// anywhere (no column on customer_call holds one -- see migration
-	// 000072). uuidToSysid(that id) would not resolve to any real ServiceNow
-	// record, so a mirrored UpdateCallRequest would either 404 against
-	// ServiceNow every single time (if the CREATE mirror never landed, or
-	// landed under a different, SN-generated id) or -- far worse -- collide
-	// with an unrelated ServiceNow record if the fabricated sys_id happened
-	// to match one. Neither outcome is acceptable, and there is no id
-	// mapping to close this gap with today.
+	// Postgres-generated UUID with no ServiceNow counterpart. uuidToSysid(that
+	// id) would not resolve to any real ServiceNow record. Migration 000088
+	// adds customer_call.sn_sys_id for exactly this: CreateCallRequest's own
+	// mirror success path now persists it (best-effort, asynchronously --
+	// see that method below), and UpdateCallRequest's mirror looks it up
+	// before dispatching, skipping silently (not erroring) when it is still
+	// NULL -- the CREATE mirror hasn't landed yet, or never will have.
 	snWriteback *SNWritebackDispatcher
 	snMirror    CallRequestService
 }
 
 // NewCallRequestService constructs a CallRequestService backed by Postgres
-// (customer_call, migration 000072).
+// (customer_call, migration 0073).
 func NewCallRequestService(repo repository.CallRequestRepository, userRepo repository.UserRepository) CallRequestService {
 	return &callRequestService{repo: repo, userRepo: userRepo}
 }
@@ -123,17 +122,29 @@ func (s *callRequestService) CreateCallRequest(ctx context.Context, req domain.C
 	// Best-effort ServiceNow mirror write, DATA_SOURCE=postgres-servicenow-dual-write
 	// only (snWriteback/snMirror are both nil otherwise -- see
 	// callRequestService's own doc comment). Postgres has already committed
-	// by this point; the ServiceNow-side id this mirror creates is
-	// deliberately discarded (never written back onto the Postgres row) --
-	// see callRequestService's own doc comment for why UpdateCallRequest
-	// cannot use it later anyway.
+	// by this point. On success, the ServiceNow-side id this mirror creates
+	// is persisted back onto the Postgres row (migration 0135's
+	// customer_call.sn_sys_id) -- itself a second best-effort, asynchronous
+	// write: if it fails, the row simply has no id yet, the same "not yet
+	// mirrorable" state UpdateCallRequest's mirror already tolerates. This
+	// follow-up write never turns a successful mirror into a recorded
+	// sn_writeback_failures row.
 	if s.snWriteback != nil {
 		mirrorReq := req
-		s.snWriteback.Dispatch(ctx, "call_request", resp.CallRequest.ID, "create",
+		pgID := resp.CallRequest.ID
+		s.snWriteback.Dispatch(ctx, "call_request", pgID, "create",
 			map[string]any{"caseId": req.CaseID, "reason": req.Reason, "utcTimes": req.UTCTimes, "durationInMinutes": req.DurationMinutes},
 			func(writeCtx context.Context) error {
-				_, err := s.snMirror.CreateCallRequest(writeCtx, mirrorReq)
-				return err
+				snResp, err := s.snMirror.CreateCallRequest(writeCtx, mirrorReq)
+				if err != nil {
+					return err
+				}
+				snSysID := uuidToSysid(snResp.CallRequest.ID)
+				if setErr := s.repo.SetCallRequestSNSysID(writeCtx, pgID, snSysID); setErr != nil {
+					slog.WarnContext(writeCtx, "sn writeback: call request created in ServiceNow but persisting its sys_id back onto Postgres failed -- update mirrors for this row will keep skipping until this is fixed",
+						"callRequestId", pgID, "error", setErr)
+				}
+				return nil
 			},
 		)
 	}
@@ -184,7 +195,7 @@ func (s *callRequestService) SearchAllCallRequests(ctx context.Context, req doma
 	}
 	// The parent case's assignment team has no column on this data source
 	// (work_item carries only assigned_to_id, and customer_call's own
-	// assignment_group was deliberately skipped in migration 000072), so this
+	// assignment_group was deliberately skipped in migration 0073), so this
 	// filter cannot be honored. Reject it rather than silently ignore it: an
 	// ignored filter would widen the result set.
 	if len(req.Filters.AssignmentTeamIDs) > 0 {
@@ -291,5 +302,46 @@ func (s *callRequestService) UpdateCallRequest(ctx context.Context, req domain.U
 		assigneeID = &user.ID
 	}
 
-	return s.repo.UpdateCallRequest(ctx, req, assigneeID, email)
+	resp, err := s.repo.UpdateCallRequest(ctx, req, assigneeID, email)
+	if err != nil {
+		return domain.UpdateCallRequestResponse{}, err
+	}
+
+	// Best-effort ServiceNow mirror write, DATA_SOURCE=postgres-servicenow-dual-write
+	// only. Postgres has already committed by this point. The SN sys_id
+	// lookup happens inside the dispatched closure (not here), since it must
+	// run after any earlier queued job for this same call request (e.g. the
+	// CREATE mirror that persists it) has already applied -- the dispatcher
+	// serializes jobs per entity key precisely so this ordering holds.
+	if s.snWriteback != nil {
+		mirrorReq := req
+		s.snWriteback.Dispatch(ctx, "call_request", req.ID, "update",
+			map[string]any{"id": req.ID, "state": req.State},
+			func(writeCtx context.Context) error {
+				snSysID, lookupErr := s.repo.GetCallRequestSNSysID(writeCtx, req.ID)
+				if lookupErr != nil {
+					return lookupErr
+				}
+				if snSysID == nil || *snSysID == "" {
+					slog.InfoContext(writeCtx, "sn writeback: call request update mirror skipped, no ServiceNow mapping stored yet",
+						"callRequestId", req.ID)
+					return nil
+				}
+				// mirrorReq.ID is replaced with the mapped ServiceNow sys_id
+				// (as a UUID, since snMirror.UpdateCallRequest converts it
+				// back via uuidToSysid). CaseID is cleared: when set, the SN
+				// mirror does an extra GET-before-write
+				// (verifyCallRequestBelongsToCase, paging through ServiceNow
+				// search results) that this background mirror does not need
+				// -- the case linkage was already established at CREATE
+				// time and never changes on update.
+				mirrorReq.ID = sysidToUUID(*snSysID)
+				mirrorReq.CaseID = ""
+				_, err := s.snMirror.UpdateCallRequest(writeCtx, mirrorReq)
+				return err
+			},
+		)
+	}
+
+	return resp, nil
 }

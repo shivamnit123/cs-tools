@@ -45,7 +45,7 @@ var caseStatsOutstandingStates = []string{
 }
 
 // Change-request state groupings, mirroring ServiceNow's CR_* constants.
-// change_request_state_enum's labels (migration 000047) match them one for
+// change_request_state_enum's labels (migration 0043) match them one for
 // one, so no key translation is needed -- unlike case severity.
 //
 // Unlike cases, a change request's active and outstanding sets genuinely
@@ -60,7 +60,7 @@ var (
 const crResolvedState = "CLOSED"
 
 // conversationActiveStates mirrors ServiceNow's CHAT_ACTIVE_STATE_VALUES.
-// conversation_state_enum (migration 000057) carries the same vocabulary.
+// conversation_state_enum (migration 0057) carries the same vocabulary.
 var conversationActiveStates = []string{"OPEN", "ACTIVE"}
 
 // projectStatsService is the Postgres-backed ProjectStatsService: the whole

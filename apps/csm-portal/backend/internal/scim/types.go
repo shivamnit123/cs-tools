@@ -16,6 +16,11 @@
 
 package scim
 
+import (
+	"encoding/json"
+	"fmt"
+)
+
 // ---- upstream (SCIM wire) types ----
 // These mirror the upstream service's SCIM record types.
 
@@ -49,6 +54,73 @@ type scimUser struct {
 	ID           string      `json:"id"`
 	PhoneNumbers []scimPhone `json:"phoneNumbers,omitempty"`
 	SchemaScope  *scimSchema `json:"urn:scim:wso2:schema,omitempty"`
+	Roles        scimRoles   `json:"roles,omitempty"`
+}
+
+// scimRoleEntry is one element of the SCIM "roles" attribute in its full
+// complex-object shape, as actually observed against a real SCIM service:
+//
+//	{"value": "<opaque role id>", "display": "<role name>",
+//	 "audienceType": "application", "audienceDisplay": "...", ...}
+//
+// "value" is the role resource's own opaque id (a UUID) -- NOT the role
+// name -- confirmed live: filtering by CSMAppRolePrefix against Value
+// silently matched nothing, since no role id happens to start with
+// "app-csm-". "display" is the actual role name and is what carries the
+// "app-csm-*" convention (with an environment-specific suffix that
+// AUTH_<ROLE>_ROLES's own configured values already account for -- this
+// package doesn't need to know or strip it).
+type scimRoleEntry struct {
+	Display string `json:"display"`
+}
+
+// scimRoles decodes the SCIM "roles" attribute. It was initially assumed to
+// follow the same "bare when one, array when several" convention Asgardeo's
+// JWT "roles" claim uses (see middleware's own stringList), but a real SCIM
+// service returns an array of {value, display, ...} objects instead --
+// confirmed live ("json: cannot unmarshal object into Go value of type
+// string" against the naive string-array assumption). Every shape below is
+// accepted, since Asgardeo's own singular/plural convention elsewhere means a
+// bare single value (string or object) isn't safe to rule out either:
+//   - a bare string:                 "roles": "app-csm-example-role"
+//   - an array of strings:           "roles": ["app-csm-example-role", ...]
+//   - a bare {display} object:       "roles": {"display": "app-csm-example-role", ...}
+//   - an array of {display} objects: "roles": [{"display": "app-csm-example-role", ...}, ...]
+type scimRoles []string
+
+func (r *scimRoles) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		if s == "" {
+			*r = nil
+		} else {
+			*r = []string{s}
+		}
+		return nil
+	}
+
+	var oneEntry scimRoleEntry
+	if err := json.Unmarshal(b, &oneEntry); err == nil {
+		*r = []string{oneEntry.Display}
+		return nil
+	}
+
+	var strs []string
+	if err := json.Unmarshal(b, &strs); err == nil {
+		*r = strs
+		return nil
+	}
+
+	var entries []scimRoleEntry
+	if err := json.Unmarshal(b, &entries); err != nil {
+		return fmt.Errorf("roles must be a string, an object, or an array of either: %w", err)
+	}
+	values := make([]string, len(entries))
+	for i, e := range entries {
+		values[i] = e.Display
+	}
+	*r = values
+	return nil
 }
 
 type scimPhone struct {
@@ -80,7 +152,20 @@ type scimPhonePayload struct {
 type UserInfo struct {
 	PhoneNumber            *string
 	LastPasswordUpdateTime *string
+	// Roles is the user's full Asgardeo role assignment, spanning every
+	// application they hold a role in -- not just the CSM portal. A caller
+	// wanting only this portal's roles must filter for the app-specific
+	// prefix itself (see CSMAppRolePrefix).
+	Roles []string
 }
+
+// CSMAppRolePrefix marks a SCIM role as belonging to the CSM portal
+// application, as opposed to some other Asgardeo-registered app the same
+// person may also hold roles in. UserInfo.Roles carries every app's roles
+// unfiltered; a caller that needs just this portal's roles (e.g. to run
+// through AccessGuard.RolesFor for a user other than the caller, where no
+// JWT "roles" claim is available) filters by this prefix first.
+const CSMAppRolePrefix = "app-csm-"
 
 // ExternalUserInfo holds the SCIM "external" org existence/lock status for a
 // user, mirroring the asgardeo-user-check service's {exists, locked} contract.

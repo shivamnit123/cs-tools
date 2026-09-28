@@ -27,7 +27,7 @@ import (
 )
 
 // commentTypeToEnum maps the CommentType values this Postgres data source can
-// represent to comment_type_enum's labels (migration 000037: APPROVAL_HISTORY,
+// represent to comment_type_enum's labels (migration 0040: APPROVAL_HISTORY,
 // COMMENT, WORK_NOTE). CommentTypeActivity maps to APPROVAL_HISTORY for
 // filtering/read-back, but CreateComment refuses to write one: APPROVAL_HISTORY
 // only ever arises from ServiceNow's own audit trail, never from a
@@ -43,10 +43,10 @@ var commentTypeToEnum = map[domain.CommentType]string{
 // any other non-empty value rather than trusting it at face value.
 const commentCreatedByAgent = "agent"
 
-// commentAdminRoleName is the role.name (migration 000004's seed data, joined
+// commentAdminRoleName is the role.name (migration 0008's seed data, joined
 // through user_role) that grants a caller admin-level access to comment
 // edit/delete/visibility decisions on this data source -- confirmed against
-// this service's own existing role checks (migration 000007's
+// this service's own existing role checks (migration 0011's
 // recompute_user_type trigger and user_repo_test.go both use the literal
 // "admin"), not the CSM portal backend's own DefaultRoles vocabulary (a
 // different layer, apps/csm-portal/backend/internal/directory/roles.go),
@@ -106,7 +106,7 @@ func commentRowToDomain(row repository.CommentRow) domain.Comment {
 		CreatedOn:    row.CreatedOn,
 		LastEditedOn: row.LastEditedAt,
 		IsDeleted:    row.DeletedAt != nil,
-		// comment.created_by (migration 000037) is a free-text VARCHAR, not a
+		// comment.created_by (migration 0040) is a free-text VARCHAR, not a
 		// foreign key into "user" -- it mirrors ServiceNow's sys_journal_field
 		// author string, which can be an integration/automation account with
 		// no local user row. This data source writes the resolved caller's
@@ -354,7 +354,20 @@ func authorizeCommentActor(actorEmail string, isAdmin bool, comment repository.C
 	return &apierror.ForbiddenError{Msg: "only the comment's author or an admin may modify it"}
 }
 
-// UpdateComment implements CommentService.
+// UpdateComment implements CommentService. Deliberately NOT mirrored to
+// ServiceNow under DATA_SOURCE=postgres-servicenow-dual-write, unlike
+// CreateComment: ServiceNow's sys_journal_field is append-only, and
+// snCommentSearchService.UpdateComment (the would-be mirror target) already
+// unconditionally returns a ServiceUnavailableError documented as a
+// permanent platform limitation, not a gap -- "stock ServiceNow does not let
+// an agent edit or delete a journal entry either" (see
+// commentEditDeleteUnsupportedOnSNMsg's own doc comment). Dispatching a
+// mirror here would only ever record a guaranteed sn_writeback_failures row
+// on every single edit, forever, which is not useful signal -- there is
+// nothing an operator could ever fix on the ServiceNow side to make it
+// succeed. This is the comment analogue of Part A's conversation finding:
+// no real path exists, so no dead-end plumbing was built for it. Postgres
+// remains fully authoritative for comment edits regardless.
 func (s *commentService) UpdateComment(ctx context.Context, req domain.UpdateCommentRequest) (domain.UpdateCommentResponse, error) {
 	if err := validateUUIDs("id", []string{req.ID}); err != nil {
 		return domain.UpdateCommentResponse{}, err
@@ -387,7 +400,9 @@ func (s *commentService) UpdateComment(ctx context.Context, req domain.UpdateCom
 	}, nil
 }
 
-// DeleteComment implements CommentService.
+// DeleteComment implements CommentService. Deliberately NOT mirrored to
+// ServiceNow under DATA_SOURCE=postgres-servicenow-dual-write -- same
+// reasoning as UpdateComment's own doc comment above.
 func (s *commentService) DeleteComment(ctx context.Context, id string) error {
 	if err := validateUUIDs("id", []string{id}); err != nil {
 		return err

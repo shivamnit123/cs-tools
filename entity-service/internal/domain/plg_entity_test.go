@@ -3,7 +3,7 @@ package domain
 import "testing"
 
 // The rules in this file are the ones written down in more than one place — in
-// Go here, in SQL in migration 000016, and in TypeScript in the webapp. These
+// Go here, in SQL in migration 0021, and in TypeScript in the webapp. These
 // tests pin the Go copy. They cannot prove the other two agree, so the ones
 // that matter most are mirrored by TestSchemaMatchesDomain in the repository
 // package, which asks the database the same questions.

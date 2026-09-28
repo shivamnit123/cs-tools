@@ -57,8 +57,14 @@ func (h *Handlers) ListProducts(w http.ResponseWriter, r *http.Request) {
 }
 
 // ListCSUsers serves GET /cs-users.
+// ListCSUsers serves GET /plg/cs-users, optionally narrowed by ?search=.
+//
+// Without a search this is the first 100 engineers by first name — the list the
+// owner pickers have always shown. With one it is the first 100 matching that
+// fragment of a name or an address, which is how the other ~1,800 are reachable
+// at all: the page limit has not moved, only the ability to aim it.
 func (h *Handlers) ListCSUsers(w http.ResponseWriter, r *http.Request) {
-	items, err := h.reference.ListCSUsers(r.Context())
+	items, err := h.reference.ListCSUsers(r.Context(), r.URL.Query().Get("search"))
 	if err != nil {
 		writeServiceError(w, r, err)
 		return

@@ -27,7 +27,7 @@ import (
 )
 
 // ProductRepository defines the persistence operations for the product table
-// (migration 000010). domain.Product.Class (values "software"/"service")
+// (migration 0015). domain.Product.Class (values "software"/"service")
 // maps to the real product.category column (product_category_enum: SOFTWARE/
 // SERVICE) -- there is no "class" column or "product_class_enum" type in the
 // migrations; category is the one real column with matching semantics

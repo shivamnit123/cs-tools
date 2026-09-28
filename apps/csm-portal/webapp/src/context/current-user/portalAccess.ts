@@ -13,6 +13,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+import { devBypassAccessCheck } from "@config/devFlags";
+
 /**
  * Portal roles as returned in `GET /users/me`'s `roles` (stable keys, not the
  * IdP role names). A user can hold several.
@@ -81,6 +83,22 @@ export interface PortalAccess {
  * loaded, or the request failed) grant nothing, so controls fail closed.
  */
 export function getPortalAccess(roles: string[] | undefined): PortalAccess {
+  // TEMPORARY / LOCAL DEV ONLY — see authConfig.ts's devBypassAccessCheck.
+  // Grants every capability regardless of the real `roles` claim, so a local
+  // account the staging backend hasn't provisioned a portal role for yet can
+  // still see every nav section/action during development.
+  if (devBypassAccessCheck) {
+    return {
+      hasAnyRole: true,
+      canEscalate: true,
+      canDownloadAttachment: true,
+      canUseOperations: true,
+      canUseTimeCardsAndUpdates: true,
+      canWrite: true,
+      canCreateUser: true,
+      canUseSecurityCenter: true,
+    };
+  }
   const held = new Set((roles ?? []).map((r) => r.toLowerCase()));
   const has = (role: string): boolean => held.has(role);
   const full = has(PORTAL_ROLE.admin) || has(PORTAL_ROLE.csEngineer);

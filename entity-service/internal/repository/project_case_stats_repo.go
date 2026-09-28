@@ -73,7 +73,7 @@ type ProjectCaseStatsRepository interface {
 	// mirroring the ServiceNow main aggregate's groupBy('state') +
 	// groupBy('priority'). Severity is read from the "case" extension table
 	// only: it is the sole case-like table with a severity column
-	// (migration 000018), so rows of every other type return an empty
+	// (migration 0023), so rows of every other type return an empty
 	// Severity and are counted in the totals but in no severity bucket.
 	StateSeverityCounts(ctx context.Context, f ProjectCaseStatsFilter) ([]StateSeverityCount, error)
 

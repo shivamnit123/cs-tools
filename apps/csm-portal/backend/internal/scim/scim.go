@@ -38,6 +38,7 @@ const (
 	attrPhoneNumbers = "phoneNumbers"
 	attrUserName     = "userName"
 	attrSchema       = "urn:scim:wso2:schema"
+	attrRoles        = "roles"
 
 	mobilePhoneType = "mobile"
 
@@ -45,8 +46,10 @@ const (
 )
 
 // SearchUser fetches SCIM data for the given email and returns the extracted
-// phone number and last password update time, mirroring searchUsers + processPhoneNumber
-// + processLastPasswordUpdateTime in the Ballerina SCIM module.
+// phone number, last password update time, and role assignment, mirroring
+// searchUsers + processPhoneNumber + processLastPasswordUpdateTime in the
+// Ballerina SCIM module (roles has no Ballerina-side precedent -- it backs the
+// profile page's own role display, added later than that mirrored logic).
 // Returns nil if no matching user is found in the SCIM service.
 func (c *Client) SearchUser(ctx context.Context, email string) (*UserInfo, error) {
 	startIndex := 1
@@ -55,7 +58,7 @@ func (c *Client) SearchUser(ctx context.Context, email string) (*UserInfo, error
 	for {
 		reqBody, err := json.Marshal(scimSearchRequest{
 			Domain:     domainDefault,
-			Attributes: []string{attrPhoneNumbers, attrUserName, attrSchema},
+			Attributes: []string{attrPhoneNumbers, attrUserName, attrSchema, attrRoles},
 			Filter:     fmt.Sprintf("userName eq %s", email),
 			StartIndex: startIndex,
 		})
@@ -93,6 +96,7 @@ func (c *Client) SearchUser(ctx context.Context, email string) (*UserInfo, error
 	return &UserInfo{
 		PhoneNumber:            extractMobilePhone(*found),
 		LastPasswordUpdateTime: extractLastPasswordUpdateTime(*found),
+		Roles:                  []string(found.Roles),
 	}, nil
 }
 

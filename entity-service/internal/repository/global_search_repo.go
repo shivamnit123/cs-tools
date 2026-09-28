@@ -30,7 +30,7 @@ import (
 
 // CaseTypeRefs is the fixed set of case types (the case-like work_item types),
 // as the id/name pairs project metadata and search results both use. Order
-// matches migrations/000016_work_item_table.up.sql's work_item_type_enum,
+// matches migrations/0021_work_item_table.sql's work_item_type_enum,
 // restricted to the case-like subset.
 var CaseTypeRefs = []domain.ReferenceTableItem{
 	{ID: "case", Name: "Case"},

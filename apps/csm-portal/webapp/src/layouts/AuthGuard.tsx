@@ -33,6 +33,7 @@ import NoPortalAccessPage from "@components/error/NoPortalAccessPage";
 import { useLogger } from "@hooks/useLogger";
 import { trySilentSignInOnce } from "@hooks/silentSignIn";
 import { isForbiddenError, isUnauthorizedError } from "@utils/ApiError";
+import { devBypassAccessCheck } from "@config/devFlags";
 
 /**
  * The app shell with the routed page deliberately suppressed.
@@ -173,11 +174,22 @@ function AuthorizedAppShell(): JSX.Element {
   // portal role (so this page can be shown rather than an error), while every
   // other endpoint 403s them. `roles` absent means an older backend or a
   // profile that failed to parse, which must not lock anyone out.
+  //
+  // "sales_solutions" is checked alongside getPortalAccess's own 8 CS-
+  // capability roles, not folded into it: it's a marker for usePortalView
+  // (which view to render), not a CS Portal capability, so a Sales/SA-only
+  // user (holding it and none of the 8) must still pass this gate — they're
+  // headed for the Sales/SA nav, not CS Portal's.
   const holdsNoPortalRole =
-    !!user && Array.isArray(user.roles) && !getPortalAccess(user.roles).hasAnyRole;
+    !!user &&
+    Array.isArray(user.roles) &&
+    !getPortalAccess(user.roles).hasAnyRole &&
+    !user.roles.includes("sales_solutions");
+  // TEMPORARY / LOCAL DEV ONLY — see authConfig.ts's devBypassAccessCheck.
   const notAuthorized =
-    holdsNoPortalRole ||
-    (isError && (isUnauthorizedError(error) || isForbiddenError(error)));
+    !devBypassAccessCheck &&
+    (holdsNoPortalRole ||
+      (isError && (isUnauthorizedError(error) || isForbiddenError(error))));
 
   if (isLoading) {
     return (

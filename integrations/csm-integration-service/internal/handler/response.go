@@ -34,14 +34,16 @@ const maxRequestBodyBytes = 1 << 20
 
 // Error message constants matching apps/csm-portal/backend's error vocabulary.
 const (
-	ErrMsgUnauthorized = "You are not authorized to perform this action. Please try again."
-	ErrMsgForbidden    = "Access to the requested resource is forbidden!"
-	ErrMsgNotFound     = "The requested resource was not found!"
-	ErrMsgBadRequest   = "Invalid request payload."
-	ErrMsgTooLarge     = "Request body too large."
-	ErrMsgInternal     = "An internal server error occurred. Please try again later."
-	ErrMsgInvalidUUID  = "Invalid UUID format."
-	errMsgReadBody     = "Failed to read request body."
+	ErrMsgUnauthorized    = "You are not authorized to perform this action. Please try again."
+	ErrMsgForbidden       = "Access to the requested resource is forbidden!"
+	ErrMsgNotFound        = "The requested resource was not found!"
+	ErrMsgBadRequest      = "Invalid request payload."
+	ErrMsgTooLarge        = "Request body too large."
+	ErrMsgInternal        = "An internal server error occurred. Please try again later."
+	ErrMsgInvalidUUID     = "Invalid UUID format."
+	errMsgReadBody        = "Failed to read request body."
+	ErrMsgContentRequired = "The 'content' field is required."
+	ErrMsgLabelRequired   = "The 'label' field is required."
 )
 
 // errorBody is the JSON error payload format.

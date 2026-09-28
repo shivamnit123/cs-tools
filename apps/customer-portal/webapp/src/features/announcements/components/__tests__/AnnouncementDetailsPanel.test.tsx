@@ -88,12 +88,54 @@ describe("AnnouncementDetailsPanel", () => {
     expect(table).toHaveTextContent("4.2.0");
   });
 
-  it("shows a Security chip when the case carries the Security Announcement tag", () => {
+  it("shows a Security chip when announcementType is SECURITY", () => {
     render(
       <AnnouncementDetailsPanel
         data={{
           title: "Critical vulnerability notice",
           number: "ANN-102",
+          description: "<p>Details</p>",
+          status: { id: "1", label: "Open" },
+          createdOn: "2024-01-15T10:00:00Z",
+          announcementType: "SECURITY",
+        } as never}
+        isLoading={false}
+        isError={false}
+        caseId="case-1"
+        projectId="proj-1"
+        onBack={() => {}}
+      />,
+    );
+    expect(screen.getByText("Security")).toBeInTheDocument();
+  });
+
+  it("shows no Security chip when announcementType is GENERAL and there is no tag", () => {
+    render(
+      <AnnouncementDetailsPanel
+        data={{
+          title: "Maintenance window",
+          number: "ANN-100",
+          description: "<p>Details</p>",
+          status: { id: "1", label: "Open" },
+          createdOn: "2024-01-15T10:00:00Z",
+          announcementType: "GENERAL",
+        } as never}
+        isLoading={false}
+        isError={false}
+        caseId="case-1"
+        projectId="proj-1"
+        onBack={() => {}}
+      />,
+    );
+    expect(screen.queryByText("Security")).not.toBeInTheDocument();
+  });
+
+  it("shows a Security chip via the Security Announcement tag when announcementType predates the column (historical data)", () => {
+    render(
+      <AnnouncementDetailsPanel
+        data={{
+          title: "Critical vulnerability notice",
+          number: "ANN-103",
           description: "<p>Details</p>",
           status: { id: "1", label: "Open" },
           createdOn: "2024-01-15T10:00:00Z",
@@ -107,26 +149,6 @@ describe("AnnouncementDetailsPanel", () => {
       />,
     );
     expect(screen.getByText("Security")).toBeInTheDocument();
-  });
-
-  it("shows no Security chip when the case has no tags", () => {
-    render(
-      <AnnouncementDetailsPanel
-        data={{
-          title: "Maintenance window",
-          number: "ANN-100",
-          description: "<p>Details</p>",
-          status: { id: "1", label: "Open" },
-          createdOn: "2024-01-15T10:00:00Z",
-        } as never}
-        isLoading={false}
-        isError={false}
-        caseId="case-1"
-        projectId="proj-1"
-        onBack={() => {}}
-      />,
-    );
-    expect(screen.queryByText("Security")).not.toBeInTheDocument();
   });
 
   it("renders back button while loading", () => {

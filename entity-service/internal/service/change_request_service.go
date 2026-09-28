@@ -30,7 +30,7 @@ import (
 
 // validChangeRequestState/validChangeRequestImpact (shared with
 // sn_change_request_service.go) restrict to change_request_state_enum/
-// change_request_impact_enum's real labels (migration 000047) -- both
+// change_request_impact_enum's real labels (migration 0043) -- both
 // domain enums happen to match their real column 1:1 (case-folded), so
 // there's nothing Postgres-specific to add for either. change_request also
 // has a risk column (change_request_risk_enum) and a narrower category
@@ -393,7 +393,7 @@ func (s *changeRequestService) DecideChangeRequestApproval(ctx context.Context, 
 	// reused directly rather than redeclared: both data sources accept
 	// exactly the same two request-level values ("approved"/"rejected"),
 	// and approval_stage_approver.status stores those same raw strings
-	// verbatim (migration 000087's own comment), so there is no separate
+	// verbatim (migration 0089's own comment), so there is no separate
 	// translation table to keep in lockstep here.
 	if !changeRequestApprovalDecisions[decision] {
 		return domain.ChangeRequestApprovalDecisionResponse{}, &apierror.ValidationError{Msg: fmt.Sprintf("invalid decision %q", decision)}

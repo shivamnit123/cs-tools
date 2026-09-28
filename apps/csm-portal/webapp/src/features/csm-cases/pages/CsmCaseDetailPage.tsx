@@ -311,6 +311,9 @@ type CaseTabId =
   | "call-requests"
   | "tasks";
 
+// Paused product-wide pending an upstream Task data-model decision. Flip to
+// true to restore; nothing else needs to change.
+const TASKS_FEATURE_ENABLED = false;
 
 const TAB_DEFS: Array<{
   id: CaseTabId;
@@ -588,7 +591,7 @@ export default function CsmCaseDetailPage(): JSX.Element {
     isFetching: isFetchingCallRequests,
   } = useGetCsmCaseCallRequests(isAnnouncement ? undefined : caseId);
   const { data: caseTasks } = useSearchCaseTasks(
-    isAnnouncement ? undefined : caseId,
+    TASKS_FEATURE_ENABLED && !isAnnouncement ? caseId : undefined,
   );
   // The backend only serves time cards to roles that can use them, so the query
   // is skipped (undefined id disables it) rather than left to 403.
@@ -618,6 +621,7 @@ export default function CsmCaseDetailPage(): JSX.Element {
   const {
     data: caseProject,
     isLoading: isCaseProjectLoading,
+    isError: isCaseProjectError,
     refetch: refetchCaseProject,
     isFetching: isFetchingCaseProject,
   } = useGetProject(data?.projectId);
@@ -1552,19 +1556,33 @@ export default function CsmCaseDetailPage(): JSX.Element {
     proceedLifecycleTransition(action, targetState);
   }, [noPublicCommentConfirm, proceedLifecycleTransition]);
 
-  // Assign the case to the chosen engineer via PATCH { assigneeEmail }. The
-  // detail query is invalidated by the hook, so the assignee display refreshes
-  // on success. (ServiceNow-source only; the BE rejects it for PG cases.)
+  // Assign the case to the chosen engineer via PATCH { assigneeEmail }, or
+  // clear the assignee via PATCH { assigneeEmail: null }. The detail query is
+  // invalidated by the hook, so the assignee display refreshes on success.
+  // Supported for both data sources on this branch (the Postgres path has
+  // its own native assignee handling, see entity-service's updateCaseAssignee).
   const onAssign = useCallback(
-    (email: string) => {
+    (email: string | null) => {
       patchCase.mutate(
         { assigneeEmail: email },
         {
           onSuccess: () => {
             setAssignOpen(false);
-            showSuccess("Case reassigned.");
+            showSuccess(email === null ? "Case unassigned." : "Case reassigned.");
           },
-          onError: (err) => showError("Could not reassign the case.", err),
+          onError: (err) => {
+            // SN can reject a clear/reassign for state reasons (e.g. "cannot
+            // be changed for Work In Progress - Ongoing") — surface that
+            // 4xx message verbatim rather than the generic fallback, same
+            // treatment as every other 4xx on this page.
+            const msg =
+              err instanceof BackendApiError && err.status < 500 && err.message
+                ? err.message
+                : email === null
+                  ? "Could not unassign the case."
+                  : "Could not reassign the case.";
+            showError(msg, err);
+          },
         },
       );
     },
@@ -2212,6 +2230,9 @@ export default function CsmCaseDetailPage(): JSX.Element {
   // more than the real (server-side) gate is likely to. This is UI-only — the
   // entity-service enforces the authoritative close gate, and a rejection
   // still surfaces via showError even if this signal is stale or absent.
+  // While TASKS_FEATURE_ENABLED is false, `caseTasks` is always undefined, so
+  // this advisory never fires — the closure UI just falls silent on it,
+  // rather than misleadingly claiming "no open tasks".
   const hasOpenTask = (caseTasks?.tasks ?? []).some((t) => t.state === "OPEN");
   const closeBlockedReason = hasOpenTask
     ? "This case has an open task. Closing may be rejected until it's resolved or closed."
@@ -3013,7 +3034,7 @@ export default function CsmCaseDetailPage(): JSX.Element {
         </Box>
       )}
 
-      {activeTab === "tasks" && caseId && (
+      {TASKS_FEATURE_ENABLED && activeTab === "tasks" && caseId && (
         <Box sx={{ display: "grid", gap: 2, gridTemplateColumns: "1fr" }}>
           <TasksWidget caseId={caseId} />
         </Box>
@@ -3168,7 +3189,7 @@ export default function CsmCaseDetailPage(): JSX.Element {
         />
       )}
 
-      {createTaskOpen && (
+      {TASKS_FEATURE_ENABLED && createTaskOpen && (
         <CreateTaskDialog
           isSaving={createTask.isPending}
           onClose={() => setCreateTaskOpen(false)}
@@ -3276,6 +3297,13 @@ export default function CsmCaseDetailPage(): JSX.Element {
           defaultTitle={c.subject}
           defaultDescription={c.description}
           showRepoField={isCloudSupportSubscription(caseProject?.subscriptionType)}
+          productName={c.product}
+          onboardingInProgress={caseProject?.onboardingStatus === "In-Progress"}
+          projectStatusPending={Boolean(c.projectId) && caseProject === undefined && !isCaseProjectError}
+          projectStatusFailed={Boolean(c.projectId) && isCaseProjectError}
+          onRetryProjectStatus={() => {
+            void refetchCaseProject();
+          }}
           onClose={() => {
             setGithubIssueOpen(false);
             setGithubIssueError(null);
@@ -3295,6 +3323,23 @@ export default function CsmCaseDetailPage(): JSX.Element {
                   // done reading the confirmation.
                   setActiveTab("activities");
                   setGithubIssueResult(res);
+                  const tagLabels = ["s_dp"];
+                  if (payload.regression) tagLabels.push("s_rg");
+                  if (payload.reason === "migration") tagLabels.push("migration");
+                  // Each mutateAsync promise is handled on its own. Per-call
+                  // callbacks on mutate are replaced by the next call.
+                  void Promise.all(
+                    tagLabels.map(async (label) => {
+                      try {
+                        await addTag.mutateAsync(label);
+                      } catch (err) {
+                        showError(
+                          `The GitHub issue was created, but the case tag "${label}" could not be added.`,
+                          err,
+                        );
+                      }
+                    }),
+                  );
                 },
                 onError: (err) => {
                   // Surface the backend's own message on 4xx (invalid state,

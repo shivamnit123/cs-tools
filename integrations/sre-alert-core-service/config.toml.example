@@ -1,0 +1,67 @@
+# Copyright (c) 2026, WSO2 LLC. (https://www.wso2.com).
+#
+# WSO2 LLC. licenses this file to you under the Apache License,
+# Version 2.0 (the "License"); you may not use this file except
+# in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied. See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+[poll]
+# Backstop cadence; a ping may reach a standby, so this also bounds worst-case pickup latency.
+interval = "10s"
+# Fingerprint-sharded workers per cycle; same-fingerprint alerts stay serialized to one worker.
+concurrency = 128
+# Parallel alert-row reads at the start of each cycle.
+read_concurrency = 64
+# Max alert ids processed per cycle; bounds memory under large bursts.
+max_window = 2000
+# How long a missing alert id may stay missing before this service skips it (loudly logged).
+# Measured per id from when the current leader first saw it missing; every missing id in the
+# window ages at once, so a whole gap is skipped together after one gap_timeout.
+gap_timeout = "10m"
+
+[lease]
+# Elects a single active poller across replicas so containers never send duplicate notifications.
+ttl = "15s"
+# How often the leader renews its lease; must be well under ttl.
+renew_interval = "5s"
+
+[cassandra]
+# Bounds Cassandra's startup connection retry so a transient blip doesn't crash-loop the pod.
+connect_max_attempts = 5
+connect_base_delay = "2s"
+# Per-connection and per-query timeouts against Cosmos DB for Apache Cassandra.
+connect_timeout = "10s"
+query_timeout = "10s"
+
+[notify]
+# Bounds retries per downstream target (CSM, Chat webhooks); base delay doubles each attempt.
+max_attempts = 3
+retry_base_delay = "200ms"
+http_timeout = "10s"
+# How often the poller retries incidents whose CSM/Chat notification still hasn't succeeded.
+retry_sweep_interval = "30s"
+# Bounds how many failed CreateIncident attempts before an incident is marked permanently failed.
+max_csm_attempts = 20
+# How long a resolved service-label -> CMDB-service-id mapping is reused before a fresh lookup.
+service_cache_ttl = "15m"
+# Throttles how often a confirmed incident's status is re-checked against CSM during a storm.
+state_check_interval = "1m"
+# Wait before the first RetrySweep-driven CSM retry after a failed attempt.
+csm_retry_base_delay = "30s"
+# Multiplier growing the wait between successive CSM retries during a prolonged outage.
+csm_retry_multiplier = 3
+# Caps how long the exponential CSM retry wait can grow to.
+csm_retry_max_delay = "1h"
+
+[server]
+# Bounds how long SIGTERM/SIGINT waits for in-flight work before forcing exit.
+shutdown_grace = "15s"

@@ -126,7 +126,7 @@ func TestSNCaseService_GetCaseByID_MapsWatchListAutoclosureAndTeams(t *testing.T
 		_, _ = w.Write([]byte(body))
 	})
 
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	cv, err := svc.GetCaseByID(contextWithUserIDToken("token"), sysidToUUID(testWLCaseSysid))
 	if err != nil {
@@ -230,7 +230,7 @@ func TestSNCaseService_GetCaseByID_MapsParentCaseType(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(newBody("incident")))
 		})
-		svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+		svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 		cv, err := svc.GetCaseByID(contextWithUserIDToken("token"), sysidToUUID(testWLCaseSysid))
 		if err != nil {
@@ -249,7 +249,7 @@ func TestSNCaseService_GetCaseByID_MapsParentCaseType(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(newBody("some_future_sn_class")))
 		})
-		svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+		svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 		cv, err := svc.GetCaseByID(contextWithUserIDToken("token"), sysidToUUID(testWLCaseSysid))
 		if err != nil {
@@ -289,7 +289,7 @@ func TestSNCaseService_GetCaseByID_MapsRelatedCaseType(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(body))
 	})
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	cv, err := svc.GetCaseByID(contextWithUserIDToken("token"), sysidToUUID(testWLCaseSysid))
 	if err != nil {
@@ -338,7 +338,7 @@ func TestSNCaseService_GetCaseByID_NestsProductUnderDeployedProduct(t *testing.T
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(newBody(`{"id": "` + dpSysid + `", "name": "WSO2 API Manager", "version": "4.5.0"}`)))
 		})
-		cv, err := NewServiceNowCaseService(client, nil, nil, nil, nil).GetCaseByID(contextWithUserIDToken("token"), sysidToUUID(testWLCaseSysid))
+		cv, err := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil).GetCaseByID(contextWithUserIDToken("token"), sysidToUUID(testWLCaseSysid))
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -359,7 +359,7 @@ func TestSNCaseService_GetCaseByID_NestsProductUnderDeployedProduct(t *testing.T
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(newBody(`{"id": "", "name": "", "version": ""}`)))
 		})
-		cv, err := NewServiceNowCaseService(client, nil, nil, nil, nil).GetCaseByID(contextWithUserIDToken("token"), sysidToUUID(testWLCaseSysid))
+		cv, err := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil).GetCaseByID(contextWithUserIDToken("token"), sysidToUUID(testWLCaseSysid))
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -401,7 +401,7 @@ func TestSNCaseService_GetCaseByID_BallerinaBlockedFieldsAbsent(t *testing.T) {
 		_, _ = w.Write([]byte(body))
 	})
 
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	cv, err := svc.GetCaseByID(contextWithUserIDToken("token"), sysidToUUID(testWLCaseSysid))
 	if err != nil {
@@ -459,7 +459,7 @@ func TestSNCaseService_GetCaseByID_MapsClosedOn(t *testing.T) {
 		_, _ = w.Write([]byte(body))
 	})
 
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	cv, err := svc.GetCaseByID(contextWithUserIDToken("token"), sysidToUUID(testWLCaseSysid))
 	if err != nil {
@@ -498,7 +498,7 @@ func TestSNCaseService_UpdateCase_ExactlyOneFieldValidation(t *testing.T) {
 			req: domain.UpdateCaseRequest{
 				ID:            testDeploymentUUID,
 				DeploymentID:  strPtr(testDeploymentUUID),
-				AssigneeEmail: strPtr("engineer@example.com"),
+				AssigneeEmail: json.RawMessage(`"engineer@example.com"`),
 			},
 		},
 		{
@@ -539,7 +539,7 @@ func TestSNCaseService_UpdateCase_ExactlyOneFieldValidation(t *testing.T) {
 	}
 
 	// client is intentionally nil: every case must fail validation before touching it.
-	svc := NewServiceNowCaseService(nil, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(nil, nil, nil, nil, nil, "", nil)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -618,7 +618,7 @@ func TestSNCaseService_UpdateCase_NewSingleFieldVariants(t *testing.T) {
 				}`))
 			})
 
-			svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+			svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 			resp, err := svc.UpdateCase(contextWithUserIDToken("token"), tt.req)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -756,7 +756,7 @@ func TestSNCaseService_UpdateCase_TypeTransfer_ValidationErrors(t *testing.T) {
 		},
 	}
 
-	svc := NewServiceNowCaseService(nil, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(nil, nil, nil, nil, nil, "", nil)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := svc.UpdateCase(contextWithUserIDToken("token"), tt.req)
@@ -788,7 +788,7 @@ func TestSNCaseService_UpdateCase_TypeTransfer_Case(t *testing.T) {
 		}`))
 	})
 
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 	// severity and issueType are both mandatory for this target: the backing data source
 	// selects Incident vs Query from the severity, and stores issue type on those records.
 	resp, err := svc.UpdateCase(contextWithUserIDToken("token"), domain.UpdateCaseRequest{
@@ -824,7 +824,7 @@ func TestSNCaseService_UpdateCase_TypeTransfer_CaseRequiresSeverityAndIssueType(
 		t.Fatal("backing service must not be called for an incomplete transfer")
 		w.WriteHeader(http.StatusOK)
 	})
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	for name, req := range map[string]domain.UpdateCaseRequest{
 		"missing both":      {ID: testDeploymentUUID, Type: &typ},
@@ -845,7 +845,7 @@ func TestSNCaseService_UpdateCase_TypeTransfer_IssueTypeRejectedForOtherTargets(
 		t.Fatal("backing service must not be called for a mismatched transfer")
 		w.WriteHeader(http.StatusOK)
 	})
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	for _, typ := range []string{"engagement", "security_report_analysis"} {
 		t.Run(typ, func(t *testing.T) {
@@ -865,7 +865,7 @@ func TestSNCaseService_UpdateCase_IssueTypeWithoutTypeRejected(t *testing.T) {
 		t.Fatal("backing service must not be called")
 		w.WriteHeader(http.StatusOK)
 	})
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 	if _, err := svc.UpdateCase(contextWithUserIDToken("token"), domain.UpdateCaseRequest{
 		ID: testDeploymentUUID, IssueType: &issue,
 	}); err == nil {
@@ -889,7 +889,7 @@ func TestSNCaseService_UpdateCase_TypeTransfer_Engagement(t *testing.T) {
 		}`))
 	})
 
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 	_, err := svc.UpdateCase(contextWithUserIDToken("token"), domain.UpdateCaseRequest{
 		ID: testDeploymentUUID, Type: &typ, EngagementType: &engagement, EngagementPaymentType: &paymentType,
 	})
@@ -921,7 +921,7 @@ func TestSNCaseService_UpdateCase_TypeTransfer_SecurityReportAnalysis(t *testing
 		}`))
 	})
 
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 	_, err := svc.UpdateCase(contextWithUserIDToken("token"), domain.UpdateCaseRequest{
 		ID: testDeploymentUUID, Type: &typ,
 	})
@@ -950,7 +950,7 @@ func TestSNCaseService_UpdateCase_TypeTransfer_ServiceRequest(t *testing.T) {
 		}`))
 	})
 
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 	_, err := svc.UpdateCase(contextWithUserIDToken("token"), domain.UpdateCaseRequest{
 		ID:            testDeploymentUUID,
 		Type:          &typ,
@@ -995,7 +995,7 @@ func TestSNCaseService_UpdateCase_TypeTransfer_ServiceRequestRequiresVariables(t
 		w.WriteHeader(http.StatusOK)
 	})
 
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 	// The backing data source requires at least one variable for a service request, exactly as
 	// it does at create time. A transfer with none would be rejected downstream, so reject it
 	// here rather than spending the round-trip.
@@ -1017,7 +1017,7 @@ func TestSNCaseService_UpdateCase_TypeTransfer_SeverityRejectedForOtherTargets(t
 		t.Fatal("backing service must not be called for a mismatched transfer")
 		w.WriteHeader(http.StatusOK)
 	})
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	tests := []struct {
 		name string
@@ -1081,7 +1081,7 @@ const (
 // --- UpdateCase: field-count union (including the internal fix-ETA date variants) ---
 
 func TestSNCaseService_UpdateCase_FieldCountValidation(t *testing.T) {
-	svc := NewServiceNowCaseService(nil, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(nil, nil, nil, nil, nil, "", nil)
 	closed := domain.CaseStateClosed
 	bestCase := "2026-08-01"
 
@@ -1106,6 +1106,23 @@ func TestSNCaseService_UpdateCase_FieldCountValidation(t *testing.T) {
 				t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
 			}
 		})
+	}
+}
+
+// TestSNCaseService_UpdateCase_RejectsMarkFixIssued proves plain
+// DATA_SOURCE=servicenow rejects markFixIssued outright rather than
+// silently accepting or dropping it: work_item.fix_issued_on is a
+// Postgres-managed column with no ServiceNow-native equivalent under this
+// data source. The mirror-only path (patchCaseFields, exercised in
+// TestSNCaseService_PatchCaseFields_NoGetCaseByIDOrEventPublish) is the only
+// place markFixIssued legitimately reaches ServiceNow.
+func TestSNCaseService_UpdateCase_RejectsMarkFixIssued(t *testing.T) {
+	svc := NewServiceNowCaseService(nil, nil, nil, nil, nil, "", nil)
+	markFixIssued := true
+
+	_, err := svc.UpdateCase(contextWithUserIDToken("token"), domain.UpdateCaseRequest{ID: testCaseUUID, MarkFixIssued: &markFixIssued})
+	if _, ok := err.(*apierror.ValidationError); !ok {
+		t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
 	}
 }
 
@@ -1138,7 +1155,7 @@ func TestSNCaseService_UpdateCase_Close_NoLongerCallsTaskSearch(t *testing.T) {
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	closed := domain.CaseStateClosed
 	if _, err := svc.UpdateCase(contextWithUserIDToken("token"), domain.UpdateCaseRequest{ID: testCaseUUID, State: &closed}); err != nil {
@@ -1155,7 +1172,7 @@ func TestSNCaseService_UpdateCase_Close_NoLongerCallsTaskSearch(t *testing.T) {
 // --- Case tags ---
 
 func TestSNCaseService_AddCaseTag_Validation(t *testing.T) {
-	svc := NewServiceNowCaseService(nil, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(nil, nil, nil, nil, nil, "", nil)
 
 	if _, err := svc.AddCaseTag(contextWithUserIDToken("token"), "not-a-uuid", "micro-gw"); err == nil {
 		t.Fatalf("expected error for invalid case id")
@@ -1186,7 +1203,7 @@ func TestSNCaseService_AddCaseTag_Success(t *testing.T) {
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	tag, err := svc.AddCaseTag(contextWithUserIDToken("token"), testCaseUUID, "micro-gw")
 	if err != nil {
@@ -1204,7 +1221,7 @@ func TestSNCaseService_AddCaseTag_Success(t *testing.T) {
 }
 
 func TestSNCaseService_RemoveCaseTag_Validation(t *testing.T) {
-	svc := NewServiceNowCaseService(nil, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(nil, nil, nil, nil, nil, "", nil)
 
 	if err := svc.RemoveCaseTag(contextWithUserIDToken("token"), "not-a-uuid", testTagUUID); err == nil {
 		t.Fatalf("expected error for invalid case id")
@@ -1231,7 +1248,7 @@ func TestSNCaseService_RemoveCaseTag_Success(t *testing.T) {
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	if err := svc.RemoveCaseTag(contextWithUserIDToken("token"), testCaseUUID, testTagUUID); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1244,7 +1261,7 @@ func TestSNCaseService_RemoveCaseTag_Success(t *testing.T) {
 // --- Internal-only fix-ETA estimates: best/most-likely/worst case ---
 
 func TestSNCaseService_UpdateCase_FieldCountValidation_InternalFixEtaVariants(t *testing.T) {
-	svc := NewServiceNowCaseService(nil, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(nil, nil, nil, nil, nil, "", nil)
 	closed := domain.CaseStateClosed
 	bestCase := "2026-08-02"
 
@@ -1290,7 +1307,7 @@ func TestSNCaseService_UpdateCase_CombinableFieldsCombineInSingleRequest(t *test
 		}`))
 	})
 
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 	req := domain.UpdateCaseRequest{
 		ID:               testDeploymentUUID,
 		Subject:          strPtr("Updated subject"),
@@ -1360,7 +1377,7 @@ func TestSNCaseService_UpdateCase_InternalFixEtaVariants_EachIndependentlySettab
 			})
 
 			client := newTestSNClient(t, mux)
-			svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+			svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 			value := "2026-03-01"
 			_, err := svc.UpdateCase(contextWithUserIDToken("token"), tt.req(value))
@@ -1395,7 +1412,7 @@ func TestSNCaseService_UpdateCase_InternalFixEtaVariants_RejectsMalformedDate(t 
 		},
 	}
 
-	svc := NewServiceNowCaseService(nil, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(nil, nil, nil, nil, nil, "", nil)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := svc.UpdateCase(contextWithUserIDToken("token"), tt.req)
@@ -1423,7 +1440,7 @@ func TestSNCaseService_GetCaseByID_MapsInternalFixEtaFields(t *testing.T) {
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	cv, err := svc.GetCaseByID(contextWithUserIDToken("token"), testCaseUUID)
 	if err != nil {
@@ -1456,7 +1473,7 @@ func TestSNCaseService_UpdateCase_EchoesInternalFixEtaFieldsBack(t *testing.T) {
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	bestCase := "2026-02-10"
 	resp, err := svc.UpdateCase(contextWithUserIDToken("token"), domain.UpdateCaseRequest{ID: testCaseUUID, BestCaseFixEta: &bestCase})
@@ -1498,7 +1515,7 @@ func TestSNCaseService_SearchCases_EmptyTypesFilterSendsNoTypeRestriction(t *tes
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	if _, err := svc.SearchCases(contextWithUserIDToken("token"), domain.SearchCasesRequest{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1534,7 +1551,7 @@ func TestSNCaseService_SearchCases_HostingCaseTypesTranslate(t *testing.T) {
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	req := domain.SearchCasesRequest{
 		Filters: domain.SearchCasesFilters{
@@ -1573,7 +1590,7 @@ func TestSNCaseService_SearchCases_GenericFiltersTranslateToSNPayload(t *testing
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	req := domain.SearchCasesRequest{
 		Filters: domain.SearchCasesFilters{
@@ -1646,7 +1663,7 @@ func TestSNCaseService_SearchCases_SLABreachedAndAccountEscalationTravelOnTheirO
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	req := domain.SearchCasesRequest{
 		Filters: domain.SearchCasesFilters{
@@ -1705,7 +1722,7 @@ func TestSNCaseService_SearchCases_CreTeamAndSreTeamFiltersTranslateToSysidsOnTh
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	creUUID := sysidToUUID(testCreTeamSysid)
 	sreUUID := sysidToUUID(testSreTeamSysid)
@@ -1770,7 +1787,7 @@ func TestSNCaseService_SearchCases_ProjectTypeGoesOutAsNamesOnItsOwnKey(t *testi
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	req := domain.SearchCasesRequest{
 		Filters: domain.SearchCasesFilters{
@@ -1823,7 +1840,7 @@ func TestSNCaseService_SearchCases_StateNotInTranslatesToExcludeStateKeys(t *tes
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	req := domain.SearchCasesRequest{
 		Filters: domain.SearchCasesFilters{
@@ -1878,7 +1895,7 @@ func TestSNCaseService_SearchCases_StateNotInOmittedWhenUnused(t *testing.T) {
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	req := domain.SearchCasesRequest{
 		Filters: domain.SearchCasesFilters{
@@ -1905,7 +1922,7 @@ func TestSNCaseService_SearchCases_StateNotInRejectsUnknownValue(t *testing.T) {
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	req := domain.SearchCasesRequest{
 		Filters: domain.SearchCasesFilters{
@@ -1957,7 +1974,7 @@ func TestSNCaseService_SearchCases_AnyOfKeepsSNOrGroupsWireFormat(t *testing.T) 
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	req := domain.SearchCasesRequest{
 		Filters: domain.SearchCasesFilters{
@@ -2045,7 +2062,7 @@ func TestSNCaseService_SearchCases_AnyOfBranchTagsFlowToSNOrGroups(t *testing.T)
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	req := domain.SearchCasesRequest{
 		Filters: domain.SearchCasesFilters{
@@ -2109,7 +2126,7 @@ func TestSNCaseService_SearchCases_AnyOfBranchTagsFlowToSNOrGroups(t *testing.T)
 // reaching the backing service, not silently ignored or forwarded.
 func TestSNCaseService_SearchCases_RejectsBadFilterFieldAndCombo(t *testing.T) {
 	client := newTestSNClient(t, http.NewServeMux())
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	t.Run("bad field name", func(t *testing.T) {
@@ -2142,7 +2159,7 @@ func TestSNCaseService_SearchCases_RejectsBadFilterFieldAndCombo(t *testing.T) {
 // previously this widened the result set instead of erroring).
 func TestSNCaseService_SearchCases_RejectsUnrecognizedEnumValues(t *testing.T) {
 	client := newTestSNClient(t, http.NewServeMux())
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	cases := []struct {
@@ -2178,7 +2195,7 @@ func TestSNCaseService_SearchCases_AcceptsAllPreviouslyValidEnumValues(t *testin
 		_ = json.NewEncoder(w).Encode(map[string]any{"cases": []map[string]any{}, "total": 0, "offset": 0, "limit": 20})
 	})
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	allStates := make([]string, 0, len(validCaseState))
@@ -2238,7 +2255,7 @@ func TestSNCaseService_SearchCases_PopulatesUpdatedOn(t *testing.T) {
 		})
 	})
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	resp, err := svc.SearchCases(ctx, domain.SearchCasesRequest{})
@@ -2277,7 +2294,7 @@ func TestSNCaseService_SearchCases_SetsIncludeExtendedFields(t *testing.T) {
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	if _, err := svc.SearchCases(contextWithUserIDToken("token"), domain.SearchCasesRequest{}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -2317,7 +2334,7 @@ func TestSNCaseService_SearchCases_MapsExtendedFieldsWhenPresent(t *testing.T) {
 		})
 	})
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	resp, err := svc.SearchCases(ctx, domain.SearchCasesRequest{})
@@ -2377,7 +2394,7 @@ func TestSNCaseService_SearchCases_ExtendedFieldsAbsentDoNotPanic(t *testing.T) 
 		})
 	})
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	resp, err := svc.SearchCases(ctx, domain.SearchCasesRequest{})
@@ -2428,7 +2445,7 @@ func TestSNCaseService_SearchTags_Success(t *testing.T) {
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	tags, err := svc.SearchTags(contextWithUserIDToken("token"), domain.SearchTagsRequest{
 		Filters: domain.SearchTagsFilters{SearchQuery: "micro"},
@@ -2475,7 +2492,7 @@ func TestSNCaseService_SearchTags_ForwardsLimit(t *testing.T) {
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	if _, err := svc.SearchTags(contextWithUserIDToken("token"), domain.SearchTagsRequest{
 		Filters: domain.SearchTagsFilters{SearchQuery: "micro"},
@@ -2497,7 +2514,7 @@ func TestSNCaseService_SearchTags_EmptyQuery(t *testing.T) {
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	tags, err := svc.SearchTags(contextWithUserIDToken("token"), domain.SearchTagsRequest{})
 	if err != nil {
@@ -2523,7 +2540,7 @@ func TestSNCaseService_SearchTags_NeverSendsCaseID(t *testing.T) {
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	if _, err := svc.SearchTags(contextWithUserIDToken("token"), domain.SearchTagsRequest{
 		Filters: domain.SearchTagsFilters{SearchQuery: "micro"},
@@ -2543,7 +2560,7 @@ func TestSNCaseService_SearchTags_QueryTooLong(t *testing.T) {
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	_, err := svc.SearchTags(contextWithUserIDToken("token"), domain.SearchTagsRequest{
 		Filters: domain.SearchTagsFilters{SearchQuery: strings.Repeat("a", 201)},
@@ -2609,7 +2626,7 @@ func TestSNCaseService_GetCaseByID_MapsLinkedChangeRequests(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(newBody(changeRequests, changeRequestsAll)))
 		})
-		svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+		svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 		cv, err := svc.GetCaseByID(contextWithUserIDToken("token"), sysidToUUID(testWLCaseSysid))
 		if err != nil {
@@ -2708,7 +2725,7 @@ func TestSNCaseService_GetCaseByID_PopulatesTags(t *testing.T) {
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	cv, err := svc.GetCaseByID(contextWithUserIDToken("token"), testCaseUUID)
 	if err != nil {
@@ -2745,7 +2762,7 @@ func TestSNCaseService_GetCaseByID_TagsFetchFailureDoesNotFailRead(t *testing.T)
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	cv, err := svc.GetCaseByID(contextWithUserIDToken("token"), testCaseUUID)
 	if err != nil {
@@ -2781,7 +2798,7 @@ func TestSNCaseService_AggregateCases_StateGroupByRemapsKeyToDomainEnum(t *testi
 	})
 
 	client := newTestSNClient(t, mux)
-	svc := NewServiceNowCaseService(client, nil, nil, nil, nil)
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil)
 
 	resp, err := svc.AggregateCases(contextWithUserIDToken("token"), domain.AggregateCasesRequest{
 		GroupBy: "state",
@@ -2850,9 +2867,9 @@ func TestSNCaseService_PatchCaseFields_NoGetCaseByIDOrEventPublish(t *testing.T)
 				}`))
 			})
 			publisher := &mockEventPublisher{}
-			svc := NewServiceNowCaseService(client, nil, publisher, nil, nil).(*snCaseService)
+			svc := NewServiceNowCaseService(client, nil, publisher, nil, nil, "", nil).(*snCaseService)
 
-			result, err := svc.patchCaseFields(contextWithUserIDToken("token"), testDeploymentUUID, tt.state, tt.severity, tt.workState)
+			result, err := svc.patchCaseFields(contextWithUserIDToken("token"), testDeploymentUUID, tt.state, tt.severity, tt.workState, nil)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -2875,5 +2892,143 @@ func TestSNCaseService_PatchCaseFields_NoGetCaseByIDOrEventPublish(t *testing.T)
 				t.Errorf("expected 0 publish calls, got %d", len(publisher.calls))
 			}
 		})
+	}
+}
+
+// --- patchCaseFieldsBundle (DATA_SOURCE=postgres-servicenow-dual-write mirror only) ---
+
+// TestSNCaseService_PatchCaseFieldsBundle_SendsAllSupportedFieldsWhenPresent
+// proves patchCaseFieldsBundle forwards every field it supports -- Subject,
+// the three reference ids (as ServiceNow sysids, not the platform UUIDs the
+// request carries), the three fix-ETA dates, and WorkaroundProvided -- in a
+// single PATCH, using the same SN-side JSON keys (title/deploymentId/
+// deployedProductId/relatedCaseId) as the primary UpdateCase path.
+func TestSNCaseService_PatchCaseFieldsBundle_SendsAllSupportedFieldsWhenPresent(t *testing.T) {
+	subject := "Updated subject"
+	bestCase := "2026-08-02"
+	mostLikely := "2026-08-03"
+	worstCase := "2026-08-04"
+	workaroundProvided := true
+
+	var gotBody map[string]any
+	requestCount := 0
+	client := newTestCaseClient(t, func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"message": "Case updated successfully.",
+			"case": {"id": "` + testWLCaseSysid + `", "updatedOn": "2026-01-02 10:00:00", "updatedBy": "engineer@example.com"}
+		}`))
+	})
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil).(*snCaseService)
+
+	req := domain.UpdateCaseRequest{
+		ID:                 testDeploymentUUID,
+		Subject:            &subject,
+		DeploymentID:       strPtr(testDeploymentUUID),
+		DeployedProductID:  strPtr(testDeployedProdID),
+		RelatedCaseID:      strPtr(testRelatedCaseUUID),
+		BestCaseFixEta:     &bestCase,
+		MostLikelyFixEta:   &mostLikely,
+		WorstCaseFixEta:    &worstCase,
+		WorkaroundProvided: &workaroundProvided,
+	}
+
+	if err := svc.patchCaseFieldsBundle(contextWithUserIDToken("token"), testDeploymentUUID, req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if requestCount != 1 {
+		t.Fatalf("expected exactly 1 HTTP request (the PATCH), got %d", requestCount)
+	}
+
+	want := map[string]any{
+		"title":              subject,
+		"deploymentId":       uuidToSysid(testDeploymentUUID),
+		"deployedProductId":  uuidToSysid(testDeployedProdID),
+		"relatedCaseId":      uuidToSysid(testRelatedCaseUUID),
+		"bestCaseFixEta":     bestCase,
+		"mostLikelyFixEta":   mostLikely,
+		"worstCaseFixEta":    worstCase,
+		"workaroundProvided": workaroundProvided,
+	}
+	for field, wantVal := range want {
+		got, ok := gotBody[field]
+		if !ok {
+			t.Fatalf("expected payload field %q to be present in %+v", field, gotBody)
+		}
+		if got != wantVal {
+			t.Errorf("payload field %q: got %v, want %v", field, got, wantVal)
+		}
+	}
+	// description is genuinely ACL-blocked on the ServiceNow side at update
+	// time and must never be sent by this mirror -- see patchCaseFieldsBundle's
+	// own doc comment.
+	if _, ok := gotBody["description"]; ok {
+		t.Errorf("description must never be sent by patchCaseFieldsBundle, got %v", gotBody["description"])
+	}
+}
+
+// TestSNCaseService_PatchCaseFieldsBundle_OmitsFieldsNotInRequest proves the
+// partial-update semantics: patchCaseFieldsBundle is a combinable "plain
+// field" bundle, not a full snapshot, so a field the caller's update didn't
+// set must never appear in the outgoing PATCH body, even though several
+// other fields are present in this request.
+func TestSNCaseService_PatchCaseFieldsBundle_OmitsFieldsNotInRequest(t *testing.T) {
+	subject := "Only subject changed"
+
+	var gotBody map[string]any
+	client := newTestCaseClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"message": "Case updated successfully.",
+			"case": {"id": "` + testWLCaseSysid + `", "updatedOn": "2026-01-02 10:00:00", "updatedBy": "engineer@example.com"}
+		}`))
+	})
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil).(*snCaseService)
+
+	req := domain.UpdateCaseRequest{ID: testDeploymentUUID, Subject: &subject}
+	if err := svc.patchCaseFieldsBundle(contextWithUserIDToken("token"), testDeploymentUUID, req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if got, ok := gotBody["title"]; !ok || got != subject {
+		t.Fatalf("title = %v (present=%v), want %q", got, ok, subject)
+	}
+	for _, field := range []string{"deploymentId", "deployedProductId", "relatedCaseId", "description",
+		"bestCaseFixEta", "mostLikelyFixEta", "worstCaseFixEta", "workaroundProvided"} {
+		if got, ok := gotBody[field]; ok {
+			t.Errorf("field %q must be omitted when not part of this update, got %v", field, got)
+		}
+	}
+}
+
+// TestSNCaseService_PatchCaseFieldsBundle_NoOpWhenNoSupportedFieldSet proves
+// patchCaseFieldsBundle returns nil without issuing any HTTP request when
+// req sets none of the eight fields it mirrors -- it must never send an
+// empty no-op PATCH.
+func TestSNCaseService_PatchCaseFieldsBundle_NoOpWhenNoSupportedFieldSet(t *testing.T) {
+	requestCount := 0
+	client := newTestCaseClient(t, func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"message": "ok", "case": {"id": "` + testWLCaseSysid + `", "updatedOn": "2026-01-02 10:00:00"}}`))
+	})
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", nil).(*snCaseService)
+
+	// Description is set (mirrored elsewhere, or simply not part of this
+	// bundle) but every field this bundle actually forwards is nil.
+	desc := "not mirrored"
+	req := domain.UpdateCaseRequest{ID: testDeploymentUUID, Description: &desc}
+	if err := svc.patchCaseFieldsBundle(contextWithUserIDToken("token"), testDeploymentUUID, req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if requestCount != 0 {
+		t.Fatalf("expected 0 HTTP requests for a no-op bundle, got %d", requestCount)
 	}
 }

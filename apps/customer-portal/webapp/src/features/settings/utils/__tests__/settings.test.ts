@@ -16,6 +16,7 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  hasCustomerAdminRole,
   getAvatarColor,
   getInitials,
   getRoleBadges,
@@ -58,3 +59,17 @@ describe("settings utils", () => {
   });
 });
 
+
+describe("hasCustomerAdminRole", () => {
+  it("accepts the ServiceNow and the CSM database spellings", () => {
+    expect(hasCustomerAdminRole(["external", "sn_customerservice.customer_admin"])).toBe(true);
+    expect(hasCustomerAdminRole(["external", "customer", "customer_admin"])).toBe(true);
+    expect(hasCustomerAdminRole([" Customer_Admin "])).toBe(true);
+  });
+
+  it("refuses everything else", () => {
+    expect(hasCustomerAdminRole(undefined)).toBe(false);
+    expect(hasCustomerAdminRole([])).toBe(false);
+    expect(hasCustomerAdminRole(["customer", "partner_admin", "sn_customerservice.customer"])).toBe(false);
+  });
+});

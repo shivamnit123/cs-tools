@@ -63,11 +63,16 @@ type stubCaseRepo struct {
 	addCaseTag                    func(ctx context.Context, caseID, label, actorEmail string) (domain.Tag, error)
 	setCaseWatchList              func(ctx context.Context, caseID string, userIDs []string, actorEmail string) ([]domain.WatchListUser, time.Time, error)
 	accountDefaultWatcherIDs      func(ctx context.Context, projectID string) ([]string, error)
-	updateCaseAssignee            func(ctx context.Context, caseID, userID, callerEmail string) (time.Time, bool, error)
+	projectContactEmailsByRole    func(ctx context.Context, projectID, role string) ([]string, error)
+	updateCaseAssignee            func(ctx context.Context, caseID string, userID *string, callerEmail string) (time.Time, bool, error)
 	acknowledgeCase               func(ctx context.Context, caseID, actorID, actorEmail string) (bool, domain.AssignedEngineerRef, string, time.Time, error)
 	updateCaseParent              func(ctx context.Context, caseID, parentID, callerEmail string) (time.Time, error)
 	updateCaseFields              func(ctx context.Context, req domain.UpdateCaseRequest, actorID, actorEmail string) (time.Time, error)
 	recordCaseFieldChangeActivity func(ctx context.Context, caseID, fieldName, oldValue, newValue, actorEmail string) error
+	removeCaseTag                 func(ctx context.Context, caseID, tagID, callerEmail string) error
+	setCaseTagSNSysID             func(ctx context.Context, caseID, tagID, snSysID string) error
+	getCaseTagSNSysID             func(ctx context.Context, caseID, tagID string) (*string, error)
+	markCaseFixIssued             func(ctx context.Context, caseID string) (time.Time, bool, error)
 }
 
 func (s *stubCaseRepo) CreateCase(ctx context.Context, req domain.CreateCaseRequest) (domain.Case, error) {
@@ -154,8 +159,23 @@ func (s *stubCaseRepo) AddCaseTag(ctx context.Context, caseID, label, actorEmail
 	}
 	panic("not implemented")
 }
-func (s *stubCaseRepo) RemoveCaseTag(context.Context, string, string, string) error {
+func (s *stubCaseRepo) RemoveCaseTag(ctx context.Context, caseID, tagID, callerEmail string) error {
+	if s.removeCaseTag != nil {
+		return s.removeCaseTag(ctx, caseID, tagID, callerEmail)
+	}
 	panic("not implemented")
+}
+func (s *stubCaseRepo) SetCaseTagSNSysID(ctx context.Context, caseID, tagID, snSysID string) error {
+	if s.setCaseTagSNSysID != nil {
+		return s.setCaseTagSNSysID(ctx, caseID, tagID, snSysID)
+	}
+	return nil
+}
+func (s *stubCaseRepo) GetCaseTagSNSysID(ctx context.Context, caseID, tagID string) (*string, error) {
+	if s.getCaseTagSNSysID != nil {
+		return s.getCaseTagSNSysID(ctx, caseID, tagID)
+	}
+	return nil, nil
 }
 func (s *stubCaseRepo) SearchTags(context.Context, string, string, int) ([]domain.Tag, error) {
 	panic("not implemented")
@@ -178,7 +198,18 @@ func (s *stubCaseRepo) AccountDefaultWatcherIDs(ctx context.Context, projectID s
 	}
 	return nil, nil
 }
-func (s *stubCaseRepo) UpdateCaseAssignee(ctx context.Context, caseID, userID, callerEmail string) (time.Time, bool, error) {
+
+// ProjectContactEmailsByRole defaults to empty rather than panicking, same
+// reasoning as AccountDefaultWatcherIDs above: publishCaseCreatedEvent now
+// calls it for every announcement-type case create, and none of this stub's
+// existing test cases care about its contents.
+func (s *stubCaseRepo) ProjectContactEmailsByRole(ctx context.Context, projectID, role string) ([]string, error) {
+	if s.projectContactEmailsByRole != nil {
+		return s.projectContactEmailsByRole(ctx, projectID, role)
+	}
+	return nil, nil
+}
+func (s *stubCaseRepo) UpdateCaseAssignee(ctx context.Context, caseID string, userID *string, callerEmail string) (time.Time, bool, error) {
 	if s.updateCaseAssignee != nil {
 		return s.updateCaseAssignee(ctx, caseID, userID, callerEmail)
 	}
@@ -199,6 +230,12 @@ func (s *stubCaseRepo) UpdateCaseParent(ctx context.Context, caseID, parentID, c
 func (s *stubCaseRepo) UpdateCaseFields(ctx context.Context, req domain.UpdateCaseRequest, actorID, actorEmail string) (time.Time, error) {
 	if s.updateCaseFields != nil {
 		return s.updateCaseFields(ctx, req, actorID, actorEmail)
+	}
+	panic("not implemented")
+}
+func (s *stubCaseRepo) MarkCaseFixIssued(ctx context.Context, caseID string) (time.Time, bool, error) {
+	if s.markCaseFixIssued != nil {
+		return s.markCaseFixIssued(ctx, caseID)
 	}
 	panic("not implemented")
 }
@@ -293,17 +330,14 @@ func (stubUserRepo) GetUsersByIDs(context.Context, []string) ([]domain.User, err
 // query support yet), rather than silently accepting the request and
 // returning a broader-than-requested result set.
 func TestCaseService_SearchCases_RejectsUnsupportedPostgresFields(t *testing.T) {
-	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	cases := []struct {
 		name   string
 		filter domain.CaseFieldFilter
 	}{
-		{name: "product", filter: domain.CaseFieldFilter{Field: "product", Op: "in", Values: []string{"API Manager"}}},
 		{name: "projectType", filter: domain.CaseFieldFilter{Field: "projectType", Op: "in", Values: []string{"Subscription"}}},
-		{name: "creTeam", filter: domain.CaseFieldFilter{Field: "creTeam", Op: "in", Values: []string{"00000000-0000-0000-0000-000000000000"}}},
-		{name: "sreTeam", filter: domain.CaseFieldFilter{Field: "sreTeam", Op: "in", Values: []string{"00000000-0000-0000-0000-000000000000"}}},
 		{name: "assignedUserId isEmpty (Unassigned)", filter: domain.CaseFieldFilter{Field: "assignedUserId", Op: "isEmpty"}},
 		{name: "resolutionNotes isEmpty", filter: domain.CaseFieldFilter{Field: "resolutionNotes", Op: "isEmpty"}},
 		// state+in IS supported by this backend; only the exclusion is not.
@@ -366,7 +400,7 @@ func TestCaseService_SearchCases_SupportedFieldsStillReachRepository(t *testing.
 					return nil, 0, nil
 				},
 			}
-			svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
+			svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 			ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 			req := domain.SearchCasesRequest{Filters: domain.SearchCasesFilters{
@@ -382,6 +416,68 @@ func TestCaseService_SearchCases_SupportedFieldsStillReachRepository(t *testing.
 	}
 }
 
+// TestCaseService_SearchCases_ProductAndTeamFiltersReachRepository is the
+// regression guard for the same "rejected outright despite a real backing
+// column" bug as the other filters above: product, creTeam and sreTeam used
+// to 400 unconditionally on this data source, even though caseRepo.SearchCases
+// already joins product (for ProductName in every result row) and, once this
+// fix's account/"group" joins were added, account.cre_team_id/sre_team_id the
+// same way GetCaseByID already resolves them.
+func TestCaseService_SearchCases_ProductAndTeamFiltersReachRepository(t *testing.T) {
+	creTeamID := "00000000-0000-0000-0000-000000000001"
+	sreTeamID := "00000000-0000-0000-0000-000000000002"
+	var got domain.SearchCasesRequest
+	repo := &stubCaseRepo{
+		searchCases: func(ctx context.Context, req domain.SearchCasesRequest) ([]domain.SearchCaseView, int, error) {
+			got = req
+			return nil, 0, nil
+		},
+	}
+	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+
+	req := domain.SearchCasesRequest{Filters: domain.SearchCasesFilters{
+		Filters: []domain.CaseFieldFilter{
+			{Field: "product", Op: "in", Values: []string{"Asgardeo"}},
+			{Field: "creTeam", Op: "in", Values: []string{creTeamID}},
+			{Field: "sreTeam", Op: "in", Values: []string{sreTeamID}},
+		},
+	}}
+	if _, err := svc.SearchCases(ctx, req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got.Parsed.ProductNames) != 1 || got.Parsed.ProductNames[0] != "Asgardeo" {
+		t.Errorf("ProductNames = %v, want [Asgardeo]", got.Parsed.ProductNames)
+	}
+	if len(got.Parsed.CreTeamIDs) != 1 || got.Parsed.CreTeamIDs[0] != creTeamID {
+		t.Errorf("CreTeamIDs = %v, want [%s]", got.Parsed.CreTeamIDs, creTeamID)
+	}
+	if len(got.Parsed.SreTeamIDs) != 1 || got.Parsed.SreTeamIDs[0] != sreTeamID {
+		t.Errorf("SreTeamIDs = %v, want [%s]", got.Parsed.SreTeamIDs, sreTeamID)
+	}
+}
+
+// TestCaseService_SearchCases_RejectsMalformedTeamUUID proves creTeam/sreTeam
+// still validate as UUIDs before reaching the repository -- only the blanket
+// "unsupported on Postgres" rejection was removed.
+func TestCaseService_SearchCases_RejectsMalformedTeamUUID(t *testing.T) {
+	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+
+	for _, field := range []string{"creTeam", "sreTeam"} {
+		t.Run(field, func(t *testing.T) {
+			req := domain.SearchCasesRequest{Filters: domain.SearchCasesFilters{
+				Filters: []domain.CaseFieldFilter{{Field: field, Op: "in", Values: []string{"not-a-uuid"}}},
+			}}
+			_, err := svc.SearchCases(ctx, req)
+			var ve *apierror.ValidationError
+			if !asValidationError(err, &ve) {
+				t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
+			}
+		})
+	}
+}
+
 // TestCaseService_SearchCases_RejectsServiceNowOnlyOptions proves the Postgres
 // path rejects the search options that only snCaseService implements: the
 // slaBreached and account-escalation filters, and grouped counts.
@@ -390,7 +486,7 @@ func TestCaseService_SearchCases_SupportedFieldsStillReachRepository(t *testing.
 // The stub repository panics if reached, so a passing test proves the
 // short-circuit, not merely that the repository ignored the option.
 func TestCaseService_SearchCases_RejectsServiceNowOnlyOptions(t *testing.T) {
-	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	cases := []struct {
@@ -467,7 +563,7 @@ func TestCaseService_SearchCaseComments(t *testing.T) {
 				return nil, 0, nil
 			},
 		}
-		svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
+		svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 
 		resp, err := svc.SearchCaseComments(context.Background(), domain.SearchCaseCommentsRequest{CaseID: caseID})
 		if err != nil {
@@ -495,7 +591,7 @@ func TestCaseService_SearchCaseComments(t *testing.T) {
 				return []domain.CaseComment{want}, 1, nil
 			},
 		}
-		svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
+		svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 
 		resp, err := svc.SearchCaseComments(context.Background(), domain.SearchCaseCommentsRequest{CaseID: caseID})
 		if err != nil {
@@ -525,7 +621,7 @@ func TestCaseService_SearchCaseComments(t *testing.T) {
 				return []domain.CaseComment{newest, middle, oldest}, 5, nil
 			},
 		}
-		svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
+		svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 
 		resp, err := svc.SearchCaseComments(context.Background(), domain.SearchCaseCommentsRequest{
 			CaseID:     caseID,
@@ -556,7 +652,7 @@ func TestCaseService_SearchCaseComments(t *testing.T) {
 				return nil, 0, nil
 			},
 		}
-		svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
+		svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 
 		_, err := svc.SearchCaseComments(context.Background(), domain.SearchCaseCommentsRequest{CaseID: "not-a-uuid"})
 		var ve *apierror.ValidationError
@@ -575,7 +671,7 @@ func TestCaseService_SearchCaseComments(t *testing.T) {
 // CreateCase's own "only type \"case\" is supported" guard), so none of these
 // fields have anywhere to go on this data source.
 func TestCaseService_UpdateCase_RejectsTypeTransferFields(t *testing.T) {
-	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := context.Background()
 	strPtr := func(s string) *string { return &s }
 	engagement := domain.EngagementTypeMigration
@@ -628,7 +724,7 @@ func TestCaseService_UpdateCase_RejectsTypeTransferFields(t *testing.T) {
 // also rejects: two exclusive fields together, or one exclusive field
 // alongside anything from the combinable bundle.
 func TestCaseService_UpdateCase_RejectsExclusiveFieldCombinations(t *testing.T) {
-	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := context.Background()
 	open := domain.CaseStateOpen
 	email := "assignee@example.com"
@@ -640,8 +736,8 @@ func TestCaseService_UpdateCase_RejectsExclusiveFieldCombinations(t *testing.T) 
 		name string
 		req  domain.UpdateCaseRequest
 	}{
-		{name: "state+assigneeEmail", req: domain.UpdateCaseRequest{ID: testDeploymentUUID, State: &open, AssigneeEmail: &email}},
-		{name: "assigneeEmail+acknowledge", req: domain.UpdateCaseRequest{ID: testDeploymentUUID, AssigneeEmail: &email, Acknowledge: &ack}},
+		{name: "state+assigneeEmail", req: domain.UpdateCaseRequest{ID: testDeploymentUUID, State: &open, AssigneeEmail: json.RawMessage(`"` + email + `"`)}},
+		{name: "assigneeEmail+acknowledge", req: domain.UpdateCaseRequest{ID: testDeploymentUUID, AssigneeEmail: json.RawMessage(`"` + email + `"`), Acknowledge: &ack}},
 		{name: "parentId+watchList", req: domain.UpdateCaseRequest{ID: testDeploymentUUID, ParentID: &parentID, WatchList: &[]string{}}},
 		{name: "acknowledge+subject", req: domain.UpdateCaseRequest{ID: testDeploymentUUID, Acknowledge: &ack, Subject: &subject}},
 		{name: "state+subject", req: domain.UpdateCaseRequest{ID: testDeploymentUUID, State: &open, Subject: &subject}},
@@ -651,7 +747,7 @@ func TestCaseService_UpdateCase_RejectsExclusiveFieldCombinations(t *testing.T) 
 		// combinableCount at all, so these used to sail past the mutual-
 		// exclusion check and get silently dropped by whichever branch
 		// handled the other field.
-		{name: "assigneeEmail+closeNotes", req: domain.UpdateCaseRequest{ID: testDeploymentUUID, AssigneeEmail: &email, CloseNotes: &subject}},
+		{name: "assigneeEmail+closeNotes", req: domain.UpdateCaseRequest{ID: testDeploymentUUID, AssigneeEmail: json.RawMessage(`"` + email + `"`), CloseNotes: &subject}},
 		{name: "subject+closeNotes", req: domain.UpdateCaseRequest{ID: testDeploymentUUID, Subject: &subject, CloseNotes: &subject}},
 	}
 	for _, tc := range cases {
@@ -673,8 +769,12 @@ func TestCaseService_UpdateCase_UpdatesAssignee(t *testing.T) {
 	assigneeEmail := "assignee@example.com"
 	called := make(chan string, 1)
 	mirror := &stubMirrorCaseService{
-		patchCaseAssigneeFn: func(_ context.Context, caseID, email string) error {
-			called <- email
+		patchCaseAssigneeFn: func(_ context.Context, caseID string, email *string) error {
+			if email == nil {
+				called <- ""
+				return nil
+			}
+			called <- *email
 			return nil
 		},
 	}
@@ -686,9 +786,9 @@ func TestCaseService_UpdateCase_UpdatesAssignee(t *testing.T) {
 			// decision comes from updateCaseAssignee's own "changed" return.
 			return domain.CaseView{ID: id, Number: "CS0001"}, nil
 		},
-		updateCaseAssignee: func(_ context.Context, caseID, userID, callerEmail string) (time.Time, bool, error) {
-			if userID != "assignee-id" {
-				t.Errorf("userID = %q, want assignee-id", userID)
+		updateCaseAssignee: func(_ context.Context, caseID string, userID *string, callerEmail string) (time.Time, bool, error) {
+			if userID == nil || *userID != "assignee-id" {
+				t.Errorf("userID = %v, want assignee-id", userID)
 			}
 			return time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC), true, nil
 		},
@@ -700,10 +800,10 @@ func TestCaseService_UpdateCase_UpdatesAssignee(t *testing.T) {
 		return domain.User{ID: "assignee-id", Email: email, FirstName: "John", LastName: "Roe"}, nil
 	}}
 	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
-	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
-	resp, err := svc.UpdateCase(ctx, domain.UpdateCaseRequest{ID: testDeploymentUUID, AssigneeEmail: &assigneeEmail})
+	resp, err := svc.UpdateCase(ctx, domain.UpdateCaseRequest{ID: testDeploymentUUID, AssigneeEmail: json.RawMessage(`"` + assigneeEmail + `"`)})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -726,14 +826,92 @@ func TestCaseService_UpdateCase_UpdatesAssignee(t *testing.T) {
 
 // TestCaseService_UpdateCase_RejectsEmptyAssigneeEmail proves an explicitly
 // empty assigneeEmail is a validation error rather than clearing the
-// assignee -- AssigneeEmail has no documented "unassign" semantics.
+// assignee -- an explicit null (json.RawMessage(`null`)) is the only way to
+// clear it; a quoted empty string is still rejected.
 func TestCaseService_UpdateCase_RejectsEmptyAssigneeEmail(t *testing.T) {
-	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
-	empty := ""
-	_, err := svc.UpdateCase(contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com")), domain.UpdateCaseRequest{ID: testDeploymentUUID, AssigneeEmail: &empty})
+	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
+	_, err := svc.UpdateCase(contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com")), domain.UpdateCaseRequest{ID: testDeploymentUUID, AssigneeEmail: json.RawMessage(`""`)})
 	var ve *apierror.ValidationError
 	if !asValidationError(err, &ve) {
 		t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
+	}
+}
+
+// TestCaseService_UpdateCase_ClearsAssignee proves an explicit
+// assigneeEmail:null PATCH clears work_item.assigned_to_id (nil userID
+// passed through to CaseRepository.UpdateCaseAssignee), never publishes
+// case.assigned (publishCaseAssigned's own `assigneeEmail == ""` guard),
+// records the activity-feed entry with the literal "Unassigned" new value,
+// returns AssignedTo/AssignedToUser as nil, and forwards the clear to the
+// ServiceNow mirror as a nil *string (not an ambiguous empty string).
+func TestCaseService_UpdateCase_ClearsAssignee(t *testing.T) {
+	called := make(chan *string, 1)
+	mirror := &stubMirrorCaseService{
+		patchCaseAssigneeFn: func(_ context.Context, caseID string, email *string) error {
+			called <- email
+			return nil
+		},
+	}
+	var recordedNewValue string
+	repo := &stubCaseRepo{
+		getCaseByID: func(_ context.Context, id string, _ repository.SearchScope) (domain.CaseView, error) {
+			return domain.CaseView{
+				ID:               id,
+				Number:           "CS0002",
+				AssignedEngineer: domain.NewUserReference("assignee-id", "john.roe@example.com", "John Roe"),
+			}, nil
+		},
+		updateCaseAssignee: func(_ context.Context, caseID string, userID *string, callerEmail string) (time.Time, bool, error) {
+			if userID != nil {
+				t.Errorf("userID = %v, want nil (clear)", *userID)
+			}
+			return time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC), true, nil
+		},
+		recordCaseFieldChangeActivity: func(_ context.Context, _, field, _, newValue, _ string) error {
+			if field == "assigned_to_id" {
+				recordedNewValue = newValue
+			}
+			return nil
+		},
+	}
+	// resolveActor also goes through GetUserByEmail (for the caller, "jane.doe@example.com"
+	// below) -- only an assignee lookup (any other email) is disallowed on a clear.
+	userRepo := stubUserRepo{getUserByEmail: func(_ context.Context, email string) (domain.User, error) {
+		if email == "jane.doe@example.com" {
+			return domain.User{ID: "actor-id", Email: email}, nil
+		}
+		t.Fatalf("GetUserByEmail should not be called for an assignee lookup on a clear, got email %q", email)
+		return domain.User{}, nil
+	}}
+	publisher := &mockEventPublisher{}
+	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
+	svc := NewCaseServiceWithSNWriteback(repo, userRepo, publisher, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
+
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	resp, err := svc.UpdateCase(ctx, domain.UpdateCaseRequest{ID: testDeploymentUUID, AssigneeEmail: json.RawMessage(`null`)})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Case.AssignedTo != nil {
+		t.Errorf("AssignedTo = %+v, want nil", resp.Case.AssignedTo)
+	}
+	if resp.Case.AssignedToUser != nil {
+		t.Errorf("AssignedToUser = %+v, want nil", resp.Case.AssignedToUser)
+	}
+	if len(publisher.calls) != 0 {
+		t.Errorf("case.assigned published on a clear, got %d calls", len(publisher.calls))
+	}
+	if recordedNewValue != "Unassigned" {
+		t.Errorf("activity new value = %q, want Unassigned", recordedNewValue)
+	}
+
+	select {
+	case got := <-called:
+		if got != nil {
+			t.Errorf("mirror got %v, want nil (clear)", *got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mirror.patchCaseAssignee was never called")
 	}
 }
 
@@ -758,7 +936,7 @@ func TestCaseService_UpdateCase_AcknowledgesCase(t *testing.T) {
 		return domain.User{ID: "actor-id", Email: email}, nil
 	}}
 	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
-	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 	resp, err := svc.UpdateCase(ctx, domain.UpdateCaseRequest{ID: testDeploymentUUID, Acknowledge: &ack})
@@ -801,7 +979,7 @@ func TestCaseService_UpdateCase_AcknowledgeNoOpSkipsMirror(t *testing.T) {
 		return domain.User{ID: "actor-id", Email: email}, nil
 	}}
 	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
-	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 	resp, err := svc.UpdateCase(ctx, domain.UpdateCaseRequest{ID: testDeploymentUUID, Acknowledge: &ack})
@@ -823,7 +1001,7 @@ func TestCaseService_UpdateCase_AcknowledgeNoOpSkipsMirror(t *testing.T) {
 // TestCaseService_UpdateCase_RejectsAcknowledgeFalse proves Acknowledge only
 // accepts true -- there is no unacknowledge.
 func TestCaseService_UpdateCase_RejectsAcknowledgeFalse(t *testing.T) {
-	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 	no := false
 	_, err := svc.UpdateCase(contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com")), domain.UpdateCaseRequest{ID: testDeploymentUUID, Acknowledge: &no})
 	var ve *apierror.ValidationError
@@ -864,7 +1042,7 @@ func TestCaseService_UpdateCase_UpdatesParent(t *testing.T) {
 		return domain.User{ID: "actor-id", Email: email}, nil
 	}}
 	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
-	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 	if _, err := svc.UpdateCase(ctx, domain.UpdateCaseRequest{ID: testDeploymentUUID, ParentID: &parentID}); err != nil {
@@ -899,7 +1077,7 @@ func TestCaseService_UpdateCase_UpdatesFieldsBundle(t *testing.T) {
 	userRepo := stubUserRepo{getUserByEmail: func(_ context.Context, email string) (domain.User, error) {
 		return domain.User{ID: "actor-id", Email: email}, nil
 	}}
-	svc := NewCaseService(repo, userRepo, nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, userRepo, nil, alwaysUnrestrictedAccess{}, nil)
 
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 	resp, err := svc.UpdateCase(ctx, domain.UpdateCaseRequest{ID: testDeploymentUUID, Subject: &subject, BestCaseFixEta: &bestCaseFixEta})
@@ -919,7 +1097,7 @@ func TestCaseService_UpdateCase_UpdatesFieldsBundle(t *testing.T) {
 // reaches the repository (the stub panics if reached).
 func TestCaseService_UpdateCase_RejectsMalformedFixEtaDate(t *testing.T) {
 	bad := "not-a-date"
-	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 	_, err := svc.UpdateCase(ctx, domain.UpdateCaseRequest{ID: testDeploymentUUID, BestCaseFixEta: &bad})
 	var ve *apierror.ValidationError
@@ -966,7 +1144,7 @@ func TestCaseService_UpdateCase_ResolutionFieldsRequireClosedOrSolutionProposedS
 					return domain.Case{ID: req.ID, State: &st}, nil, nil
 				},
 			}
-			svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
+			svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 			_, err := svc.UpdateCase(context.Background(), tc.req)
 			if tc.wantErr {
 				var ve *apierror.ValidationError
@@ -987,7 +1165,7 @@ func TestCaseService_UpdateCase_ResolutionFieldsRequireClosedOrSolutionProposedS
 func TestCaseService_UpdateCase_RejectsInvalidCause(t *testing.T) {
 	closed := domain.CaseStateClosed
 	bogus := domain.CaseCause("not_a_real_cause")
-	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 	_, err := svc.UpdateCase(context.Background(), domain.UpdateCaseRequest{ID: testDeploymentUUID, State: &closed, Cause: &bogus})
 	var ve *apierror.ValidationError
 	if !asValidationError(err, &ve) {
@@ -1007,7 +1185,7 @@ func TestCaseService_SearchCases_AnyOfReachesRepository(t *testing.T) {
 			return nil, 0, nil
 		},
 	}
-	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	req := domain.SearchCasesRequest{Filters: domain.SearchCasesFilters{
@@ -1047,32 +1225,59 @@ func TestCaseService_SearchCases_AnyOfReachesRepository(t *testing.T) {
 // the mirror never calls either of those on this stub, only the bare/lean
 // methods, and a stray call to the wrong one should fail loudly (embedding
 // CaseService with these left unset means such a call panics on a nil func).
+// stubProjectContactRepo backs validateWatchListProjectMembership's tests.
+// Only GetProjectContactByUserID is ever called by that check; a stray call
+// to SearchProjectContacts panics rather than silently returning nothing.
+type stubProjectContactRepo struct {
+	getProjectContactByUserID func(ctx context.Context, projectID, userID, callerEmail string) (repository.ProjectContactRow, error)
+}
+
+func (s *stubProjectContactRepo) SearchProjectContacts(context.Context, string, domain.SearchProjectContactsRequest, string) ([]repository.ProjectContactRow, int, error) {
+	panic("not implemented")
+}
+
+func (s *stubProjectContactRepo) GetProjectContactByUserID(ctx context.Context, projectID, userID, callerEmail string) (repository.ProjectContactRow, error) {
+	if s.getProjectContactByUserID != nil {
+		return s.getProjectContactByUserID(ctx, projectID, userID, callerEmail)
+	}
+	panic("not implemented")
+}
+
 type stubMirrorCaseService struct {
 	CaseService
-	createCase              func(ctx context.Context, req domain.CreateCaseRequest) (domain.CreateCaseResponse, error)
-	patchCaseFieldsFn       func(ctx context.Context, caseID string, state *domain.CaseState, severity *domain.CaseSeverity, workState *domain.CaseWorkState) (domain.UpdatedCase, error)
-	createBareCaseComment   func(ctx context.Context, caseID string, commentType domain.CommentType, content string) (domain.CaseCommentDetail, error)
-	addCaseTagAsFn          func(ctx context.Context, caseID, label, actorEmail string) (domain.Tag, error)
-	patchCaseWatchListFn    func(ctx context.Context, caseID string, userIDs []string) (domain.UpdatedCase, error)
-	patchCaseAssigneeFn     func(ctx context.Context, caseID, assigneeEmail string) error
-	patchCaseAcknowledgeFn  func(ctx context.Context, caseID string) error
-	patchCaseParentFn       func(ctx context.Context, caseID, parentID string) error
-	patchCaseFieldsBundleFn func(ctx context.Context, caseID string, req domain.UpdateCaseRequest) error
+	createCase                   func(ctx context.Context, req domain.CreateCaseRequest) (domain.CreateCaseResponse, error)
+	patchCaseFieldsFn            func(ctx context.Context, caseID string, state *domain.CaseState, severity *domain.CaseSeverity, workState *domain.CaseWorkState, markFixIssued *bool) (domain.UpdatedCase, error)
+	createBareCaseComment        func(ctx context.Context, caseID string, commentType domain.CommentType, content string) (domain.CaseCommentDetail, error)
+	addCaseTagAsFn               func(ctx context.Context, caseID, label, actorEmail string) (domain.Tag, error)
+	removeCaseTagFn              func(ctx context.Context, caseID, tagID string) error
+	patchCaseWatchListFn         func(ctx context.Context, caseID string, userIDs []string) (domain.UpdatedCase, error)
+	patchCaseAssigneeFn          func(ctx context.Context, caseID string, assigneeEmail *string) error
+	patchCaseAcknowledgeFn       func(ctx context.Context, caseID string) error
+	patchCaseParentFn            func(ctx context.Context, caseID, parentID string) error
+	patchCaseFieldsBundleFn      func(ctx context.Context, caseID string, req domain.UpdateCaseRequest) error
+	projectContactEmailsByRoleFn func(ctx context.Context, projectID, role string) ([]string, error)
+}
+
+func (s *stubMirrorCaseService) ProjectContactEmailsByRole(ctx context.Context, projectID, role string) ([]string, error) {
+	if s.projectContactEmailsByRoleFn != nil {
+		return s.projectContactEmailsByRoleFn(ctx, projectID, role)
+	}
+	return nil, nil
 }
 
 func (s *stubMirrorCaseService) CreateCase(ctx context.Context, req domain.CreateCaseRequest) (domain.CreateCaseResponse, error) {
 	return s.createCase(ctx, req)
 }
 
-func (s *stubMirrorCaseService) patchCaseFields(ctx context.Context, caseID string, state *domain.CaseState, severity *domain.CaseSeverity, workState *domain.CaseWorkState) (domain.UpdatedCase, error) {
-	return s.patchCaseFieldsFn(ctx, caseID, state, severity, workState)
+func (s *stubMirrorCaseService) patchCaseFields(ctx context.Context, caseID string, state *domain.CaseState, severity *domain.CaseSeverity, workState *domain.CaseWorkState, markFixIssued *bool) (domain.UpdatedCase, error) {
+	return s.patchCaseFieldsFn(ctx, caseID, state, severity, workState, markFixIssued)
 }
 
 func (s *stubMirrorCaseService) CreateBareCaseComment(ctx context.Context, caseID string, commentType domain.CommentType, content string) (domain.CaseCommentDetail, error) {
 	return s.createBareCaseComment(ctx, caseID, commentType, content)
 }
 
-func (s *stubMirrorCaseService) patchCaseAssignee(ctx context.Context, caseID, assigneeEmail string) error {
+func (s *stubMirrorCaseService) patchCaseAssignee(ctx context.Context, caseID string, assigneeEmail *string) error {
 	return s.patchCaseAssigneeFn(ctx, caseID, assigneeEmail)
 }
 
@@ -1090,6 +1295,10 @@ func (s *stubMirrorCaseService) patchCaseFieldsBundle(ctx context.Context, caseI
 
 func (s *stubMirrorCaseService) AddCaseTagAs(ctx context.Context, caseID, label, actorEmail string) (domain.Tag, error) {
 	return s.addCaseTagAsFn(ctx, caseID, label, actorEmail)
+}
+
+func (s *stubMirrorCaseService) RemoveCaseTag(ctx context.Context, caseID, tagID string) error {
+	return s.removeCaseTagFn(ctx, caseID, tagID)
 }
 
 func (s *stubMirrorCaseService) patchCaseWatchList(ctx context.Context, caseID string, userIDs []string) (domain.UpdatedCase, error) {
@@ -1126,7 +1335,7 @@ func TestCaseService_UpdateCase_MirrorsFieldToServiceNow(t *testing.T) {
 			var gotWorkState *domain.CaseWorkState
 			called := make(chan struct{})
 			mirror := &stubMirrorCaseService{
-				patchCaseFieldsFn: func(_ context.Context, caseID string, state *domain.CaseState, severity *domain.CaseSeverity, workState *domain.CaseWorkState) (domain.UpdatedCase, error) {
+				patchCaseFieldsFn: func(_ context.Context, caseID string, state *domain.CaseState, severity *domain.CaseSeverity, workState *domain.CaseWorkState, _ *bool) (domain.UpdatedCase, error) {
 					mu.Lock()
 					gotCaseID, gotState, gotSeverity, gotWorkState = caseID, state, severity, workState
 					mu.Unlock()
@@ -1151,7 +1360,7 @@ func TestCaseService_UpdateCase_MirrorsFieldToServiceNow(t *testing.T) {
 					return domain.Case{ID: req.ID, State: req.State, Severity: req.Severity, WorkState: req.WorkState}, req.Severity, nil
 				},
 			}
-			svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+			svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 			if _, err := svc.UpdateCase(context.Background(), tc.req); err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -1208,7 +1417,7 @@ func TestCaseService_UpdateCase_PublishesStatusChanged(t *testing.T) {
 		},
 	}
 	publisher := &mockEventPublisher{}
-	svc := NewCaseService(repo, stubUserRepo{}, publisher, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, stubUserRepo{}, publisher, alwaysUnrestrictedAccess{}, nil)
 
 	if _, err := svc.UpdateCase(context.Background(), domain.UpdateCaseRequest{ID: testDeploymentUUID, State: &newState}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1244,7 +1453,7 @@ func TestCaseService_UpdateCase_DoesNotPublishStatusChangedOnNoOp(t *testing.T) 
 		},
 	}
 	publisher := &mockEventPublisher{}
-	svc := NewCaseService(repo, stubUserRepo{}, publisher, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, stubUserRepo{}, publisher, alwaysUnrestrictedAccess{}, nil)
 
 	if _, err := svc.UpdateCase(context.Background(), domain.UpdateCaseRequest{ID: testDeploymentUUID, State: &sameState}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1275,7 +1484,7 @@ func TestCaseService_UpdateCase_PublishesSeverityChanged(t *testing.T) {
 		},
 	}
 	publisher := &mockEventPublisher{}
-	svc := NewCaseService(repo, stubUserRepo{}, publisher, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, stubUserRepo{}, publisher, alwaysUnrestrictedAccess{}, nil)
 
 	if _, err := svc.UpdateCase(context.Background(), domain.UpdateCaseRequest{ID: testDeploymentUUID, Severity: &newSeverity}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1319,7 +1528,7 @@ func TestCaseService_UpdateCase_PublishesSeverityChangedOnFirstSet(t *testing.T)
 		},
 	}
 	publisher := &mockEventPublisher{}
-	svc := NewCaseService(repo, stubUserRepo{}, publisher, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, stubUserRepo{}, publisher, alwaysUnrestrictedAccess{}, nil)
 
 	if _, err := svc.UpdateCase(context.Background(), domain.UpdateCaseRequest{ID: testDeploymentUUID, Severity: &newSeverity}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1348,7 +1557,7 @@ func TestCaseService_UpdateCase_DoesNotPublishSeverityChangedOnNoOp(t *testing.T
 		},
 	}
 	publisher := &mockEventPublisher{}
-	svc := NewCaseService(repo, stubUserRepo{}, publisher, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, stubUserRepo{}, publisher, alwaysUnrestrictedAccess{}, nil)
 
 	if _, err := svc.UpdateCase(context.Background(), domain.UpdateCaseRequest{ID: testDeploymentUUID, Severity: &sameSeverity}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1364,7 +1573,7 @@ func TestCaseService_UpdateCase_DoesNotPublishSeverityChangedOnNoOp(t *testing.T
 // recorded to sn_writeback_failures instead (see SNWritebackDispatcher).
 func TestCaseService_UpdateCase_RecordsSNWritebackFailureOnMirrorError(t *testing.T) {
 	mirror := &stubMirrorCaseService{
-		patchCaseFieldsFn: func(context.Context, string, *domain.CaseState, *domain.CaseSeverity, *domain.CaseWorkState) (domain.UpdatedCase, error) {
+		patchCaseFieldsFn: func(context.Context, string, *domain.CaseState, *domain.CaseSeverity, *domain.CaseWorkState, *bool) (domain.UpdatedCase, error) {
 			return domain.UpdatedCase{}, errors.New("sn downstream unreachable")
 		},
 	}
@@ -1381,7 +1590,7 @@ func TestCaseService_UpdateCase_RecordsSNWritebackFailureOnMirrorError(t *testin
 			return domain.Case{ID: req.ID, WorkState: req.WorkState}, nil, nil
 		},
 	}
-	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	resp, err := svc.UpdateCase(context.Background(), domain.UpdateCaseRequest{ID: testDeploymentUUID, WorkState: &workState})
 	if err != nil {
@@ -1395,6 +1604,158 @@ func TestCaseService_UpdateCase_RecordsSNWritebackFailureOnMirrorError(t *testin
 	req := failures.calls[0]
 	if req.EntityType != "case" || req.EntityID != testDeploymentUUID || req.Operation != "update" {
 		t.Errorf("unexpected failure record: %+v", req)
+	}
+}
+
+// TestCaseService_UpdateCase_MarkFixIssued_MirrorsToServiceNow proves a
+// first-time markFixIssued write persists via MarkCaseFixIssued and
+// dispatches an async ServiceNow mirror carrying markFixIssued:true, the
+// same shape as State/Severity/WorkState's own mirror
+// (TestCaseService_UpdateCase_MirrorsFieldToServiceNow).
+func TestCaseService_UpdateCase_MarkFixIssued_MirrorsToServiceNow(t *testing.T) {
+	fixIssuedOn := time.Date(2026, 9, 24, 10, 0, 0, 0, time.UTC)
+
+	var mu sync.Mutex
+	var gotCaseID string
+	var gotMarkFixIssued *bool
+	called := make(chan struct{})
+	mirror := &stubMirrorCaseService{
+		patchCaseFieldsFn: func(_ context.Context, caseID string, state *domain.CaseState, severity *domain.CaseSeverity, workState *domain.CaseWorkState, markFixIssued *bool) (domain.UpdatedCase, error) {
+			mu.Lock()
+			gotCaseID, gotMarkFixIssued = caseID, markFixIssued
+			mu.Unlock()
+			close(called)
+			return domain.UpdatedCase{}, nil
+		},
+	}
+	failures := &recordingSNWritebackFailures{}
+	dispatcher := NewSNWritebackDispatcher(failures)
+
+	repo := &stubCaseRepo{
+		markCaseFixIssued: func(_ context.Context, caseID string) (time.Time, bool, error) {
+			if caseID != testDeploymentUUID {
+				t.Errorf("MarkCaseFixIssued got caseID %q, want %q", caseID, testDeploymentUUID)
+			}
+			return fixIssuedOn, false, nil
+		},
+	}
+	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
+
+	markFixIssued := true
+	resp, err := svc.UpdateCase(context.Background(), domain.UpdateCaseRequest{ID: testDeploymentUUID, MarkFixIssued: &markFixIssued})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Case.FixIssued == nil || !resp.Case.FixIssued.Equal(fixIssuedOn) {
+		t.Errorf("resp.Case.FixIssued = %v, want %v", resp.Case.FixIssued, fixIssuedOn)
+	}
+
+	select {
+	case <-called:
+	case <-time.After(2 * time.Second):
+		t.Fatal("mirror.patchCaseFields was never called")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if gotCaseID != testDeploymentUUID {
+		t.Errorf("mirror got caseID %q, want %q", gotCaseID, testDeploymentUUID)
+	}
+	if gotMarkFixIssued == nil || !*gotMarkFixIssued {
+		t.Errorf("mirror got markFixIssued %v, want true", gotMarkFixIssued)
+	}
+	if got := failures.count(); got != 0 {
+		t.Errorf("expected 0 sn_writeback_failures records for a successful mirror, got %d", got)
+	}
+}
+
+// TestCaseService_UpdateCase_MarkFixIssued_AlreadySetIsNoOp proves a second
+// markFixIssued:true call on a case whose fix is already marked issued
+// succeeds without error and does NOT dispatch a second ServiceNow mirror
+// write -- there is nothing new to mirror.
+func TestCaseService_UpdateCase_MarkFixIssued_AlreadySetIsNoOp(t *testing.T) {
+	existingFixIssuedOn := time.Date(2026, 9, 1, 8, 0, 0, 0, time.UTC)
+
+	mirrorCalled := false
+	mirror := &stubMirrorCaseService{
+		patchCaseFieldsFn: func(context.Context, string, *domain.CaseState, *domain.CaseSeverity, *domain.CaseWorkState, *bool) (domain.UpdatedCase, error) {
+			mirrorCalled = true
+			return domain.UpdatedCase{}, nil
+		},
+	}
+	failures := &recordingSNWritebackFailures{}
+	dispatcher := NewSNWritebackDispatcher(failures)
+
+	repo := &stubCaseRepo{
+		markCaseFixIssued: func(context.Context, string) (time.Time, bool, error) {
+			return existingFixIssuedOn, true, nil
+		},
+	}
+	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
+
+	markFixIssued := true
+	resp, err := svc.UpdateCase(context.Background(), domain.UpdateCaseRequest{ID: testDeploymentUUID, MarkFixIssued: &markFixIssued})
+	if err != nil {
+		t.Fatalf("a repeat markFixIssued call on an already-marked case must succeed, not error: %v", err)
+	}
+	if resp.Case.FixIssued == nil || !resp.Case.FixIssued.Equal(existingFixIssuedOn) {
+		t.Errorf("resp.Case.FixIssued = %v, want the existing timestamp %v", resp.Case.FixIssued, existingFixIssuedOn)
+	}
+
+	// Give any wrongly-dispatched async mirror a moment to run before asserting
+	// it never did.
+	time.Sleep(50 * time.Millisecond)
+	if mirrorCalled {
+		t.Error("mirror.patchCaseFields must not be called for a no-op (already-set) markFixIssued update")
+	}
+	if got := failures.count(); got != 0 {
+		t.Errorf("expected 0 sn_writeback_failures records, got %d", got)
+	}
+}
+
+// TestCaseService_UpdateCase_MarkFixIssued_RejectsFalse proves false is
+// rejected -- markFixIssued is a one-way claim like Acknowledge, with no
+// unmark path.
+func TestCaseService_UpdateCase_MarkFixIssued_RejectsFalse(t *testing.T) {
+	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
+
+	markFixIssued := false
+	_, err := svc.UpdateCase(context.Background(), domain.UpdateCaseRequest{ID: testDeploymentUUID, MarkFixIssued: &markFixIssued})
+	var ve *apierror.ValidationError
+	if !asValidationError(err, &ve) {
+		t.Fatalf("markFixIssued:false must be a validation error, got %v", err)
+	}
+}
+
+// TestCaseService_UpdateCase_MarkFixIssued_RejectsCombinationWithOtherFields
+// proves markFixIssued cannot be combined with State/Severity/WorkState/
+// WatchList in the same request, mirroring WatchList's own mutual-exclusion
+// guard.
+func TestCaseService_UpdateCase_MarkFixIssued_RejectsCombinationWithOtherFields(t *testing.T) {
+	svc := NewCaseService(&stubCaseRepo{}, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
+	markFixIssued := true
+	state := domain.CaseStateOpen
+	severity := domain.CaseSeverityHigh
+	workState := domain.CaseWorkStateOngoing
+	watchList := []string{}
+
+	tests := []struct {
+		name string
+		req  domain.UpdateCaseRequest
+	}{
+		{name: "state", req: domain.UpdateCaseRequest{ID: testDeploymentUUID, MarkFixIssued: &markFixIssued, State: &state}},
+		{name: "severity", req: domain.UpdateCaseRequest{ID: testDeploymentUUID, MarkFixIssued: &markFixIssued, Severity: &severity}},
+		{name: "workState", req: domain.UpdateCaseRequest{ID: testDeploymentUUID, MarkFixIssued: &markFixIssued, WorkState: &workState}},
+		{name: "watchList", req: domain.UpdateCaseRequest{ID: testDeploymentUUID, MarkFixIssued: &markFixIssued, WatchList: &watchList}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := svc.UpdateCase(context.Background(), tc.req)
+			var ve *apierror.ValidationError
+			if !asValidationError(err, &ve) {
+				t.Fatalf("combining markFixIssued with %s must be a validation error, got %v", tc.name, err)
+			}
+		})
 	}
 }
 
@@ -1450,7 +1811,7 @@ func TestCaseService_CreateCase_SNFailureLeavesPostgresUntouched(t *testing.T) {
 	// untouched.
 	repo := &stubCaseRepo{}
 	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
-	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	_, err := svc.CreateCase(context.Background(), validCreateCaseRequest())
 	if err == nil {
@@ -1504,7 +1865,7 @@ func TestCaseService_CreateCase_SNSuccessCreatesPostgresRowWithMatchingIdentity(
 		},
 	}
 	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
-	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	resp, err := svc.CreateCase(context.Background(), validCreateCaseRequest())
 	if err != nil {
@@ -1566,7 +1927,7 @@ func TestCaseService_CreateCase_PublishesOnlyAfterPostgresSucceeds(t *testing.T)
 	}
 	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
 	publisher := &mockEventPublisher{}
-	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, publisher, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, publisher, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	if _, err := svc.CreateCase(context.Background(), validCreateCaseRequest()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1645,7 +2006,7 @@ func TestCaseService_CreateCase_AddsAccountDefaultWatchers(t *testing.T) {
 	}
 	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
 	publisher := &mockEventPublisher{}
-	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, publisher, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, publisher, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	if _, err := svc.CreateCase(context.Background(), validCreateCaseRequest()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1661,6 +2022,63 @@ func TestCaseService_CreateCase_AddsAccountDefaultWatchers(t *testing.T) {
 		t.Fatalf("SetCaseWatchList userIDs = %v, want %v", setWatchListUserIDs, stakeholderIDs)
 	}
 	for i, id := range stakeholderIDs {
+		if setWatchListUserIDs[i] != id {
+			t.Errorf("SetCaseWatchList userIDs[%d] = %q, want %q", i, setWatchListUserIDs[i], id)
+		}
+	}
+}
+
+// TestCaseService_CreateCase_MergesRequestedWatchersWithAccountDefaults
+// proves the fix for the "customer's own watch-list picks were silently
+// discarded from Postgres on create" gap: req.WatchList must end up merged
+// with the account's four stakeholders, not overwritten by them.
+func TestCaseService_CreateCase_MergesRequestedWatchersWithAccountDefaults(t *testing.T) {
+	const caseID = "44444444-4444-4444-4444-444444444444"
+	const projectID = "proj-1"
+	stakeholderIDs := []string{"csm-id", "tow-id"}
+	requestedIDs := []string{"customer-pick-1", "csm-id"} // "csm-id" overlaps on purpose
+
+	mirror := &stubMirrorCaseService{
+		createCase: func(_ context.Context, req domain.CreateCaseRequest) (domain.CreateCaseResponse, error) {
+			return domain.CreateCaseResponse{
+				Message: "Case created successfully.",
+				Case:    domain.CreateCaseDetails{ID: caseID, InternalID: "WSO2-CS-2", Number: "CS0023002", CreatedBy: "jane.doe@example.com", State: "Open"},
+			}, nil
+		},
+	}
+	var setWatchListUserIDs []string
+	repo := &stubCaseRepo{
+		createCaseFromServiceNow: func(_ context.Context, req domain.CreateCaseRequest, id, number, wso2ID, createdBy, state string) (domain.Case, error) {
+			respState := domain.CaseStateOpen
+			return domain.Case{ID: id, Number: number, InternalID: wso2ID, CreatedBy: createdBy, ProjectID: projectID, State: &respState}, nil
+		},
+		accountDefaultWatcherIDs: func(context.Context, string) ([]string, error) { return stakeholderIDs, nil },
+		setCaseWatchList: func(_ context.Context, _ string, userIDs []string, _ string) ([]domain.WatchListUser, time.Time, error) {
+			setWatchListUserIDs = userIDs
+			return nil, time.Time{}, nil
+		},
+		getCaseByID: func(context.Context, string, repository.SearchScope) (domain.CaseView, error) {
+			severity := domain.CaseSeverityHigh
+			return domain.CaseView{
+				ID: caseID, ProjectDetails: &domain.EntityRef{ID: projectID},
+				WatchList: []domain.WatchListUser{{Email: "watcher@example.com"}}, Severity: &severity,
+			}, nil
+		},
+	}
+	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
+	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, &mockEventPublisher{}, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
+
+	req := validCreateCaseRequest()
+	req.WatchList = requestedIDs
+	if _, err := svc.CreateCase(context.Background(), req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := []string{"csm-id", "tow-id", "customer-pick-1"} // defaults first, then new requested ids, deduplicated
+	if len(setWatchListUserIDs) != len(want) {
+		t.Fatalf("SetCaseWatchList userIDs = %v, want %v", setWatchListUserIDs, want)
+	}
+	for i, id := range want {
 		if setWatchListUserIDs[i] != id {
 			t.Errorf("SetCaseWatchList userIDs[%d] = %q, want %q", i, setWatchListUserIDs[i], id)
 		}
@@ -1708,7 +2126,7 @@ func TestCaseService_CreateCase_NoAccountDefaultWatchersIsNotAnError(t *testing.
 		},
 	}
 	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
-	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	if _, err := svc.CreateCase(context.Background(), validCreateCaseRequest()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -1742,7 +2160,7 @@ func TestCaseService_CreateCase_DoesNotPublishWhenPostgresFails(t *testing.T) {
 	}
 	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
 	publisher := &mockEventPublisher{}
-	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, publisher, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, publisher, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	if _, err := svc.CreateCase(context.Background(), validCreateCaseRequest()); err == nil {
 		t.Fatal("expected an error when the Postgres insert fails")
@@ -1777,7 +2195,7 @@ func TestCaseService_CreateCase_AnnouncementTypeReachesServiceNowMirror(t *testi
 		},
 	}
 	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
-	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	req := domain.CreateCaseRequest{
 		CreatedBy:   "user-1",
@@ -1812,7 +2230,7 @@ func TestCaseService_CreateCase_DoesNotRetryValidationError(t *testing.T) {
 	}
 	repo := &stubCaseRepo{}
 	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
-	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	_, err := svc.CreateCase(context.Background(), validCreateCaseRequest())
 	var ve *apierror.ValidationError
@@ -1842,7 +2260,7 @@ func TestCaseService_CreateCase_RejectsUnsupportedTypesOnPostgres(t *testing.T) 
 	}
 	repo := &stubCaseRepo{}
 	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
-	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	for _, typ := range []string{"bogus_type"} {
 		t.Run(typ, func(t *testing.T) {
@@ -1878,7 +2296,7 @@ func TestCaseService_CreateCase_RejectsSNOnlyTypesWithoutMirror(t *testing.T) {
 			return domain.Case{}, nil
 		},
 	}
-	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 
 	for _, req := range []domain.CreateCaseRequest{
 		{Type: "announcement", ProjectID: testDeploymentUUID, Subject: "x", Description: "y"},
@@ -1998,7 +2416,7 @@ func TestCaseService_CreateCase_CaseFamily_SNSuccessStoresTypeAndMappedState(t *
 				},
 			}
 			dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
-			svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+			svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 			resp, err := svc.CreateCase(context.Background(), tc.reqFunc())
 			if err != nil {
@@ -2050,7 +2468,7 @@ func TestCaseService_CreateCase_CaseFamily_UnknownSNStateFailsClosed(t *testing.
 			// unmappable state.
 			repo := &stubCaseRepo{}
 			dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
-			svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+			svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 			_, err := svc.CreateCase(context.Background(), tc.reqFunc())
 			if err == nil {
@@ -2075,7 +2493,7 @@ func TestCaseService_CreateCase_CaseFamily_SNFailureLeavesPostgresUntouched(t *t
 			}
 			repo := &stubCaseRepo{}
 			dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
-			svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+			svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 			_, err := svc.CreateCase(context.Background(), tc.reqFunc())
 			if err == nil {
@@ -2104,7 +2522,7 @@ func TestCaseService_CreateCase_CaseFamily_DoesNotRetryValidationError(t *testin
 			}
 			repo := &stubCaseRepo{}
 			dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
-			svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+			svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 			_, err := svc.CreateCase(context.Background(), tc.reqFunc())
 			var ve *apierror.ValidationError
@@ -2154,7 +2572,7 @@ func TestCaseService_CreateCaseComment_MirrorsToServiceNow(t *testing.T) {
 	userRepo := stubUserRepo{getUserByEmail: func(context.Context, string) (domain.User, error) {
 		return domain.User{ID: "user-1", Email: "jane.doe@example.com"}, nil
 	}}
-	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 	req := domain.CreateCaseCommentRequest{CaseID: testDeploymentUUID, Type: domain.CommentTypeComment, Content: "Working on it"}
@@ -2209,7 +2627,7 @@ func TestCaseService_CreateCaseComment_PublishesCommentAdded(t *testing.T) {
 		return domain.User{ID: "user-1", Email: "jane.doe@example.com", FirstName: "Jane", LastName: "Doe"}, nil
 	}}
 	publisher := &mockEventPublisher{}
-	svc := NewCaseService(repo, userRepo, publisher, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, userRepo, publisher, alwaysUnrestrictedAccess{}, nil)
 
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 	req := domain.CreateCaseCommentRequest{CaseID: testDeploymentUUID, Type: domain.CommentTypeComment, Content: "Working on it"}
@@ -2256,7 +2674,7 @@ func TestCaseService_CreateCaseComment_RecordsSNWritebackFailureOnMirrorError(t 
 	userRepo := stubUserRepo{getUserByEmail: func(context.Context, string) (domain.User, error) {
 		return domain.User{ID: "user-1", Email: "jane.doe@example.com"}, nil
 	}}
-	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 	req := domain.CreateCaseCommentRequest{CaseID: testDeploymentUUID, Type: domain.CommentTypeComment, Content: "Working on it"}
@@ -2303,7 +2721,7 @@ func TestCaseService_CreateCaseComment_SkipsMirrorForActivityType(t *testing.T) 
 	userRepo := stubUserRepo{getUserByEmail: func(context.Context, string) (domain.User, error) {
 		return domain.User{ID: "user-1", Email: "jane.doe@example.com"}, nil
 	}}
-	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 	req := domain.CreateCaseCommentRequest{CaseID: testDeploymentUUID, Type: domain.CommentTypeActivity, Content: "system note"}
@@ -2337,7 +2755,7 @@ func TestCaseService_CreateCaseComment_DoesNotMirrorWithoutSNWriteback(t *testin
 	userRepo := stubUserRepo{getUserByEmail: func(context.Context, string) (domain.User, error) {
 		return domain.User{ID: "user-1", Email: "jane.doe@example.com"}, nil
 	}}
-	svc := NewCaseService(repo, userRepo, nil, alwaysUnrestrictedAccess{})
+	svc := NewCaseService(repo, userRepo, nil, alwaysUnrestrictedAccess{}, nil)
 
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 	req := domain.CreateCaseCommentRequest{CaseID: testDeploymentUUID, Type: domain.CommentTypeComment, Content: "Working on it"}
@@ -2347,6 +2765,59 @@ func TestCaseService_CreateCaseComment_DoesNotMirrorWithoutSNWriteback(t *testin
 	// No mirror configured at all -- nothing to assert beyond "this didn't
 	// panic trying to dispatch through a nil snWriteback/snMirror", which a
 	// clean return already proves.
+}
+
+// TestCaseService_CreateCaseCommentAs_UsesActorEmailDirectly covers the M2M
+// path this method exists for: no x-user-id-token is required, and --
+// mirroring addCaseTagAs -- the caller-supplied actorEmail is used directly
+// for created_by and the published event's author name, with no
+// userRepo.GetUserByEmail lookup at all (stubUserRepo{} panics if it were
+// called, since no getUserByEmail func is configured here). Also proves the
+// created comment's CreatedBy in the response is the actorEmail, not a
+// resolved user row's email.
+func TestCaseService_CreateCaseCommentAs_UsesActorEmailDirectly(t *testing.T) {
+	var gotCreatedBy string
+	repo := &stubCaseRepo{
+		createCaseComment: func(_ context.Context, req domain.CreateCaseCommentRequest) (domain.CaseComment, error) {
+			gotCreatedBy = req.CreatedBy
+			return domain.CaseComment{ID: "comment-1", CaseID: req.CaseID, Type: req.Type, Content: req.Content}, nil
+		},
+		getCaseByID: func(context.Context, string, repository.SearchScope) (domain.CaseView, error) {
+			return domain.CaseView{
+				ID: testDeploymentUUID, Number: "CS0001", InternalID: "WSO2-CS-1", Subject: "s",
+				ProjectDetails: &domain.EntityRef{ID: "proj-1", Name: "Project One"},
+				WatchList:      []domain.WatchListUser{{Email: "watcher@example.com"}},
+			}, nil
+		},
+	}
+	// Deliberately no getUserByEmail configured -- CreateCaseCommentAs must
+	// never call it (unlike CreateCaseComment).
+	userRepo := stubUserRepo{}
+	publisher := &mockEventPublisher{}
+	svc := NewCaseService(repo, userRepo, publisher, alwaysUnrestrictedAccess{}, nil)
+
+	const actorEmail = "umt-service@example.com"
+	req := domain.CreateCaseCommentRequest{CaseID: testDeploymentUUID, Type: domain.CommentTypeComment, Content: "Working on it"}
+	resp, err := svc.CreateCaseCommentAs(context.Background(), req, actorEmail)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotCreatedBy != actorEmail {
+		t.Errorf("repo got created_by %q, want %q", gotCreatedBy, actorEmail)
+	}
+	if resp.Comment.CreatedBy != actorEmail {
+		t.Errorf("response CreatedBy = %q, want %q", resp.Comment.CreatedBy, actorEmail)
+	}
+	if len(publisher.calls) != 1 {
+		t.Fatalf("expected exactly 1 publish call, got %d", len(publisher.calls))
+	}
+	var payload events.CommentAddedPayload
+	if err := json.Unmarshal(publisher.calls[0].payload, &payload); err != nil {
+		t.Fatalf("failed to decode payload: %v", err)
+	}
+	if payload.Name != actorEmail {
+		t.Errorf("published author Name = %q, want %q (actorEmail, since no user row was looked up)", payload.Name, actorEmail)
+	}
 }
 
 // TestCaseService_CreateCase_Announcement_SNSuccessStoresAnnouncementType
@@ -2390,7 +2861,7 @@ func TestCaseService_CreateCase_Announcement_SNSuccessStoresAnnouncementType(t *
 		},
 	}
 	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
-	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	resp, err := svc.CreateCase(context.Background(), validAnnouncementCreateCaseRequest())
 	if err != nil {
@@ -2429,7 +2900,7 @@ func TestCaseService_CreateCase_Announcement_UnknownSNStateFailsClosed(t *testin
 	// ever called, proving Postgres is never reached for an unmappable state.
 	repo := &stubCaseRepo{}
 	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
-	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	_, err := svc.CreateCase(context.Background(), validAnnouncementCreateCaseRequest())
 	if err == nil {
@@ -2449,7 +2920,7 @@ func TestCaseService_CreateCase_Announcement_SNFailureLeavesPostgresUntouched(t 
 	}
 	repo := &stubCaseRepo{}
 	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
-	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	_, err := svc.CreateCase(context.Background(), validAnnouncementCreateCaseRequest())
 	if err == nil {
@@ -2484,7 +2955,7 @@ func TestCaseService_AddCaseTag_MirrorsToServiceNow(t *testing.T) {
 	userRepo := stubUserRepo{getUserByEmail: func(context.Context, string) (domain.User, error) {
 		return domain.User{ID: testDeploymentUUID, Email: "jane.doe@example.com"}, nil
 	}}
-	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 	if _, err := svc.AddCaseTag(ctx, testDeploymentUUID, "patch-me"); err != nil {
@@ -2527,7 +2998,7 @@ func TestCaseService_AddCaseTag_MirrorFailureRecordsWritebackFailure(t *testing.
 	userRepo := stubUserRepo{getUserByEmail: func(context.Context, string) (domain.User, error) {
 		return domain.User{ID: testDeploymentUUID, Email: "jane.doe@example.com"}, nil
 	}}
-	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 	if _, err := svc.AddCaseTag(ctx, testDeploymentUUID, "patch-me"); err != nil {
@@ -2535,6 +3006,265 @@ func TestCaseService_AddCaseTag_MirrorFailureRecordsWritebackFailure(t *testing.
 	}
 
 	waitFor(t, func() bool { return failures.count() == 1 })
+}
+
+// TestCaseService_AddCaseTag_MirrorSuccessPersistsSNSysID covers the
+// id-mapping half of the AddCaseTag mirror: on success, the ServiceNow
+// label_entry sys_id the mirror returns (converted to its raw form) is
+// persisted onto the (caseID, tagID) work_item_tag attachment via
+// SetCaseTagSNSysID.
+func TestCaseService_AddCaseTag_MirrorSuccessPersistsSNSysID(t *testing.T) {
+	mirror := &stubMirrorCaseService{
+		addCaseTagAsFn: func(context.Context, string, string, string) (domain.Tag, error) {
+			return domain.Tag{ID: testSNSysID2}, nil // the ServiceNow-side id, sysidToUUID-converted
+		},
+	}
+	type setCall struct{ caseID, tagID, snSysID string }
+	setCalls := make(chan setCall, 1)
+	repo := &stubCaseRepo{
+		addCaseTag: func(_ context.Context, caseID, label, actorEmail string) (domain.Tag, error) {
+			return domain.Tag{ID: "t-1", Label: label}, nil // the Postgres-side tag id
+		},
+		getCaseByID: func(context.Context, string, repository.SearchScope) (domain.CaseView, error) {
+			return domain.CaseView{}, nil
+		},
+		setCaseTagSNSysID: func(_ context.Context, caseID, tagID, snSysID string) error {
+			setCalls <- setCall{caseID: caseID, tagID: tagID, snSysID: snSysID}
+			return nil
+		},
+	}
+	failures := &recordingSNWritebackFailures{}
+	dispatcher := NewSNWritebackDispatcher(failures)
+	userRepo := stubUserRepo{getUserByEmail: func(context.Context, string) (domain.User, error) {
+		return domain.User{ID: testDeploymentUUID, Email: "jane.doe@example.com"}, nil
+	}}
+	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
+
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	if _, err := svc.AddCaseTag(ctx, testDeploymentUUID, "patch-me"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case got := <-setCalls:
+		if got.caseID != testDeploymentUUID {
+			t.Errorf("SetCaseTagSNSysID caseID = %q, want %q", got.caseID, testDeploymentUUID)
+		}
+		if got.tagID != "t-1" {
+			t.Errorf("SetCaseTagSNSysID tagID = %q, want %q (the Postgres tag id)", got.tagID, "t-1")
+		}
+		wantSysID := uuidToSysid(testSNSysID2)
+		if got.snSysID != wantSysID {
+			t.Errorf("SetCaseTagSNSysID snSysID = %q, want %q", got.snSysID, wantSysID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("SetCaseTagSNSysID was never called")
+	}
+}
+
+// TestCaseService_AddCaseTag_CleansUpSNTagWhenAttachmentRemovedConcurrently
+// covers the narrow race between AddCaseTag's mirror and a concurrent
+// RemoveCaseTag: if the (caseID, tagID) attachment is gone by the time
+// SetCaseTagSNSysID runs (RemoveCaseTag deleted it, found no sn_sys_id
+// stored yet, and so skipped its own REMOVE mirror), the ServiceNow tag this
+// callback just created would otherwise be permanently orphaned. The
+// callback must react to SetCaseTagSNSysID's *apierror.NotFoundError by
+// removing that just-created ServiceNow tag itself.
+func TestCaseService_AddCaseTag_CleansUpSNTagWhenAttachmentRemovedConcurrently(t *testing.T) {
+	mirror := &stubMirrorCaseService{
+		addCaseTagAsFn: func(context.Context, string, string, string) (domain.Tag, error) {
+			return domain.Tag{ID: testSNSysID2}, nil // the ServiceNow-side id, sysidToUUID-converted
+		},
+	}
+	removeCalled := make(chan struct{ caseID, tagID string }, 1)
+	mirror.removeCaseTagFn = func(_ context.Context, caseID, tagID string) error {
+		removeCalled <- struct{ caseID, tagID string }{caseID, tagID}
+		return nil
+	}
+	repo := &stubCaseRepo{
+		addCaseTag: func(_ context.Context, caseID, label, actorEmail string) (domain.Tag, error) {
+			return domain.Tag{ID: "t-1", Label: label}, nil
+		},
+		getCaseByID: func(context.Context, string, repository.SearchScope) (domain.CaseView, error) {
+			return domain.CaseView{}, nil
+		},
+		setCaseTagSNSysID: func(context.Context, string, string, string) error {
+			// Simulates RemoveCaseTag having already deleted the
+			// work_item_tag row before this persist runs.
+			return &apierror.NotFoundError{Msg: "tag not found on this case"}
+		},
+	}
+	failures := &recordingSNWritebackFailures{}
+	dispatcher := NewSNWritebackDispatcher(failures)
+	userRepo := stubUserRepo{getUserByEmail: func(context.Context, string) (domain.User, error) {
+		return domain.User{ID: testDeploymentUUID, Email: "jane.doe@example.com"}, nil
+	}}
+	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
+
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	if _, err := svc.AddCaseTag(ctx, testDeploymentUUID, "patch-me"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case got := <-removeCalled:
+		if got.caseID != testDeploymentUUID {
+			t.Errorf("cleanup RemoveCaseTag caseID = %q, want %q", got.caseID, testDeploymentUUID)
+		}
+		if got.tagID != testSNSysID2 {
+			t.Errorf("cleanup RemoveCaseTag tagID = %q, want %q (the just-created ServiceNow tag id)", got.tagID, testSNSysID2)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mirror.RemoveCaseTag (cleanup) was never called")
+	}
+	// A handled NotFoundError is not itself a mirror failure to record --
+	// only if the cleanup RemoveCaseTag call above also failed would this
+	// count.
+	if got := failures.count(); got != 0 {
+		t.Errorf("expected 0 sn_writeback_failures records for a successfully cleaned-up race, got %d", got)
+	}
+}
+
+// TestCaseService_RemoveCaseTag_MirrorsWithStoredSNSysID covers the REMOVE
+// mirror's happy path: when a ServiceNow label_entry sys_id is already
+// stored for this (caseID, tagID) attachment, the mirror fires against it
+// (converted back to UUID form for the mirror's own uuidToSysid).
+func TestCaseService_RemoveCaseTag_MirrorsWithStoredSNSysID(t *testing.T) {
+	storedSysID := uuidToSysid(testSNSysID2)
+	repo := &stubCaseRepo{
+		removeCaseTag: func(context.Context, string, string, string) error { return nil },
+		getCaseTagSNSysID: func(context.Context, string, string) (*string, error) {
+			return &storedSysID, nil
+		},
+	}
+	type removeCall struct{ caseID, tagID string }
+	called := make(chan removeCall, 1)
+	mirror := &stubMirrorCaseService{
+		removeCaseTagFn: func(_ context.Context, caseID, tagID string) error {
+			called <- removeCall{caseID: caseID, tagID: tagID}
+			return nil
+		},
+	}
+	failures := &recordingSNWritebackFailures{}
+	dispatcher := NewSNWritebackDispatcher(failures)
+	userRepo := stubUserRepo{getUserByEmail: func(context.Context, string) (domain.User, error) {
+		return domain.User{ID: testDeploymentUUID, Email: "jane.doe@example.com"}, nil
+	}}
+	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
+
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	if err := svc.RemoveCaseTag(ctx, testDeploymentUUID, testUUID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case got := <-called:
+		if got.caseID != testDeploymentUUID {
+			t.Errorf("mirror RemoveCaseTag caseID = %q, want %q", got.caseID, testDeploymentUUID)
+		}
+		if got.tagID != testSNSysID2 {
+			t.Errorf("mirror RemoveCaseTag tagID = %q, want %q (sysidToUUID of the stored sys_id)", got.tagID, testSNSysID2)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mirror.RemoveCaseTag was never called")
+	}
+	if got := failures.count(); got != 0 {
+		t.Errorf("expected 0 sn_writeback_failures records for a successful mirror, got %d", got)
+	}
+}
+
+// TestCaseService_RemoveCaseTag_SkipsMirrorWhenNoSNSysIDStored covers the
+// pre-migration-attachment case: a NULL sn_sys_id (the AddCaseTag mirror
+// never ran, hasn't finished, or failed) must make the REMOVE mirror skip
+// silently -- no mirror call, no sn_writeback_failures record, no error to
+// the caller.
+func TestCaseService_RemoveCaseTag_SkipsMirrorWhenNoSNSysIDStored(t *testing.T) {
+	repo := &stubCaseRepo{
+		removeCaseTag: func(context.Context, string, string, string) error { return nil },
+		getCaseTagSNSysID: func(context.Context, string, string) (*string, error) {
+			return nil, nil // no mapping stored yet
+		},
+	}
+	mirrorCalled := make(chan struct{}, 1)
+	mirror := &stubMirrorCaseService{
+		removeCaseTagFn: func(context.Context, string, string) error {
+			mirrorCalled <- struct{}{}
+			return nil
+		},
+	}
+	failures := &recordingSNWritebackFailures{}
+	dispatcher := NewSNWritebackDispatcher(failures)
+	userRepo := stubUserRepo{getUserByEmail: func(context.Context, string) (domain.User, error) {
+		return domain.User{ID: testDeploymentUUID, Email: "jane.doe@example.com"}, nil
+	}}
+	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
+
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	if err := svc.RemoveCaseTag(ctx, testDeploymentUUID, testUUID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case <-mirrorCalled:
+		t.Fatal("mirror.RemoveCaseTag was called despite no ServiceNow mapping being stored")
+	case <-time.After(300 * time.Millisecond):
+		// expected: no mirror call
+	}
+	if got := failures.count(); got != 0 {
+		t.Errorf("expected 0 sn_writeback_failures records for a deliberate skip, got %d", got)
+	}
+}
+
+// TestCaseService_RemoveCaseTag_RecordsSNWritebackFailureOnLookupError covers
+// the real-error half of the same lookup: unlike a genuinely successful
+// lookup that finds no mapping (nil, nil -- see
+// TestCaseService_RemoveCaseTag_SkipsMirrorWhenNoSNSysIDStored), a lookup
+// that fails outright must not be silently discarded. The Postgres delete
+// still succeeds and is still authoritative, but the lookup failure is
+// recorded to sn_writeback_failures for manual backfill instead of vanishing.
+func TestCaseService_RemoveCaseTag_RecordsSNWritebackFailureOnLookupError(t *testing.T) {
+	lookupErr := errors.New("sn sys id lookup: connection reset")
+	repo := &stubCaseRepo{
+		removeCaseTag: func(context.Context, string, string, string) error { return nil },
+		getCaseTagSNSysID: func(context.Context, string, string) (*string, error) {
+			return nil, lookupErr
+		},
+	}
+	mirrorCalled := make(chan struct{}, 1)
+	mirror := &stubMirrorCaseService{
+		removeCaseTagFn: func(context.Context, string, string) error {
+			mirrorCalled <- struct{}{}
+			return nil
+		},
+	}
+	failures := &recordingSNWritebackFailures{}
+	dispatcher := NewSNWritebackDispatcher(failures)
+	userRepo := stubUserRepo{getUserByEmail: func(context.Context, string) (domain.User, error) {
+		return domain.User{ID: testDeploymentUUID, Email: "jane.doe@example.com"}, nil
+	}}
+	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
+
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	if err := svc.RemoveCaseTag(ctx, testDeploymentUUID, testUUID); err != nil {
+		t.Fatalf("Postgres delete must still be reported as a success despite the lookup error, got: %v", err)
+	}
+
+	select {
+	case <-mirrorCalled:
+		t.Fatal("mirror.RemoveCaseTag was called despite the sys_id lookup having failed")
+	case <-time.After(300 * time.Millisecond):
+		// expected: no mirror call, the lookup error means we don't know
+		// what to remove
+	}
+
+	waitFor(t, func() bool { return failures.count() == 1 })
+	req := failures.calls[0]
+	if req.EntityType != "case_tag" || req.EntityID != testDeploymentUUID || req.Operation != "remove" {
+		t.Errorf("unexpected failure record: %+v", req)
+	}
+	if req.Error != lookupErr.Error() {
+		t.Errorf("failure record Error = %q, want %q", req.Error, lookupErr.Error())
+	}
 }
 
 // TestCaseService_UpdateCase_WatchList_MirrorsToServiceNow covers the
@@ -2554,6 +3284,13 @@ func TestCaseService_UpdateCase_WatchList_MirrorsToServiceNow(t *testing.T) {
 		},
 	}
 	repo := &stubCaseRepo{
+		getCaseByID: func(context.Context, string, repository.SearchScope) (domain.CaseView, error) {
+			// No project linked: validateWatchListProjectMembership has
+			// nothing to check against and skips, same as any other
+			// project-less case (see that method's own doc comment) --
+			// this test is about the SN mirror dispatch, not that check.
+			return domain.CaseView{}, nil
+		},
 		setCaseWatchList: func(_ context.Context, caseID string, gotUserIDs []string, actorEmail string) ([]domain.WatchListUser, time.Time, error) {
 			return nil, time.Now(), nil
 		},
@@ -2563,7 +3300,7 @@ func TestCaseService_UpdateCase_WatchList_MirrorsToServiceNow(t *testing.T) {
 	userRepo := stubUserRepo{getUserByEmail: func(context.Context, string) (domain.User, error) {
 		return domain.User{ID: testDeploymentUUID, Email: "jane.doe@example.com"}, nil
 	}}
-	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 	req := domain.UpdateCaseRequest{ID: testDeploymentUUID, WatchList: &userIDs}
@@ -2584,6 +3321,71 @@ func TestCaseService_UpdateCase_WatchList_MirrorsToServiceNow(t *testing.T) {
 	}
 }
 
+// TestCaseService_UpdateCase_WatchList_MirrorGetsMergedAccountDefaults is the
+// regression test for a CodeRabbit finding on this same change: the
+// ServiceNow mirror dispatch used to forward the caller's own pre-merge
+// userIDs, while Postgres persisted finalIDs (userIDs merged with the
+// account's default stakeholders) -- silently leaving ServiceNow's own copy
+// of the watch list missing whichever stakeholders the caller didn't already
+// list, permanently disagreeing with what Postgres actually has.
+func TestCaseService_UpdateCase_WatchList_MirrorGetsMergedAccountDefaults(t *testing.T) {
+	const projectID = "6fa0b42d-1bfa-a694-a002-c9d3604bcb77"
+	const submittedID = "11111111-1111-1111-1111-111111111111"
+	const stakeholderID = "22222222-2222-2222-2222-222222222222"
+	userIDs := []string{submittedID}
+
+	called := make(chan []string, 1)
+	mirror := &stubMirrorCaseService{
+		patchCaseWatchListFn: func(_ context.Context, caseID string, gotUserIDs []string) (domain.UpdatedCase, error) {
+			called <- gotUserIDs
+			return domain.UpdatedCase{}, nil
+		},
+	}
+	repo := &stubCaseRepo{
+		getCaseByID: func(context.Context, string, repository.SearchScope) (domain.CaseView, error) {
+			return domain.CaseView{ProjectDetails: &domain.EntityRef{ID: projectID}}, nil
+		},
+		accountDefaultWatcherIDs: func(context.Context, string) ([]string, error) {
+			return []string{stakeholderID}, nil
+		},
+		setCaseWatchList: func(context.Context, string, []string, string) ([]domain.WatchListUser, time.Time, error) {
+			return nil, time.Now(), nil
+		},
+	}
+	contactRepo := &stubProjectContactRepo{
+		getProjectContactByUserID: func(context.Context, string, string, string) (repository.ProjectContactRow, error) {
+			return repository.ProjectContactRow{Email: "member@example.com", RegistrationState: "REGISTERED"}, nil
+		},
+	}
+	failures := &recordingSNWritebackFailures{}
+	dispatcher := NewSNWritebackDispatcher(failures)
+	userRepo := stubUserRepo{getUserByEmail: func(context.Context, string) (domain.User, error) {
+		return domain.User{ID: testDeploymentUUID, Email: "jane.doe@example.com"}, nil
+	}}
+	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, contactRepo, dispatcher, mirror)
+
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	req := domain.UpdateCaseRequest{ID: testDeploymentUUID, WatchList: &userIDs}
+	if _, err := svc.UpdateCase(ctx, req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case got := <-called:
+		want := []string{submittedID, stakeholderID}
+		if len(got) != len(want) {
+			t.Fatalf("mirror got %v, want %v (submitted + merged-in stakeholder)", got, want)
+		}
+		for i, id := range want {
+			if got[i] != id {
+				t.Errorf("mirror got[%d] = %q, want %q", i, got[i], id)
+			}
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mirror.patchCaseWatchList was never called")
+	}
+}
+
 // TestCaseService_UpdateCase_WatchList_MirrorFailureRecordsWritebackFailure
 // covers the failure half: Postgres already succeeded, so the call must
 // still report success, but the mirror error lands in sn_writeback_failures
@@ -2597,6 +3399,9 @@ func TestCaseService_UpdateCase_WatchList_MirrorFailureRecordsWritebackFailure(t
 		},
 	}
 	repo := &stubCaseRepo{
+		getCaseByID: func(context.Context, string, repository.SearchScope) (domain.CaseView, error) {
+			return domain.CaseView{}, nil
+		},
 		setCaseWatchList: func(context.Context, string, []string, string) ([]domain.WatchListUser, time.Time, error) {
 			return nil, time.Now(), nil
 		},
@@ -2606,7 +3411,7 @@ func TestCaseService_UpdateCase_WatchList_MirrorFailureRecordsWritebackFailure(t
 	userRepo := stubUserRepo{getUserByEmail: func(context.Context, string) (domain.User, error) {
 		return domain.User{ID: testDeploymentUUID, Email: "jane.doe@example.com"}, nil
 	}}
-	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, dispatcher, mirror)
+	svc := NewCaseServiceWithSNWriteback(repo, userRepo, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror)
 
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 	req := domain.UpdateCaseRequest{ID: testDeploymentUUID, WatchList: &userIDs}
@@ -2615,4 +3420,299 @@ func TestCaseService_UpdateCase_WatchList_MirrorFailureRecordsWritebackFailure(t
 	}
 
 	waitFor(t, func() bool { return failures.count() == 1 })
+}
+
+// TestCaseService_UpdateCase_WatchList_RejectsNonProjectMember is the
+// regression test for validateWatchListProjectMembership: a watch-list
+// update naming a user who is not a project_contact on the case's project
+// must be rejected wholesale, and SetCaseWatchList must never be called.
+func TestCaseService_UpdateCase_WatchList_RejectsNonProjectMember(t *testing.T) {
+	const projectID = "6fa0b42d-1bfa-a694-a002-c9d3604bcb77"
+	const memberUserID = "11111111-1111-1111-1111-111111111111"
+	const nonMemberUserID = "22222222-2222-2222-2222-222222222222"
+	userIDs := []string{memberUserID, nonMemberUserID}
+
+	setCaseWatchListCalled := false
+	repo := &stubCaseRepo{
+		getCaseByID: func(context.Context, string, repository.SearchScope) (domain.CaseView, error) {
+			return domain.CaseView{ProjectDetails: &domain.EntityRef{ID: projectID}}, nil
+		},
+		setCaseWatchList: func(context.Context, string, []string, string) ([]domain.WatchListUser, time.Time, error) {
+			setCaseWatchListCalled = true
+			return nil, time.Now(), nil
+		},
+	}
+	contactRepo := &stubProjectContactRepo{
+		getProjectContactByUserID: func(_ context.Context, gotProjectID, userID, _ string) (repository.ProjectContactRow, error) {
+			if gotProjectID != projectID {
+				t.Errorf("projectID = %q, want %q", gotProjectID, projectID)
+			}
+			if userID == nonMemberUserID {
+				return repository.ProjectContactRow{}, &apierror.NotFoundError{Msg: "contact not found on this project"}
+			}
+			return repository.ProjectContactRow{Email: "member@example.com", RegistrationState: "REGISTERED"}, nil
+		},
+	}
+	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, contactRepo)
+
+	req := domain.UpdateCaseRequest{ID: testDeploymentUUID, WatchList: &userIDs}
+	_, err := svc.UpdateCase(context.Background(), req)
+
+	var ve *apierror.ValidationError
+	if !asValidationError(err, &ve) {
+		t.Fatalf("expected a ValidationError, got %v", err)
+	}
+	if setCaseWatchListCalled {
+		t.Error("SetCaseWatchList was called despite a non-member user in the watch list")
+	}
+}
+
+// TestCaseService_UpdateCase_WatchList_RejectsUnregisteredContact is the
+// regression test for a CodeRabbit finding on this same change:
+// validateWatchListProjectMembership only checked that a project_contact row
+// existed, not its state -- an INVITED (not yet accepted) or DEACTIVATED
+// contact would pass. Neither actually belongs on the project today; only
+// REGISTERED should.
+func TestCaseService_UpdateCase_WatchList_RejectsUnregisteredContact(t *testing.T) {
+	const projectID = "6fa0b42d-1bfa-a694-a002-c9d3604bcb77"
+	const invitedUserID = "11111111-1111-1111-1111-111111111111"
+	userIDs := []string{invitedUserID}
+
+	setCaseWatchListCalled := false
+	repo := &stubCaseRepo{
+		getCaseByID: func(context.Context, string, repository.SearchScope) (domain.CaseView, error) {
+			return domain.CaseView{ProjectDetails: &domain.EntityRef{ID: projectID}}, nil
+		},
+		setCaseWatchList: func(context.Context, string, []string, string) ([]domain.WatchListUser, time.Time, error) {
+			setCaseWatchListCalled = true
+			return nil, time.Now(), nil
+		},
+	}
+	contactRepo := &stubProjectContactRepo{
+		getProjectContactByUserID: func(context.Context, string, string, string) (repository.ProjectContactRow, error) {
+			return repository.ProjectContactRow{Email: "invited@example.com", RegistrationState: "INVITED"}, nil
+		},
+	}
+	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, contactRepo)
+
+	req := domain.UpdateCaseRequest{ID: testDeploymentUUID, WatchList: &userIDs}
+	_, err := svc.UpdateCase(context.Background(), req)
+
+	var ve *apierror.ValidationError
+	if !asValidationError(err, &ve) {
+		t.Fatalf("expected a ValidationError for an INVITED (not yet REGISTERED) contact, got %v", err)
+	}
+	if setCaseWatchListCalled {
+		t.Error("SetCaseWatchList was called despite an unregistered contact in the watch list")
+	}
+}
+
+// TestCaseService_UpdateCase_WatchList_AcceptsProjectMembers is the positive
+// counterpart: every user in the watch list resolves as a project_contact,
+// so the update proceeds normally.
+func TestCaseService_UpdateCase_WatchList_AcceptsProjectMembers(t *testing.T) {
+	const projectID = "6fa0b42d-1bfa-a694-a002-c9d3604bcb77"
+	userIDs := []string{"11111111-1111-1111-1111-111111111111", "33333333-3333-3333-3333-333333333333"}
+
+	repo := &stubCaseRepo{
+		getCaseByID: func(context.Context, string, repository.SearchScope) (domain.CaseView, error) {
+			return domain.CaseView{ProjectDetails: &domain.EntityRef{ID: projectID}}, nil
+		},
+		setCaseWatchList: func(context.Context, string, []string, string) ([]domain.WatchListUser, time.Time, error) {
+			return nil, time.Now(), nil
+		},
+	}
+	contactRepo := &stubProjectContactRepo{
+		getProjectContactByUserID: func(context.Context, string, string, string) (repository.ProjectContactRow, error) {
+			return repository.ProjectContactRow{Email: "member@example.com", RegistrationState: "REGISTERED"}, nil
+		},
+	}
+	svc := NewCaseService(repo, stubUserRepo{getUserByEmail: func(context.Context, string) (domain.User, error) {
+		return domain.User{ID: testDeploymentUUID, Email: "jane.doe@example.com"}, nil
+	}}, nil, alwaysUnrestrictedAccess{}, contactRepo)
+
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	req := domain.UpdateCaseRequest{ID: testDeploymentUUID, WatchList: &userIDs}
+	if _, err := svc.UpdateCase(ctx, req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestCaseService_UpdateCase_WatchList_KeepsAccountDefaultsEvenWhenOmitted is
+// the regression test for the "4 mandatory stakeholders can never be
+// removed" rule: a caller submitting a watch list that leaves out one of the
+// account's four named stakeholders must still end up with that stakeholder
+// present in what actually gets written -- and that stakeholder must never
+// be checked against project_contact (it's a WSO2-internal role, not a
+// customer-side contact; see validateWatchListProjectMembership's own doc
+// comment).
+func TestCaseService_UpdateCase_WatchList_KeepsAccountDefaultsEvenWhenOmitted(t *testing.T) {
+	const projectID = "6fa0b42d-1bfa-a694-a002-c9d3604bcb77"
+	const submittedID = "11111111-1111-1111-1111-111111111111"
+	const stakeholderID = "csm-id-not-submitted"
+	userIDs := []string{submittedID}
+
+	var setWatchListUserIDs []string
+	repo := &stubCaseRepo{
+		getCaseByID: func(context.Context, string, repository.SearchScope) (domain.CaseView, error) {
+			return domain.CaseView{ProjectDetails: &domain.EntityRef{ID: projectID}}, nil
+		},
+		accountDefaultWatcherIDs: func(_ context.Context, gotProjectID string) ([]string, error) {
+			if gotProjectID != projectID {
+				t.Errorf("AccountDefaultWatcherIDs projectID = %q, want %q", gotProjectID, projectID)
+			}
+			return []string{stakeholderID}, nil
+		},
+		setCaseWatchList: func(_ context.Context, _ string, ids []string, _ string) ([]domain.WatchListUser, time.Time, error) {
+			setWatchListUserIDs = ids
+			return nil, time.Now(), nil
+		},
+	}
+	var checkedIDs []string
+	contactRepo := &stubProjectContactRepo{
+		getProjectContactByUserID: func(_ context.Context, _ string, userID, _ string) (repository.ProjectContactRow, error) {
+			checkedIDs = append(checkedIDs, userID)
+			return repository.ProjectContactRow{Email: "member@example.com", RegistrationState: "REGISTERED"}, nil
+		},
+	}
+	svc := NewCaseService(repo, stubUserRepo{getUserByEmail: func(context.Context, string) (domain.User, error) {
+		return domain.User{ID: testDeploymentUUID, Email: "jane.doe@example.com"}, nil
+	}}, nil, alwaysUnrestrictedAccess{}, contactRepo)
+
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	req := domain.UpdateCaseRequest{ID: testDeploymentUUID, WatchList: &userIDs}
+	if _, err := svc.UpdateCase(ctx, req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	want := []string{submittedID, stakeholderID}
+	if len(setWatchListUserIDs) != len(want) {
+		t.Fatalf("SetCaseWatchList userIDs = %v, want %v (submitted + mandatory stakeholder)", setWatchListUserIDs, want)
+	}
+	for i, id := range want {
+		if setWatchListUserIDs[i] != id {
+			t.Errorf("SetCaseWatchList userIDs[%d] = %q, want %q", i, setWatchListUserIDs[i], id)
+		}
+	}
+
+	if len(checkedIDs) != 1 || checkedIDs[0] != submittedID {
+		t.Errorf("project-membership check ran against %v, want only the caller-submitted %q (the mandatory stakeholder must be exempt)", checkedIDs, submittedID)
+	}
+}
+
+// TestCaseService_UpdateCase_WatchList_SubmittedStakeholderSkipsValidation is
+// the regression test for a CodeRabbit finding on this same change: the
+// frontend's edit flow always resubmits the case's *entire* current watch
+// list, including its already-present locked stakeholders, alongside
+// whatever the caller actually changed -- so a stakeholder id is normally
+// present IN userIDs, not just omitted from it (the sibling
+// KeepsAccountDefaultsEvenWhenOmitted test above only covers the omitted
+// case). Validating a submitted stakeholder id against project_contact would
+// reject the very people this system itself always adds, breaking a normal
+// edit essentially every time.
+func TestCaseService_UpdateCase_WatchList_SubmittedStakeholderSkipsValidation(t *testing.T) {
+	const projectID = "6fa0b42d-1bfa-a694-a002-c9d3604bcb77"
+	const submittedID = "11111111-1111-1111-1111-111111111111"
+	const stakeholderID = "22222222-2222-2222-2222-222222222222"
+	userIDs := []string{submittedID, stakeholderID}
+
+	var setWatchListUserIDs []string
+	repo := &stubCaseRepo{
+		getCaseByID: func(context.Context, string, repository.SearchScope) (domain.CaseView, error) {
+			return domain.CaseView{ProjectDetails: &domain.EntityRef{ID: projectID}}, nil
+		},
+		accountDefaultWatcherIDs: func(context.Context, string) ([]string, error) {
+			return []string{stakeholderID}, nil
+		},
+		setCaseWatchList: func(_ context.Context, _ string, ids []string, _ string) ([]domain.WatchListUser, time.Time, error) {
+			setWatchListUserIDs = ids
+			return nil, time.Now(), nil
+		},
+	}
+	var checkedIDs []string
+	contactRepo := &stubProjectContactRepo{
+		getProjectContactByUserID: func(_ context.Context, _ string, userID, _ string) (repository.ProjectContactRow, error) {
+			checkedIDs = append(checkedIDs, userID)
+			return repository.ProjectContactRow{Email: "member@example.com", RegistrationState: "REGISTERED"}, nil
+		},
+	}
+	svc := NewCaseService(repo, stubUserRepo{getUserByEmail: func(context.Context, string) (domain.User, error) {
+		return domain.User{ID: testDeploymentUUID, Email: "jane.doe@example.com"}, nil
+	}}, nil, alwaysUnrestrictedAccess{}, contactRepo)
+
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	req := domain.UpdateCaseRequest{ID: testDeploymentUUID, WatchList: &userIDs}
+	if _, err := svc.UpdateCase(ctx, req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(setWatchListUserIDs) != 2 {
+		t.Fatalf("SetCaseWatchList userIDs = %v, want both ids (no duplication)", setWatchListUserIDs)
+	}
+	if len(checkedIDs) != 1 || checkedIDs[0] != submittedID {
+		t.Errorf("project-membership check ran against %v, want only %q (the stakeholder must be exempt even when it's part of the submission)", checkedIDs, submittedID)
+	}
+}
+
+// TestCaseService_UpdateCase_WatchList_FailsWhenAccountDefaultLookupFails is
+// the regression test for a CodeRabbit finding on this same change: a failed
+// AccountDefaultWatcherIDs lookup used to fall back to finalIDs = userIDs and
+// let SetCaseWatchList's full-replace write proceed anyway -- silently
+// dropping any existing account stakeholder from the case's watch list
+// entirely, on a transient lookup error, while still reporting success. The
+// whole update must fail instead, and SetCaseWatchList must never run.
+func TestCaseService_UpdateCase_WatchList_FailsWhenAccountDefaultLookupFails(t *testing.T) {
+	const projectID = "6fa0b42d-1bfa-a694-a002-c9d3604bcb77"
+	userIDs := []string{"11111111-1111-1111-1111-111111111111"}
+
+	setCaseWatchListCalled := false
+	repo := &stubCaseRepo{
+		getCaseByID: func(context.Context, string, repository.SearchScope) (domain.CaseView, error) {
+			return domain.CaseView{ProjectDetails: &domain.EntityRef{ID: projectID}}, nil
+		},
+		accountDefaultWatcherIDs: func(context.Context, string) ([]string, error) {
+			return nil, errors.New("boom")
+		},
+		setCaseWatchList: func(context.Context, string, []string, string) ([]domain.WatchListUser, time.Time, error) {
+			setCaseWatchListCalled = true
+			return nil, time.Now(), nil
+		},
+	}
+	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, &stubProjectContactRepo{})
+
+	req := domain.UpdateCaseRequest{ID: testDeploymentUUID, WatchList: &userIDs}
+	if _, err := svc.UpdateCase(context.Background(), req); err == nil {
+		t.Fatal("expected an error when the account default watcher lookup fails, got nil")
+	}
+	if setCaseWatchListCalled {
+		t.Error("SetCaseWatchList was called despite a failed account default watcher lookup -- this would have silently dropped any existing stakeholder from the case")
+	}
+}
+
+// TestCaseService_UpdateCase_WatchList_SkipsCheckWhenNoProjectLinked confirms
+// a case with no project linked (ProjectDetails nil, a documented real
+// state) never consults projectContactRepo at all -- there is nothing to
+// validate membership against.
+func TestCaseService_UpdateCase_WatchList_SkipsCheckWhenNoProjectLinked(t *testing.T) {
+	userIDs := []string{"11111111-1111-1111-1111-111111111111"}
+
+	repo := &stubCaseRepo{
+		getCaseByID: func(context.Context, string, repository.SearchScope) (domain.CaseView, error) {
+			return domain.CaseView{ProjectDetails: nil}, nil
+		},
+		setCaseWatchList: func(context.Context, string, []string, string) ([]domain.WatchListUser, time.Time, error) {
+			return nil, time.Now(), nil
+		},
+	}
+	// No getProjectContactByUserID stub set: a call to it panics, so this
+	// test also proves the check is skipped, not just that it would pass.
+	svc := NewCaseService(repo, stubUserRepo{getUserByEmail: func(context.Context, string) (domain.User, error) {
+		return domain.User{ID: testDeploymentUUID, Email: "jane.doe@example.com"}, nil
+	}}, nil, alwaysUnrestrictedAccess{}, &stubProjectContactRepo{})
+
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	req := domain.UpdateCaseRequest{ID: testDeploymentUUID, WatchList: &userIDs}
+	if _, err := svc.UpdateCase(ctx, req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }

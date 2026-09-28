@@ -62,7 +62,7 @@ type ProjectStatsRepository interface {
 	// logged against a project's cases. ServiceNow sums time_card.total for
 	// cases opened inside the project's start/end window; this schema has no
 	// single total column, so the five per-activity minute columns
-	// (migration 000039) are summed instead.
+	// (migration 0041) are summed instead.
 	//
 	// The project comes from the time card's case (work_item.project_id),
 	// not time_card.customer_project_id, matching SearchCaseTimeCards' own
@@ -179,9 +179,11 @@ func (r *projectStatsRepo) DeployedProductCount(ctx context.Context, projectID s
 // instance_repo.go's own instanceRefJoins does.
 //
 // The column is spelled project_key, following the live (sync-built) schema
-// rather than migration 000054's subscription_key -- the same deliberate
-// choice instance_repo.go makes, and the reason a database built purely from
-// migrations/ cannot run this query. See CLAUDE.md's "Staging schema drift".
+// -- migration 0054 (post-restructure) creates it under this name directly
+// rather than the stale subscription_key its pre-restructure version used,
+// the same deliberate choice instance_repo.go makes, so a database built
+// purely from migrations/, applied in order, can run this query too. See
+// CLAUDE.md's "Staging schema drift".
 func (r *projectStatsRepo) InstanceCount(ctx context.Context, projectID string) (int, error) {
 	var n int
 	err := r.db.QueryRow(ctx, `

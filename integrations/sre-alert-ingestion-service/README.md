@@ -1,576 +1,203 @@
-# SRE Alert Ingestion Service
+# sre-alert-ingestion-service
 
-Go backend service that ingests normalized alerts from external
-monitoring/alerting tools (Azure, Site24x7, Grafana, Datadog, Prometheus,
-etc.) and turns each into a platform incident, by calling the sibling M2M
-gateway `csm-integration-service`. If that call fails, the alert is durably
-buffered in this service's own dedicated Postgres database, retried with
-exponential backoff, and — if it keeps failing — escalated via a Twilio
-voice call to SRE, through a channel independent of the platform.
+Receives monitoring webhooks from 10 vendors, normalises each alert to the 8-field alert shape,
+gives it a gap-free `ALT#########` id, writes it to the `alerts` table in Cosmos DB for Apache
+Cassandra, and wakes up `sre-alert-core-service` (alerts-core). alerts-core reads the rows in id
+order and turns them into incidents. This service does not create incidents and does not touch
+alerts-core's own tables (`alert_cursor`, `incidents_*`, `processor_lease`).
 
-**The entire point of this component is to not be a single point of failure
-on the platform's own availability.** Buffering survives this service's own
-restarts and a regional failover, not just an in-process retry loop.
+```
+vendor ──POST──▶ ingestion (transform → allocator: CAS-claim ids → insert + read back) ──▶ alerts
+                                           │                                               ▲
+                                           └── POST /alert (wake-up) ──▶ alerts-core ──reads┘
+```
 
-## Quick Start
+## What it does
 
-```bash
-# from integrations/sre-alert-ingestion-service
-PGHOST="${DB_HOST:-localhost}" PGPORT="${DB_PORT:-5432}" \
-PGUSER="$DB_USER" PGPASSWORD="$DB_PASSWORD" \
-PGDATABASE="$DB_NAME" PGSSLMODE="$DB_SSLMODE" \
-psql -f migrations/0001_create_alert_buffer.up.sql
+- **Transforms**: one per vendor (`internal/vendors/<vendor>/`), following the ServiceNow Edge
+  API mappings for that vendor. A payload the transform rejects is answered `400` and never
+  claims an id.
+- **Ids**: every replica claims ranges of ids from the `alert_seq` row with a lightweight
+  transaction (compare-and-set), so ids never repeat across replicas. One claim covers everything
+  queued at that moment (up to `allocator.max_batch`), so a burst costs a handful of transactions.
+- **Writes**: each alert is inserted, then read back. After `store.insert_attempts` failures a
+  `VOID: <reason>` filler row is written (with the same retries) under the same id so alerts-core skips it immediately
+  instead of waiting its 10-minute gap timeout, and a DB-failure Chat card is posted.
+- **Response**: `201` only after every alert in the request has been written and read back.
+- **Wake-up**: one `POST /alert` to alerts-core per written batch. Calls are coalesced so at most
+  one is in flight. If it fails, alerts-core's own 10-second poll still picks the rows up.
+- **Chat cards** (Google Chat, cardsV2): a *rejected webhook* card (at most one per vendor + error
+  class, and 10 in total, per `reject.window`) and a *DB failure* card (at most `fallback.cards_per_minute`, then one
+  summary per minute). These limits are per replica, so N replicas can post up to N times as many
+  cards. If Chat fails too, the full alert is logged at ERROR.
+
+## Endpoints
+
+| Method | Path | Answers |
+|---|---|---|
+| POST | `/api/wso2/v1/sre_alert_api/<vendor>` | `201` stored, `400` rejected payload, `401` auth, `404` unknown vendor, `405` wrong method, `413` body over `server.max_body_bytes`, `503` queue full / store unavailable / draining (with `Retry-After: 60`) |
+| GET | `/healthz` | `200`, or `503` while shutting down. Never checks Cassandra, so a DB outage doesn't pull every replica out of rotation |
+| GET | `/livez` | Always `200` while the process runs |
+
+Vendors: `aws`, `azure`, `datadog`, `elasticsearch`, `gcp`, `icinga`, `openobserve`,
+`opensearch`, `prometheus`, `site24x7`.
+
+Responses:
+
+```json
+201 {"status":"stored","alt_ids":["ALT000000123"],"count":1}
+400 {"status":"rejected","error":"INVALID DATADOG ALERT PAYLOAD STRUCTURE"}
+503 {"status":"unavailable","error":"alert queue full"}
+```
+
+A Prometheus request carries several alerts and gets one id per alert, in order. A Prometheus
+batch whose alerts are all skipped by the transform answers `201` with `"count":0`.
+
+## Run locally
+
+Requires Go 1.25.5.
+
+```sh
+cp .env.example .env               # fill in the CASSANDRA_* values
+cp config.toml.example config.toml # optional; built-in defaults are the same values
+set -a; . ./.env; set +a
 go run ./cmd/server
 ```
 
-(the server itself reads `DB_HOST`/`DB_PORT`/`DB_USER`/`DB_PASSWORD`/`DB_NAME`/
-`DB_SSLMODE` directly and builds its own DSN via `net/url` + `url.UserPassword`,
-which percent-encodes the password automatically — the one-liner above is
-only for driving `psql` by hand, and passes credentials as `PG*` environment
-settings rather than embedding them in a URI on purpose: libpq's own URI
-form requires percent-encoding any reserved character in the user-info part
-— `@` ends it early, `?` starts a query string — and shell quoting doesn't
-perform that encoding, it only protects the string from the shell itself)
+The Cassandra connection always uses TLS (as Cosmos DB requires), so a plain local Cassandra
+container can't be used by the binary as it is. Point it at a **non-production** Cosmos DB
+account/keyspace; never at the production `alertintegration` keyspace.
 
-The server automatically loads `.env` from the working directory on startup
-(silently ignored if absent).
+Tests:
 
-Server starts at `http://localhost:8080`.
-
-## Overview
-
-- Default port: `8080`
-- Runtime: Go `1.26+`
-- Entry point: `cmd/server/main.go`
-- Authentication:
-  - Incoming requests (`POST /alerts`): **HTTP Basic Auth, enforced by this
-    service itself.** Unlike this repo's other `integrations/*` services,
-    this one is deployed on AKS with no gateway/ingress auth layer in front
-    of it, so it authenticates every request end to end rather than
-    trusting a Choreo API Manager gateway. Each source (Datadog, Grafana,
-    PagerDuty, etc.) gets its own username/password pair, configured via
-    `SRE_ALERT_AUTH_USERS` as comma-separated `username:bcryptHash` entries
-    — passwords are never stored in plaintext, only their bcrypt hash. Use
-    `go run ./cmd/server gen-basic-auth-hash` to generate the hash for a new password. This
-    variable is required; the service refuses to start without it, and
-    fails fast on any malformed entry. `GET /health` is deliberately
-    exempt, so liveness/readiness probes don't need credentials.
-  - Outbound calls to `csm-integration-service`: OAuth2 client credentials
-    grant (managed automatically), always M2M.
-  - Outbound calls to Twilio: HTTP Basic Auth (Account SID / Auth Token) —
-    Twilio has no OAuth2 flow.
-
-## Architecture
-
-```
-SRE monitoring tool
-       |  POST /alerts
-       v
-sre-alert-ingestion-service
-       |  1. validate + map to a CreateIncidentRequest
-       |  2. persist to alert_buffer (status=pending) -- BEFORE any delivery attempt
-       |  3. respond 202 {id}
-       |
-       |  (background worker, polling alert_buffer on a timer)
-       |  4. attempt POST /incidents on csm-integration-service
-       |     success -> status=delivered
-       |     retryable failure, budget remaining -> status stays pending, retry_count++
-       |     retryable failure, budget exhausted -> Twilio voice call, status=escalated
-       |     non-retryable failure (e.g. 400) -> status=failed, no escalation
-       v
-csm-integration-service  ---->  entity-service  ---->  platform incident store
-```
-
-Persist-then-attempt, not attempt-then-persist: nothing is lost even if this
-process crashes between accepting a request and its first delivery attempt.
-
-## `CSM_INTEGRATION_BASE_URL` can point at `csm-integration-service` or `entity-service` directly
-
-`internal/csmclient` always calls the same relative paths — `POST /incidents`,
-`POST /incidents/search`, `PATCH /incidents/{id}`, `POST /services/search`,
-`POST /alert-incident-mappings`, `POST /alert-incident-mappings/lookup` — and
-`csm-integration-service` proxies every one of them at that identical
-relative path against `entity-service`, which exposes the same paths itself.
-So whether a given deployment of this service reaches `entity-service`
-directly (e.g. both components in the same Choreo organization) or goes
-through `csm-integration-service` (e.g. this service is deployed outside
-that organization, where `entity-service` isn't directly reachable) is purely
-a matter of which `CSM_INTEGRATION_BASE_URL`/OAuth2 client credentials it's
-configured with — no code in this service branches on which target it's
-talking to, and none should be added; if a future path ever needs one target
-but not the other, that's a reason to revisit this, not to special-case it
-here.
-
-## Prerequisites
-
-- Go `1.26+` — [install](https://go.dev/doc/install)
-- PostgreSQL — a **dedicated** database for this service's buffer (never
-  CSM's own database — see "Why a dedicated database" below)
-
-## Configuration
-
-Copy `.env.example` to `.env` and fill in the values:
-
-| Variable | Description |
-|---|---|
-| `DB_HOST` | Buffer database host (default `localhost`) |
-| `DB_PORT` | Buffer database port (default `5432`) |
-| `DB_USER` | Buffer database user. Required |
-| `DB_PASSWORD` | Buffer database password. Required — may contain any character, including `?`/`@`/`/`/spaces; the DSN is built in code via `url.UserPassword`, which percent-encodes it automatically |
-| `DB_NAME` | Buffer database name. Required |
-| `DB_SSLMODE` | Buffer database `sslmode`. No default — empty is a valid value (pgx applies its own default behavior); a managed Postgres (e.g. Azure Database for PostgreSQL) will typically need `require` |
-| `CSM_INTEGRATION_BASE_URL` | Base URL of `csm-integration-service` |
-| `CSM_INTEGRATION_TOKEN_URL` | OAuth2 token endpoint for `csm-integration-service` |
-| `CSM_INTEGRATION_CLIENT_ID` | OAuth2 client ID |
-| `CSM_INTEGRATION_CLIENT_SECRET` | OAuth2 client secret |
-| `CSM_INTEGRATION_SCOPES` | Comma-separated OAuth2 scopes |
-| `SRE_ALERT_CALLER_ID` | A real, provisioned platform user id — see "Known limitations" |
-| `SRE_ALERT_SERVICE_MAP` | Optional JSON object, `{"<label>":"<CMDB service UUID>", ...}` — the static half of service-UUID resolution, see "Service-UUID resolution" below |
-| `SRE_ALERT_UNKNOWN_SERVICE_ID` | Required. CMDB "Unclassified" service UUID, used when a label has no static-map entry and a live search finds no match — see "Service-UUID resolution" below |
-| `SRE_ALERT_AUTH_USERS` | Required. Comma-separated `username:bcryptHash` pairs for inbound HTTP Basic Auth on `POST /alerts` — generate a hash with `go run ./cmd/server gen-basic-auth-hash` |
-| `SRE_ALERT_MAX_RETRIES` | Retryable-failure count before escalation (default `3`) |
-| `SRE_ALERT_POLL_INTERVAL_SECONDS` | How often the worker scans the buffer (default `15`) |
-| `SRE_ALERT_GROUP_WINDOW_MINUTES` | How far back the incident-grouping search looks for an attachable incident (default `15`) |
-| `TWILIO_ACCOUNT_SID` | Twilio account SID |
-| `TWILIO_AUTH_TOKEN` | Twilio auth token |
-| `TWILIO_FROM_NUMBER` | Twilio-provisioned caller-ID number (E.164) |
-| `SRE_ALERT_ONCALL_NUMBER` | Static on-call number every escalation call rings (E.164) — see "Known limitations" |
-| `TWILIO_VOICE` | Optional: TTS voice for the escalation call |
-| `TWILIO_LANGUAGE` | Optional: TTS language/locale |
-| `TWILIO_API_BASE_URL` | Optional: override Twilio's API base (tests / regional edge) |
-| `GOOGLE_CHAT_ESCALATION_WEBHOOK_URL` | Incoming-webhook URL for the escalation Google Chat space |
-| `EMAIL_SERVICE_BASE_URL` | Base URL of the internal email-notification service |
-| `EMAIL_SERVICE_TOKEN_URL` | OAuth2 token endpoint for the email-notification service |
-| `EMAIL_SERVICE_CLIENT_ID` | OAuth2 client ID |
-| `EMAIL_SERVICE_CLIENT_SECRET` | OAuth2 client secret |
-| `EMAIL_SERVICE_SCOPES` | Comma-separated OAuth2 scopes |
-| `SRE_ALERT_ESCALATION_EMAIL_FROM` | "From" address for escalation emails |
-| `SRE_ALERT_ESCALATION_EMAIL_TO` | Comma-separated recipient list for escalation emails |
-| `PORT` | Server listen port (default `8080`) |
-
-## Database / migrations
-
-This service owns a **dedicated** Postgres database — never CSM's own
-database. Sharing a database would reintroduce exactly the coupling this
-service exists to remove: if CSM's database has a problem, this service's
-ability to buffer alerts must not degrade with it.
-
-Migrations follow this repo's `up`/`down` SQL-pair convention (matching
-`entity-service/migrations` and
-`integrations/sftpgo-authentication-service/db/migrations`), applied via
-`psql`, not from application code:
-
-```bash
-PGHOST="${DB_HOST:-localhost}" PGPORT="${DB_PORT:-5432}" \
-PGUSER="$DB_USER" PGPASSWORD="$DB_PASSWORD" \
-PGDATABASE="$DB_NAME" PGSSLMODE="$DB_SSLMODE" \
-psql -f migrations/0001_create_alert_buffer.up.sql
-```
-
-Driver: `github.com/jackc/pgx/v5` via `database/sql` (the `pgx/v5/stdlib`
-adapter) — the same choice already established in this repo by
-`entity-service` and `integrations/sftpgo-authentication-service`, used here
-for consistency rather than re-evaluated independently.
-
-### `alert_buffer` schema
-
-| Column | Purpose |
-|---|---|
-| `id` | UUID primary key, generated **client-side** by `internal/idgen` before the row is persisted (not by the column's `gen_random_uuid()` default — see "Duplicate-incident dedup" below for why) — returned to the caller as the buffered alert's id |
-| `received_at` | When the alert was accepted |
-| `payload` | The already-mapped `CreateIncidentRequest` JSON (not the raw inbound alert) — see `internal/handler.MapToIncident`. Its `Subject` is tagged with this row's own `alertNumber`, not `id` (`internal/csmclient.DedupTag`) |
-| `status` | `pending` \| `delivered` \| `escalated` \| `failed` |
-| `retry_count` | Number of failed, retryable delivery attempts so far |
-| `last_attempt_at` | Timestamp of the most recent delivery attempt |
-| `last_error` | The most recent attempt's error, if any |
-| `incident_id` | Set once delivery succeeds |
-| `escalated_at` | Set once the Twilio escalation call is placed |
-
-## Severity mapping
-
-`AlertRequest.Severity` maps to `CreateIncidentRequest`'s `Impact`/`Urgency`
-(`internal/severity.MapImpactUrgency`) — this service's own choice; no
-upstream contract dictates it:
-
-| Severity | Impact | Urgency |
-|---|---|---|
-| `critical` | HIGH | HIGH |
-| `major` | HIGH | MEDIUM |
-| `minor` | MEDIUM | MEDIUM |
-| `warning` | LOW | MEDIUM |
-| `ok` | LOW | LOW |
-| *(anything else)* | LOW | LOW — fails safe, not open |
-
-`AlertRequest.Source` maps to `ContactType` (`internal/severity.MapContactType`)
-only where an existing enum value fits: `azure`→`AZURE`, `site24x7`/`site247`→`SITE_247`,
-`sentinel`/`microsoft-sentinel`→`SENTINEL`. Any other source omits `ContactType`
-entirely rather than guessing.
-
-`AlertRequest.Category` passes through uppercased if it's one of `INQUIRY` /
-`SERVICE_INTERRUPTION` / `SECURITY` (case-insensitive); otherwise it defaults
-to `SERVICE_INTERRUPTION` (`internal/severity.MapCategory`).
-
-## API Endpoints
-
-- `GET /health` — liveness/readiness; reports `503` if the buffer database
-  is unreachable
-- `POST /alerts` — accepts a normalized alert (this service's own generic
-  `AlertRequest` shape), persists it to the buffer, responds `202` with
-  `{"id": "<buffered-alert-id>", "alertNumber": "<human-readable-number>"}`.
-  Never attempts delivery inline — see "Architecture" above. Stays available
-  for any source that can speak `AlertRequest`'s shape directly (e.g. a
-  future in-house tool); the four vendor-adapter routes below are additive
-  to it, not a replacement.
-- `POST /alerts/adapters/azure` — accepts an Azure Monitor
-  common-alert-schema webhook payload
-- `POST /alerts/adapters/site24x7` — accepts a Site24x7 native alert-webhook
-  payload; only `STATUS` `TROUBLE`/`DOWN`/`CRITICAL` creates a buffered
-  alert, any other `STATUS` returns `200` with a small acknowledgment body
-- `POST /alerts/adapters/opensearch` — accepts this source's own native
-  alert payload
-- `POST /alerts/adapters/grafana` — accepts a Grafana native alert-webhook
-  payload; only `state == "alerting"` creates a buffered alert, any other
-  state returns `200` with a small acknowledgment body
-- `POST /alerts/adapters/choreodp` — accepts an internal alert-forwarder's
-  native alert payload; `severity`/`impact`/`urgency` are raw integers
-  (1=High, 2=Medium, 3=Low), and `impact`/`urgency` are passed straight
-  through as an override of the created incident's Impact/Urgency — see
-  "Impact/Urgency override" below
-
-Every adapter route translates its vendor's own native payload into
-`AlertRequest`, then reuses the exact same validation/buffering/worker/
-grouping/dedup/escalation path `POST /alerts` uses — see
-`internal/handler.AlertHandler.enqueueAlert`. Each vendor gets its own
-dedicated route (deliberately, not one shared endpoint that branches on
-payload shape internally) so each vendor's parsing/mapping stays simple to
-reason about, route, and test independently. All five routes require the
-same HTTP Basic Auth as described above.
-
-See `openapi.yaml` for the full request/response schema of every route,
-including each adapter's own native payload shape.
-
-## Vendor-adapter mapping notes
-
-These are this service's own mapping choices for each adapter — the exact
-tables live in `internal/severity` and each `internal/handler/adapter_*.go`
-file; this section is a summary, not a restatement of every line.
-
-- **Azure** (`adapter_azure.go`): `Sev0`-`Sev4` → `critical`/`major`/`minor`/
-  `warning`/`ok`; a `monitorCondition` of `"Resolved"` always forces `"ok"`
-  regardless of the reported `Sev`. `service` defaults to `"Managed
-  Services"` when `monitoringService` is absent (matching the prior
-  ServiceNow-based pipeline's own fallback for the identical gap).
-  `alertId` becomes `uniqueIdentifier` for cross-alert grouping.
-- **Site24x7** (`adapter_site24x7.go`): only `STATUS` `TROUBLE`/`DOWN`/
-  `CRITICAL` (case-sensitive) create a buffered alert; anything else is
-  acknowledged with `200` and ignored. `DOWN`/`CRITICAL` → `critical`,
-  `TROUBLE` → `warning` — a real per-status severity mapping, deliberately
-  added here since the prior ServiceNow-based pipeline had none (every
-  alert through that path got the same hardcoded low-priority
-  classification regardless of `STATUS`).
-- **OpenSearch** (`adapter_opensearch.go`): `AlertRequest.source` is always
-  the fixed literal `"opensearch"` — this source's own `source` field is a
-  human-readable title, not the originating system's identity, and maps to
-  `metricName` instead. Any unrecognized/missing severity value maps to
-  `"ok"` (a deliberate, safe-default deviation from the prior pipeline,
-  which failed open to the *highest* severity on an unrecognized value).
-- **Grafana** (`adapter_grafana.go`): only `state == "alerting"` creates a
-  buffered alert; anything else is acknowledged with `200` and ignored,
-  matching the prior pipeline's own filter. `tags.severity` `"1"`-`"4"` →
-  `critical`/`major`/`minor`/`warning`; anything else/missing → `"ok"`.
-  `tags.service` is passed through as free text (unlike the prior pipeline,
-  which only honored it when it equaled `"CHOREO"` — a routing rule tied to
-  that system's own lookup table, with no equivalent here).
-- **Internal alert-forwarder** (`adapter_choreodp.go`): `severity`,
-  `impact`, and `urgency` are raw integers (1=High, 2=Medium, 3=Low), not
-  this service's string vocabulary. `severity` → `critical`/`major`/`minor`;
-  any other value → `"warning"` (fails safe, not open — see
-  `choreoDPSeverityTable`). `impact`/`urgency` map onto `HIGH`/`MEDIUM`/`LOW`
-  and are set directly on `AlertRequest.impact`/`urgency` — see
-  "Impact/Urgency override" below. `source` (unlike every other adapter) is
-  taken straight from the payload's own `source` field, not a fixed literal.
-
-## Impact/Urgency override
-
-`AlertRequest.impact`/`urgency` are an additive, optional override of this
-service's usual `severity.MapImpactUrgency(req.Severity)` derivation
-(`internal/handler.MapToIncident`) — set only by `adapter_choreodp.go` today,
-since it's the only source with its own authoritative impact/urgency signal.
-Every other caller (generic `/alerts`, the four other adapters) never sets
-these, so `MapToIncident`'s output is unchanged for them: nil means "derive
-from Severity as before." Values must be `HIGH`/`MEDIUM`/`LOW`, matching
-`csmclient.CreateIncidentRequest.Impact`/`.Urgency`'s own vocabulary.
-
-## Retry / escalation behavior
-
-A background worker (`internal/worker`) polls `alert_buffer` every
-`SRE_ALERT_POLL_INTERVAL_SECONDS` for `pending` rows, and attempts
-delivery for whichever ones are due per exponential backoff
-(`internal/backoff`: 30s base delay, doubling, capped at 30 minutes).
-
-Every `POST /incidents` failure is classified (`internal/worker.isRetryable`):
-
-- **HTTP 400** — the buffered payload itself is invalid. Retrying it can
-  never succeed, so the row is marked `failed` immediately: no retry, no
-  Twilio escalation (that channel exists for "CSM won't accept this right
-  now", not "this request is malformed").
-- **Everything else — including HTTP 401** — is retryable. See "Known
-  limitations" below for exactly why a 401 is treated as retryable here,
-  which is the opposite of how a 401 is normally read.
-
-Once a row accumulates `SRE_ALERT_MAX_RETRIES` retryable failures, the
-worker escalates via `internal/notifications.MultiChannelEscalator` and
-marks the row `escalated` — terminal; this service does not resume
-retrying an escalated row automatically. Escalation fans out to every
-configured channel independently — a Twilio voice call, a Google Chat
-message, and an email — not a first-success-wins race: the whole point is
-more independent ways for SRE to notice that CSM delivery is failing.
-`Escalate` reports success if *any* channel got through; a channel that
-isn't configured is skipped, not treated as a failure, and a channel that
-fails while another succeeds is logged but doesn't block the others (see
-`MultiChannelEscalator`'s own doc comment).
-
-## Duplicate-incident dedup
-
-A failed `POST /incidents` call does not prove the incident wasn't actually
-created — the request can succeed on the far side while the response is
-lost (timeout, connection reset, etc.). Retrying blindly in that situation
-risks creating a second, duplicate incident for the same alert. This
-service guards against that in two parts:
-
-1. **Every incident's `Subject` is tagged with its buffer row's own
-   `alertNumber`, not its `id`.** `internal/store.Store.Enqueue` generates
-   `alertNumber` (this service's own Postgres sequence) as part of the same
-   INSERT that persists the row, and `internal/handler.MapToIncident`
-   embeds it as a dedup tag — `internal/csmclient.DedupTag(alertNumber)`,
-   format `"[alert:<alert-number>]"` — as the leading text of
-   `CreateIncidentRequest.Subject`. This is fully within this service's own
-   control, unlike `AlertRequest.UniqueIdentifier` (vendor-supplied and
-   optional), and guaranteed unique per buffered alert. (`internal/idgen`
-   generates `id` client-side for a different reason — see its own doc
-   comment — not for this dedup tag.)
-2. **Before any *retry* (never the first attempt — nothing could exist yet
-   on attempt 1), the worker searches for that tag first.**
-   `internal/worker.attempt` calls
-   `csmclient.Client.SearchIncidentByTag` (`POST /incidents/search` on
-   `csm-integration-service`, `searchQuery` = the row's dedup tag) whenever
-   `row.RetryCount > 0`. A match means an earlier attempt's incident
-   already exists: the row is marked `delivered` against that incident's
-   id/number and `POST /incidents` is **not** called again. No match, or
-   the search call itself failing, both **fail open toward attempting
-   delivery** — the search existing at all must never become a new way to
-   silently drop a buffered alert.
-3. **The incident id is durably recorded the instant `CreateIncident`
-   succeeds — before `MarkDelivered` is even attempted.**
-   `internal/store.Store.RecordIncidentID` persists `incident_id` on the row
-   without changing its status or `retry_count`, so a subsequent
-   `MarkDelivered` failure (this service's own database, not CSM) does not
-   leave the row looking as if nothing happened. On the next attempt,
-   `internal/worker.attempt`'s very first check is `row.IncidentID != ""`:
-   if it's already set, the worker retries `MarkDelivered` directly and
-   **never calls `CreateIncident` again** — no network call to CSM at all,
-   so unlike mechanism 2 above, this cannot fail open into creating a
-   duplicate. This is the actual fix for the gap mechanism 2 alone left
-   open (a `MarkDelivered` failure right after a successful create, followed
-   by a retry whose dedup search 401s and fails open) — mechanism 2 still
-   matters for the *cross-request* dedup case (a genuinely different retry
-   racing a lost response), which this mechanism doesn't cover.
-
-**Known limitation, mechanism 2 only:** `POST /incidents/search`, like
-`POST /incidents` itself, is ServiceNow-backed and currently also always
-401s for the same missing-end-user-identity reason (see "Known
-limitations" below). Until that infrastructure gap is closed, every retry
-that reaches mechanism 2 hits "search 401'd, proceeding to create anyway" —
-that check is **structurally correct and ready to work**, but **not yet
-actually effective in production**. Mechanism 3 has no such dependency —
-it works today, unconditionally.
-
-## Cross-alert incident grouping
-
-The dedup mechanisms above stop a *single* alert from creating two
-incidents. Grouping is a different problem: multiple *distinct* alerts
-reporting the same underlying condition (e.g. a "firing" event and its
-later "resolved" event) should land on one incident, not one each.
-
-For any inbound alert carrying `uniqueIdentifier`, `internal/handler.buildSubject`
-tags the incident's `Subject` with `csmclient.GroupTag(source,
-uniqueIdentifier)` — deliberately the *same* value across every alert for
-that condition, unlike the per-row dedup tag. Before creating a new
-incident, `internal/worker.tryGroup` searches for that tag via one
-`POST /incidents/search` call (`csmclient.SearchOpenIncidentByGroupTag`),
-filtered to still-open incidents (`state` not Resolved/Closed/Cancelled)
-created within `SRE_ALERT_GROUP_WINDOW_MINUTES` (default 15). A match
-attaches this alert to that incident instead of calling `POST /incidents`
-again; no match, or the search call itself failing, both fail open to the
-normal create-or-dedup flow above — same fail-open posture as everywhere
-else in this service.
-
-Every successful delivery (a fresh create, or an attach via grouping) also
-records a best-effort `CreateAlertIncidentMapping` call — a CSM-side audit
-trail of which alerts fed which incident, kept for visibility even though
-the grouping *decision* itself no longer reads it back.
-
-A group-attach also pushes a best-effort work note onto the incident itself
-via `csmclient.Client.UpdateIncident` (`PATCH /incidents/{id}` on
-`csm-integration-service`), summarizing the new alert (alert number, when it
-was received, and whatever `internal/handler.buildWorkNotes`/the alert's own
-description already captured) — so an engineer looking at the incident sees
-"this condition fired again" history, not silence. Same failure-tolerance
-contract as `CreateAlertIncidentMapping`: a failed push is logged and does
-not block `MarkDelivered` or the mapping call — the primary goal (this alert
-is attached to the right incident) is already achieved by the time it runs.
-
-This design mirrors, in spirit, a ServiceNow prod flow ("Create Incident
-from Alert") found during design — a hash + time-window match — but is not
-a port of it: that flow's referenced hash column doesn't actually exist on
-any live SN table (confirmed by direct schema read), so there was no
-working field-level mechanism to copy. The 15-minute window is the one
-concrete, prod-confirmed parameter kept from that design; the tag itself,
-and the search-based implementation, are this service's own — and unlike
-the SN flow (permanently disabled) or a Postgres-side mapping table (a
-dependency this service exists specifically to avoid), this mechanism has
-no dependency beyond the same `POST /incidents/search` call the dedup
-mechanism above already makes.
-
-## Service-UUID resolution
-
-`CreateIncidentRequest.ServiceID` must be a CMDB service UUID, but
-`AlertRequest.Service` is a human-readable label (a vendor's own field, e.g.
-Azure's `monitoringService`, or a fixed literal like `"Site24x7
-Monitoring"`) — never a UUID itself. Resolving one to the other is a
-two-step, hybrid design, split across the request path and the worker for
-the same "persist before any delivery attempt" reason described above:
-
-1. **Static map, synchronous, in the request path.** `SRE_ALERT_SERVICE_MAP`
-   (an exact-match label → UUID JSON object) is checked by
-   `internal/handler.MapToIncident` before an alert is ever buffered — pure
-   in-process map lookup, no I/O, safe on the fast path. A match resolves
-   `ServiceID` immediately; a miss buffers `ServiceID` as
-   `csmclient.UnresolvedServiceIDSentinel` (the empty string) instead, with
-   the raw label preserved separately in the row's payload.
-2. **Live search, at delivery-attempt time, in the worker.**
-   `internal/worker.resolveServiceID` runs immediately before
-   `CreateIncident`, only for a row still carrying the sentinel: an
-   in-memory, TTL-bounded cache (`internal/worker.serviceCache`, 15 minutes)
-   is checked first, then a live `POST /services/search` call
-   (`csmclient.Client.SearchServices`, exact-match, limit 1) against
-   `csm-integration-service`. A match is cached and used; a confirmed
-   zero-result search falls back to `SRE_ALERT_UNKNOWN_SERVICE_ID`; a
-   transient error from the search itself is treated exactly like any other
-   retryable `CreateIncident` failure, never silently bucketed as
-   "unknown."
-
-## Known limitations
-
-These are deliberate, already-decided states this service does not attempt
-to work around — documented here rather than as scattered code comments.
-
-- **`POST /incidents` on `csm-integration-service` currently always returns
-  401.** `csm-integration-service` is M2M-only, and the upstream
-  entity-service incident-creation operation is ServiceNow-backed,
-  requiring a forwarded end-user identity token this stack cannot currently
-  supply. This service's retry/buffer/escalate logic treats that 401 as a
-  retryable CSM-unavailability signal (see `internal/worker.isRetryable`'s
-  doc comment for the full reasoning), so every alert submitted today will
-  eventually reach Twilio escalation rather than ever being delivered. This
-  is expected until the missing end-user-identity infrastructure exists
-  upstream — not a bug in this service.
-- **`SRE_ALERT_CALLER_ID` must be a real, provisioned platform user id.**
-  The platform has no "system"/machine-caller concept for machine-created
-  incidents today. This service does not guess or hardcode a value — the
-  operator must provision a real user and configure its id before this
-  service can create incidents (moot today anyway, given the point above,
-  but the contract is sound for when it isn't). The service refuses to
-  start if this is unset.
-- **Escalation calls a single static on-call number, not a live rotation.**
-  `SRE_ALERT_ONCALL_NUMBER` is fixed config, not looked up against any
-  on-call schedule. A future iteration integrating a real rotation (e.g.
-  a PagerDuty/Opsgenie lookup before placing the call) would change
-  `internal/worker`'s escalation step and `internal/notifications.TwilioClient`
-  accordingly.
-- **No further fallback if every escalation channel fails.** If CSM is
-  unreachable and Twilio, Google Chat, *and* email are all also unreachable
-  or unconfigured, the row is still marked `escalated` and every failure is
-  logged — there is no fourth channel. Three independent channels make this
-  a much smaller risk than the single-channel (Twilio-only) design this
-  replaced, but it isn't zero; a wider on-call/paging integration (e.g.
-  PagerDuty) is still out of scope for this iteration.
-- **Run exactly one instance of this worker.** `PendingBatch` has no
-  claim/lease mechanism, so two instances polling concurrently can both pick
-  up and dispatch the same new row (`RetryCount == 0` skips the dedup search
-  that would otherwise catch this), creating a duplicate incident. See this
-  service's `CLAUDE.md` ("Deployment isolation") for what a safe multi-
-  instance design needs before scaling past one.
-
-## Testing
-
-```bash
-go build ./...
+```sh
+gofmt -l .
 go vet ./...
-go test ./...
 go test -race ./...
-go test -coverprofile=coverage.out ./... && go tool cover -html=coverage.out
+
+# Cassandra integration tests: a local container and a throwaway keyspace that is dropped afterwards.
+docker run -d --name ingestion-cassandra -p 19042:9042 cassandra:4.1
+CASSANDRA_TEST_PORT=19042 go test -race -tags integration ./internal/cassandra/
 ```
 
-Or use `make`:
+Docker image:
 
-```bash
-make test    # vet + race-detector tests
-make build   # vet + test + compile
+```sh
+docker build -t sre-alert-ingestion-service .
+docker run --rm -p 8080:8080 --env-file .env \
+  -v "$PWD/config.toml:/app/config.toml:ro" -e CONFIG_PATH=/app/config.toml sre-alert-ingestion-service
 ```
 
-- **Request validation, severity mapping, backoff math, retry/escalation
-  branching, and the Twilio client are all unit-tested with hand-rolled
-  mocks** (no mocking library, matching this repo's convention) — no real
-  Postgres or Twilio required for `go test ./...` to fully exercise this
-  service's decision logic.
-- **`internal/store`'s Postgres implementation additionally has a real-DB
-  integration test** (`internal/store/postgres_test.go`), guarded by
-  `SRE_ALERT_TEST_DATABASE_URL` — it skips cleanly when that's unset, so it
-  never blocks `go test ./...` in an environment without Postgres. Run it
-  against a real (disposable) database:
+## Environment variables
 
-  ```bash
-  docker run -d --rm --name sais-test-pg -e POSTGRES_PASSWORD=testpass \
-    -e POSTGRES_DB=sais_test -p 55499:5432 postgres:16-alpine
-  SRE_ALERT_TEST_DATABASE_URL="postgres://postgres:testpass@127.0.0.1:55499/sais_test?sslmode=disable" \
-    go test ./internal/store/... -v
-  docker stop sais-test-pg
-  ```
+| Variable | Required | Meaning |
+|---|---|---|
+| `CASSANDRA_CONTACT_POINT` | yes | `<account>.cassandra.cosmos.azure.com` |
+| `CASSANDRA_KEYSPACE` | yes | The keyspace alerts-core reads (`alertintegration` in production) |
+| `CASSANDRA_KEY` | yes | Cosmos DB primary or secondary key (secret) |
+| `CASSANDRA_USERNAME` | no | Defaults to the account name (first DNS label of the contact point) |
+| `CASSANDRA_PORT` | no | Default `10350` |
+| `ALERT_CORE_WAKE_URL` | no | alerts-core's `POST /alert` URL. Empty: no wake-up, alerts-core's poll still works |
+| `FALLBACK_CHAT_WEBHOOK_URLS` | no | Comma-separated Google Chat webhook URLs (secret). Empty: no cards, only logs |
+| `<VENDOR>_ALERT_CONFIG` | no* | Per-vendor JSON overrides, same keys and shapes as the ServiceNow Edge API alert-config properties, e.g. `DATADOG_ALERT_CONFIG` |
+| `CONFIG_PATH` | no | Path to `config.toml`. Default `./config.toml`; a missing file means built-in defaults |
+| `PORT` | no | Default `8080` |
 
-  This test applies the migration itself before each test and exercises the
-  actual SQL (JSONB round-trip, NULL handling, the partial `pending` index)
-  — coverage an interface mock can't provide.
-- `cmd/server` (wiring only) has no dedicated tests, matching this repo's
-  convention for wiring-only code (e.g. `csm-integration-service`'s own
-  `cmd/server`).
+\* `SITE24X7_ALERT_CONFIG` needs a `TagList` for Site24x7 alerts to carry service, category and
+environment, for example
+`{"TagList":{"Service":"svc","Category":"cat","Environment":"env"}}`. A malformed
+`<VENDOR>_ALERT_CONFIG` stops the service at startup.
 
-## Security Scanning
+## Configuration (`config.toml`)
 
-```bash
-go install github.com/securego/gosec/v2/cmd/gosec@latest
-gosec -fmt=text ./...
+Everything is optional; [`config.toml.example`](config.toml.example) lists every key with its
+default and a comment. The main knobs:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `server.shutdown_grace` | `25s` | Total SIGTERM budget; must cover the three below |
+| `server.drain_delay` | `5s` | `/healthz` answers `503` this long before the listener closes |
+| `server.request_wait` | `8s` | A request waits this long for its ids, then gets `503`; also in-flight requests' time on shutdown |
+| `server.allocator_drain` | `7s` | The allocator's own time on shutdown to write everything already claimed |
+| `server.write_timeout` | `30s` | Connection write limit; must be at least 1s above `request_wait` |
+| `server.idle_timeout` | `60s` | Idle keep-alive connections are closed after this |
+| `server.max_body_bytes` | `1048576` | Larger bodies get `413` |
+| `auth.mode` | `none` | Hook for vendor authentication; only `none` exists today |
+| `allocator.queue_size` | `5000` | Queued submissions per replica before `503` |
+| `allocator.max_batch` | `200` | Most ids claimed in one compare-and-set |
+| `allocator.write_concurrency` | `64` | Parallel inserts per replica |
+| `store.insert_attempts` | `3` | Insert + read-back attempts before the filler row |
+| `store.claim_timeout` | `5s` | Timeout for the `alert_seq` read and compare-and-set (inserts use `store.query_timeout`, 1.5s) |
+| `reject.window` | `15m` | Rejected-webhook card window: one per vendor + error class, 10 in total, per replica |
+| `fallback.cards_per_minute` | `5` | DB-failure cards per minute, per replica, before summarising |
+
+## Example requests
+
+`BASE=http://localhost:8080/api/wso2/v1/sre_alert_api`. The same payloads, plus a recovery
+payload for each vendor, are in [`internal/vendors/testdata/`](internal/vendors/testdata/).
+
+```sh
+# AWS (SNS notification wrapping a CloudWatch alarm)
+curl -sS -X POST "$BASE/aws" -H 'Content-Type: application/json' -d '{"Type":"Notification","MessageId":"7a3f9c2e-4b1d-4e8a-9c3f-2b8d5e6f1a9c","TopicArn":"arn:aws:sns:us-east-1:487629103847:prod-cloudwatch-alarms","Message":"{\"AlarmName\":\"prod-rds-cpu-utilization-high\",\"AlarmArn\":\"arn:aws:cloudwatch:us-east-1:487629103847:alarm:prod-rds-cpu-utilization-high\",\"NewStateValue\":\"ALARM\",\"NewStateReason\":\"Threshold Crossed: 1 datapoint [92.4] was greater than the threshold (90.0)\",\"AlarmDescription\":\"{\\\"service\\\":\\\"client-medlineprod-alert-integration\\\",\\\"category\\\":\\\"service_interruption\\\",\\\"environment\\\":\\\"production\\\",\\\"severity\\\":\\\"critical\\\"}\"}","Timestamp":"2026-09-24T05:12:33.512Z"}'
+
+# Azure Monitor (common alert schema)
+curl -sS -X POST "$BASE/azure" -H 'Content-Type: application/json' -d '{"schemaId":"azureMonitorCommonAlertSchema","data":{"essentials":{"alertId":"/subscriptions/4c9e2a1f-8b3d-4e7c-9f1a-2b6d8e3c5a9f/providers/Microsoft.AlertsManagement/alerts/7f3a9c2e-4b1d-4e8a-9c3f-2b8d5e6f1a9c","alertRule":"prod-app-service-response-time-high","severity":"Sev1","signalType":"Metric","monitorCondition":"Fired","monitoringService":"Platform","firedDateTime":"2026-09-24T05:12:33.481Z"},"customProperties":{"service":"client-medlineprod-alert-integration","category":"service_interruption","environment":"production"},"alertContext":{}}}'
+
+# Datadog
+curl -sS -X POST "$BASE/datadog" -H 'Content-Type: application/json' -d '{"event_name":"prod-web high memory usage","trigger_name":"avg(last_5m):avg:system.mem.pct_usable{env:production} < 0.1","transition":"Triggered","alert_id":"148502937","service":"client-medlineprod-alert-integration","category":"service_interruption","tags":"env:production,severity:1,team:sre"}'
+
+# Elasticsearch
+curl -sS -X POST "$BASE/elasticsearch" -H 'Content-Type: application/json' -d '{"rule_id":"a8f2c9e1-3b7d-4f6a-9c1e-8d2b5f7a3c9e","rule_name":"prod-cluster-disk-watermark-exceeded","trigger_name":"disk.watermark.flood_stage","state":"ACTIVE","alert_id":"ZQ79cZ0B6qTDiYX-WKue","severity":"1","service":"client-medlineprod-alert-integration","category":"service_interruption"}'
+
+# GCP Cloud Monitoring
+curl -sS -X POST "$BASE/gcp" -H 'Content-Type: application/json' -d '{"incident":{"incident_id":"0.mzq9x7k2j8h4","state":"open","severity":"critical","policy_name":"prod-api-5xx-error-rate","condition_name":"5xx error rate above 5% for 5 minutes","resource":{"type":"gce_instance","labels":{"service":"client-medlineprod-alert-integration","category":"service_interruption","environment":"production"}},"started_at":1758700800},"version":"1.2"}'
+
+# Icinga
+curl -sS -X POST "$BASE/icinga" -H 'Content-Type: application/json' -d '{"notification_type":"PROBLEM","host_name":"prod-db-primary-01","host_display_name":"prod-db-primary-01.medlineprod.internal","host_state":"UP","service_name":"postgres-replication-lag","service_state":"CRITICAL","vars":{"service":"client-medlineprod-alert-integration","environment":"production"}}'
+
+# OpenObserve
+curl -sS -X POST "$BASE/openobserve" -H 'Content-Type: application/json' -d '{"short_description":"prod-api-gateway: p99 latency above 2000ms","description":"p99 latency has been above 2000ms for 5 minutes","urgency":"1","impact":"1","correlation_id":"9f3a7c2e-4b1d-4e8a-9c3f-2b8d5e6f1a9c","caller_id":"openobserve","service":"client-medlineprod-alert-integration","category":"service_interruption","environment":"production"}'
+
+# OpenSearch
+curl -sS -X POST "$BASE/opensearch" -H 'Content-Type: application/json' -d '{"monitor_id":"T3x9mZQBv8h5k2j4L7n1","monitor_name":"prod-cluster-jvm-heap-usage-critical","trigger_name":"jvm-heap-above-90pct","state":"ACTIVE","alert_id":"xY29Y5oB7fN3k1L8Qm4R","severity":"1","service":"client-medlineprod-alert-integration","category":"service_interruption"}'
+
+# Prometheus Alertmanager (one id per alert in "alerts")
+curl -sS -X POST "$BASE/prometheus" -H 'Content-Type: application/json' -d '{"receiver":"sre-alert-integration","status":"firing","alerts":[{"status":"firing","labels":{"alertname":"PodCrashLoopBackOff","severity":"critical","service":"client-medlineprod-alert-integration","category":"service_interruption","environment":"production","namespace":"medlineprod"},"annotations":{"summary":"Pod restarted 5 times in 10 minutes"},"startsAt":"2026-09-24T05:12:33Z","fingerprint":"a1b2c3d4e5f6a7b8"}]}'
+
+# Site24x7 (needs SITE24X7_ALERT_CONFIG={"TagList":{"Service":"svc","Category":"cat","Environment":"env"}})
+curl -sS -X POST "$BASE/site24x7" -H 'Content-Type: application/json' -d '{"STATUS":"DOWN","MONITORNAME":"prod-medlineprod-api-https-check","MONITOR_ID":"100004312589","TAGS":["svc:client-medlineprod-alert-integration","cat:service_interruption","env:production"]}'
 ```
 
-## Project Structure
+## Deploying on Choreo
 
-```text
-sre-alert-ingestion-service/
-├── cmd/server/main.go            # Entry point — routes, worker startup, graceful shutdown
-├── internal/
-│   ├── apierror/                 # Typed upstream error type (4xx/5xx passthrough)
-│   ├── backoff/                  # Pure exponential-backoff math (no I/O)
-│   ├── csmclient/                # OAuth2 client credentials HTTP client for csm-integration-service
-│   ├── handler/                  # POST /alerts + vendor adapters, GET /health, alert-to-incident mapping
-│   ├── middleware/                # X-CSM-Correlation-ID, access log, security headers
-│   ├── notifications/            # Twilio voice-call escalation channel
-│   ├── severity/                 # Severity/source/category mapping tables
-│   ├── store/                    # Durable buffer: Store interface + Postgres implementation
-│   └── worker/                   # Background retry/escalation loop
-├── migrations/
-│   ├── 0001_create_alert_buffer.up.sql
-│   └── 0001_create_alert_buffer.down.sql
-├── .choreo/component.yaml
-├── openapi.yaml
-└── .env.example
-```
+1. **Component**: create a *Service* component from this repo with build context
+   `integrations/sre-alert-ingestion-service` and the Dockerfile build preset. The Dockerfile runs the
+   tests, builds a static binary and runs it as user `10014`.
+2. **Endpoints** come from [`.choreo/component.yaml`](.choreo/component.yaml):
+   - `sre-alert-api`, base path `/api/wso2/v1/sre_alert_api`, Public: the vendor webhooks.
+   - `healthz`, Public; use `/healthz` as the readiness probe.
+   - `livez`, Project; use `/livez` as the liveness probe.
+3. **Environment variables**: set everything from [Environment variables](#environment-variables).
+   Mark `CASSANDRA_KEY` and `FALLBACK_CHAT_WEBHOOK_URLS` as secrets.
+4. **config.toml file mount**: to change any default, add a *file mount* under
+   Configs & Secrets with mount path `/etc/sre-alert-ingestion-service/config.toml` and the contents
+   of your edited `config.toml.example`, then set
+   `CONFIG_PATH=/etc/sre-alert-ingestion-service/config.toml`. Keep it out of `/app`, where the binary
+   lives, so the mount can never hide it. Without the mount the service runs on the built-in
+   defaults.
+5. **Connecting to alerts-core**: add a connection from this component to the
+   `sre-alert-core-service` component's endpoint (Project visibility is enough) and set
+   `ALERT_CORE_WAKE_URL` to that endpoint's URL plus `/alert`. Both components must use the same
+   `CASSANDRA_*` values: this service writes the `alerts` rows that alerts-core reads.
+6. **Replicas**: any number. Ids stay unique across replicas because every claim is a
+   compare-and-set on `alert_seq`.
+7. **Shutdown**: on SIGTERM `/healthz` turns `503` for `drain_delay`, in-flight requests get
+   `request_wait`, then the allocator gets its own `allocator_drain` so every claimed id gets its
+   row (or filler), all within `server.shutdown_grace` (25s by default). **Set Choreo's
+   termination grace period to 30s or more.**
+
+## Logs
+
+JSON on stdout, one `request` line per webhook with `request_id` (from `X-Request-ID` if sent),
+`vendor`, `status`, `alt_ids`, `count`, `duration_ms` and `error`. The allocator logs
+`batch claimed` and `batch written` with the id range and timings. Health probes are not logged.

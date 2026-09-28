@@ -14,7 +14,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useAuthApiClient } from "@hooks/useAuthApiClient";
 import { apiConfig } from "@config/apiConfig";
 import {
@@ -45,9 +45,16 @@ export interface ResolvedAudiencePreview {
   total: number;
   isLoading: boolean;
   isError: boolean;
-  /** True when total > AUDIENCE_PREVIEW_MAX_PROJECTS and the list below was truncated. */
+  /** True when total exceeds the cap actually used for the last resolve() call. */
   truncated: boolean;
-  resolve: (projectIds: string[]) => Promise<void>;
+  /**
+   * maxProjects overrides AUDIENCE_PREVIEW_MAX_PROJECTS for this call only --
+   * every other call site keeps the default 200-project safety cap; a caller
+   * that explicitly wants to see further (e.g. an approver opting into "show
+   * the full audience" for a large send before approving) can raise it for
+   * just that one resolve.
+   */
+  resolve: (projectIds: string[], maxProjects?: number) => Promise<void>;
 }
 
 /**
@@ -64,16 +71,27 @@ export function useResolvedAudiencePreview(): ResolvedAudiencePreview {
   const authFetch = useAuthApiClient();
   const [projects, setProjects] = useState<ResolvedAudienceProject[]>([]);
   const [total, setTotal] = useState(0);
+  const [fetchLimit, setFetchLimit] = useState(AUDIENCE_PREVIEW_MAX_PROJECTS);
   const [isLoading, setIsLoading] = useState(false);
   const [isError, setIsError] = useState(false);
+  // Guards against an older, still-in-flight resolve() call overwriting
+  // state after a newer one has already started -- a real risk now that a
+  // caller can pass a large maxProjects (an approver's explicit "show the
+  // full audience" for 1000+ projects can take a while), during which a
+  // second resolve() (e.g. the request changing, or the caller collapsing
+  // and re-expanding) can easily start and finish first. Only the call
+  // whose token is still the latest when it settles is allowed to commit.
+  const latestResolveToken = useRef(0);
 
   const resolve = useCallback(
-    async (projectIds: string[]): Promise<void> => {
+    async (projectIds: string[], maxProjects: number = AUDIENCE_PREVIEW_MAX_PROJECTS): Promise<void> => {
+      const resolveToken = ++latestResolveToken.current;
       setIsLoading(true);
       setIsError(false);
       setTotal(projectIds.length);
+      setFetchLimit(maxProjects);
 
-      const toFetch = projectIds.slice(0, AUDIENCE_PREVIEW_MAX_PROJECTS);
+      const toFetch = projectIds.slice(0, maxProjects);
       const results = await settleWithConcurrencyLimit(
         toFetch,
         ANNOUNCEMENT_CASE_CREATE_CONCURRENCY_LIMIT,
@@ -96,6 +114,11 @@ export function useResolvedAudiencePreview(): ResolvedAudiencePreview {
         .map((r) => r.value)
         .filter((p): p is ResolvedAudienceProject => p !== null);
 
+      // A newer resolve() call has since started (this one is stale) --
+      // don't let its late result clobber whatever the newer call already
+      // committed, or is still in the middle of fetching.
+      if (resolveToken !== latestResolveToken.current) return;
+
       setProjects(resolved);
       setIsError(results.length > 0 && resolved.length === 0);
       setIsLoading(false);
@@ -108,7 +131,7 @@ export function useResolvedAudiencePreview(): ResolvedAudiencePreview {
     total,
     isLoading,
     isError,
-    truncated: total > AUDIENCE_PREVIEW_MAX_PROJECTS,
+    truncated: total > fetchLimit,
     resolve,
   };
 }

@@ -20,9 +20,10 @@ import { useMemo, useState } from "react";
 import { useNavigate } from "react-router";
 
 
-import { useCSUsers, useOrganizations, useProducts } from "@features/plg/api/hooks";
+import { useOrganizations, useProducts } from "@features/plg/api/hooks";
 import { EmptyState, ErrorBlock, LoadingBlock, PageHeader, StatusChip } from "@features/plg/components/common";
-import { LIFECYCLE_STAGES, type LifecycleStage } from "@features/plg/api/types";
+import { LIFECYCLE_STAGES, type LifecycleStage, type UserRef } from "@features/plg/api/types";
+import { CSUserSelect } from "@features/plg/components/CSUserSelect";
 import { formatDate, humanizeEnum } from "@features/plg/utils/format";
 import { selectLabelProps } from "@features/plg/components/selectLabelProps";
 
@@ -37,15 +38,34 @@ const PAGE_SIZE = 25;
  * any of its pairings match — the only coherent reading once the stage belongs to
  * the pairing rather than the customer.
  */
+/**
+ * The two rows that are not engineers. Sentinel ids the query layer already
+ * understands: "" is no owner filter at all, "UNASSIGNED" asks for pairings
+ * nobody owns.
+ */
+const OWNER_FILTER_OPTIONS: UserRef[] = [
+  { id: "", email: "", name: "Anyone" },
+  { id: "UNASSIGNED", email: "", name: "Unassigned" },
+];
+
 export default function OrganizationsPage() {
   const navigate = useNavigate();
   const { data: products } = useProducts();
-  const { data: owners } = useCSUsers();
 
   const [query, setQuery] = useState("");
   const [productCode, setProductCode] = useState("");
   const [stage, setStage] = useState("");
   const [ownerId, setOwnerId] = useState("");
+  const [ownerRef, setOwnerRef] = useState<UserRef | null>(null);
+  // Bumped by Clear to remount the owner picker.
+  //
+  // The picker holds its own search term, and that term is state Clear has no
+  // other way to reach: resetting ownerId alone left the dropdown still showing
+  // the previous search — the field read "Anyone" and the table unfiltered,
+  // while the list underneath was still the matches for whatever had been typed.
+  // Remounting retires the child's state with the parent's, which an effect
+  // syncing the two could always drift out of.
+  const [pickerKey, setPickerKey] = useState(0);
   const [page, setPage] = useState(0);
 
   const request = useMemo(
@@ -130,23 +150,19 @@ export default function OrganizationsPage() {
             </TextField>
           </Grid>
           <Grid size={{ xs: 12, sm: 4, md: 2.5 }}>
-            <TextField
-              select
-              {...selectLabelProps(ownerId)}
-              fullWidth
-              size="small"
+            <CSUserSelect
+              key={pickerKey}
               label="CS owner"
               value={ownerId}
-              onChange={(e) => resetTo(setOwnerId)(e.target.value)}
-            >
-              <MenuItem value="">Anyone</MenuItem>
-              <MenuItem value="UNASSIGNED">Unassigned</MenuItem>
-              {(owners ?? []).map((u) => (
-                <MenuItem key={u.id} value={u.id}>
-                  {u.name}
-                </MenuItem>
-              ))}
-            </TextField>
+              extraOptions={OWNER_FILTER_OPTIONS}
+              selected={ownerRef}
+              onChange={(id, user) => {
+                resetTo(setOwnerId)(id);
+                // Kept so the name survives once the picker's page moves on —
+                // the chosen engineer is often not in the default 100.
+                setOwnerRef(user && user.id !== "" && user.id !== "UNASSIGNED" ? user : null);
+              }}
+            />
           </Grid>
           <Grid size={{ xs: 12, md: 0.5 }}>
             <Button
@@ -156,6 +172,10 @@ export default function OrganizationsPage() {
                 setProductCode("");
                 setStage("");
                 setOwnerId("");
+                // Without this the picker would keep offering the engineer it
+                // last pinned, as an option nothing had selected.
+                setOwnerRef(null);
+                setPickerKey((n) => n + 1);
                 setPage(0);
               }}
             >

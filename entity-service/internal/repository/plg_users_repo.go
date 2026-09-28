@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
@@ -75,7 +76,35 @@ func userConditions(f *domain.UserSearchFilters, b *argBuilder) []string {
 	if f.Active != nil {
 		conds = append(conds, `COALESCE(u.is_active, FALSE) = `+b.add(*f.Active))
 	}
+	// A fragment of the name or the address, matched anywhere in either.
+	//
+	// Both, because an engineer is often easier to find by their address than by
+	// how their display name happens to be spelled — and first_name/last_name as
+	// well as name, since `name` is empty on some synced rows and the display
+	// value falls back to the two parts (see the page query, which assembles it
+	// the same way).
+	//
+	// The caller's own % and _ are escaped: without it, a search for "a_b" would
+	// match "axb", and a lone "%" would match everyone while looking like it had
+	// filtered. ESCAPE '\' matches how every other search in this service does
+	// it — see account_repo.go and case_repo.go.
+	if term := strings.TrimSpace(f.Search); term != "" {
+		like := b.add("%" + escapeLikeWildcards(term) + "%")
+		conds = append(conds, `(u.name ILIKE `+like+` ESCAPE '\'`+
+			` OR u.email ILIKE `+like+` ESCAPE '\'`+
+			` OR u.first_name ILIKE `+like+` ESCAPE '\'`+
+			` OR u.last_name ILIKE `+like+` ESCAPE '\'`+
+			` OR TRIM(BOTH ' ' FROM COALESCE(u.first_name, '') || ' ' ||`+
+			` COALESCE(u.last_name, '')) ILIKE `+like+` ESCAPE '\')`)
+	}
 	return conds
+}
+
+// escapeLikeWildcards makes a caller's search term literal, so % and _ match
+// themselves rather than acting as patterns.
+func escapeLikeWildcards(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
 }
 
 // SearchUsers runs the count and the page concurrently, on separate pool

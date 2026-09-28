@@ -95,7 +95,7 @@ func seedCaseStats(t *testing.T, pool *pgxpool.Pool) {
 
 	for i, it := range items {
 		// wso2_id is required by the work_item_wso2_id_required_by_type CHECK
-		// for every case-like type (migration 000016).
+		// for every case-like type (migration 0021).
 		suffix := string(rune('1' + i))
 		mustExec(`INSERT INTO work_item (id, created_on, updated_on, created_by, updated_by, number, wso2_id, subject, type, project_id)
 		          VALUES ($1, `+it.createdAt+`, now(), $2, $2, $3, $4, 'seeded', $5::work_item_type_enum, $6)`,

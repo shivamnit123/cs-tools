@@ -114,6 +114,29 @@ func (c *Client) SearchContactByEmail(ctx context.Context, email string) (Contac
 	return Contact{}, false, nil
 }
 
+// SearchContactsByEmail returns up to limit Salesforce Contacts carrying
+// email, compared case-insensitively. Unlike SearchContactByEmail it keeps
+// every match, so a caller can tell one contact from several: two contacts
+// with one address is a data fault the invitation checks refuse, where
+// SearchContactByEmail would quietly adopt the first.
+func (c *Client) SearchContactsByEmail(ctx context.Context, email string, limit int) ([]Contact, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" {
+		return nil, &apierror.ValidationError{Msg: "email is required to search for a Salesforce contact"}
+	}
+	var rows []Contact
+	if err := c.searchWithRetry(ctx, contactSearchPath, contactEmailSearchRequest{Email: email, Limit: limit}, "contact", &rows); err != nil {
+		return nil, err
+	}
+	matches := make([]Contact, 0, len(rows))
+	for _, ct := range rows {
+		if ct.Email != nil && strings.EqualFold(strings.TrimSpace(*ct.Email), email) {
+			matches = append(matches, ct)
+		}
+	}
+	return matches, nil
+}
+
 // SearchProjectContact looks a membership up by its (project, contact) pair
 // via POST /project-contacts/search. found is false (no error) when there is
 // none, the same "absence is an answer" contract as SearchContactByEmail.

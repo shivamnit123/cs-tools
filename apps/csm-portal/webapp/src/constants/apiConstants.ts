@@ -62,6 +62,7 @@ export const ApiQueryKeys = {
   ALERT_DETAILS: "alert-details",
   SMART_ALERT_DETAILS: "smart-alert-details",
   PROJECT_CONTACTS: "project-contacts",
+  PROJECT_ONBOARDING_STEPS: "project-onboarding-steps",
   TIME_TRACKING_DETAILS: "time-tracking-details",
   TIME_CARDS_SEARCH: "time-cards-search",
   CASE_TIME_CARDS_SEARCH: "case-time-cards-search",

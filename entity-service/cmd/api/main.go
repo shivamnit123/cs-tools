@@ -87,6 +87,19 @@ func main() {
 		}
 	}
 
+	// CSM-native SLA engine recompute worker: periodically recomputes every
+	// source='CSM' "sla" row's elaped percentage/breach status (migration
+	// 000088) — see service.SLAEngineRecomputeWorker's own doc comment.
+	// Gated on pool the same way the GitHub outbound worker above is:
+	// nowhere to read/write a clock at all with no database configured.
+	slaEngineCtx, stopSLAEngine := context.WithCancel(context.Background())
+	defer stopSLAEngine()
+	if pool != nil {
+		slaEngineWorker := service.NewSLAEngineRecomputeWorker(repository.NewSLAEngineRepository(pool), cfg.SLARecomputeInterval)
+		go slaEngineWorker.Run(slaEngineCtx)
+		log.Printf("sla engine recompute worker enabled (every %s)", cfg.SLARecomputeInterval)
+	}
+
 	// Change-request notices: a background poller over event_outbox, gated on
 	// CR_NOTICES_ENABLED. Off by default because ServiceNow still sends these
 	// mails — turning it on is a paired change with disabling them there, or
@@ -176,5 +189,6 @@ func main() {
 	if crPublisher != nil {
 		crPublisher.Close()
 	}
+	stopSLAEngine()
 	log.Println("server stopped")
 }

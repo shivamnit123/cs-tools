@@ -134,6 +134,29 @@ func TestMapCaseDetails_ExposesTags(t *testing.T) {
 	}
 }
 
+// TestMapCaseDetails_ExposesWatchListLocked is the regression test for the
+// "4 mandatory account stakeholders can never be removed" feature: the
+// frontend needs entity-service's own WatchListUser.Locked flag to disable
+// the remove control for those specific watchers, and it must not be lost
+// in the entity -> dto mapping.
+func TestMapCaseDetails_ExposesWatchListLocked(t *testing.T) {
+	got := MapCaseDetails(entity.CaseView{
+		WatchList: []entity.WatchListUser{
+			{ID: "stakeholder-1", Email: "csm@example.com", Locked: true},
+			{ID: "customer-pick-1", Email: "jane.doe@example.com", Locked: false},
+		},
+	})
+	if len(got.WatchList) != 2 {
+		t.Fatalf("expected 2 watchers, got %d", len(got.WatchList))
+	}
+	if !got.WatchList[0].Locked {
+		t.Errorf("expected the account stakeholder watcher to be Locked, got %+v", got.WatchList[0])
+	}
+	if got.WatchList[1].Locked {
+		t.Errorf("expected the customer-picked watcher to NOT be Locked, got %+v", got.WatchList[1])
+	}
+}
+
 // TestMapCaseDetails_OmitsAbsentFields checks a case response carrying none of
 // these values omits the keys rather than emitting nulls or zero values.
 func TestMapCaseDetails_OmitsAbsentFields(t *testing.T) {

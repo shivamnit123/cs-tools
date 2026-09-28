@@ -30,8 +30,8 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// TaskSlaRepository defines the read operations for sla (migration 000052),
-// joined against sla_policy (migration 000051) and work_item for the task
+// TaskSlaRepository defines the read operations for sla (migration 0048),
+// joined against sla_policy (migration 0047) and work_item for the task
 // reference. BusinessTimeLeft/BusinessElapsedTime/TaskSlaDefinitionDetail.Duration
 // are rendered from real INTERVAL columns via formatDurationSeconds -- safe to
 // invent a display format for, unlike change_request_repo.go's calendar_duration
@@ -41,7 +41,7 @@ import (
 // left"/"{value} elapsed"), so any clear human-readable rendering is safe.
 // ScheduleSource/Flow/Workflow/IsEnableLogging/DurationType/ResetCondition on
 // the definition detail remain nil: sla_policy has no backing column for any
-// of them (confirmed against the live schema, migration 000051's full column
+// of them (confirmed against the live schema, migration 0047's full column
 // list), and -- for ResetCondition specifically -- the column that does exist
 // is resume_condition, a different concept from the reset_action enum this
 // field would need to derive from.

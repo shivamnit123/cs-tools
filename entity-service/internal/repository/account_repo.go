@@ -36,32 +36,39 @@ import (
 // CRE/SRE team refs. It is mapped to domain.AccountView / domain.AccountDetail
 // by the service layer.
 type AccountRow struct {
-	ID                         string
-	Name                       string
-	Classification             *string
-	Pod                        *string
-	SfID                       *string
-	Region                     *string
-	ActivationDate             *time.Time
-	DeactivationDate           *time.Time
-	TechnicalOwnerID           *string
-	TechnicalOwnerName         *string
-	TechnicalOwnerEmail        *string
-	AccountManagerID           *string
-	AccountManagerName         *string
-	AccountManagerEmail        *string
-	RenewalAccountManagerID    *string
-	RenewalAccountManagerName  *string
-	RenewalAccountManagerEmail *string
-	CreTeamID                  *string
-	CreTeamName                *string
-	SreTeamID                  *string
-	SreTeamName                *string
-	HasAgent                   *bool
-	HasKbReferences            *bool
-	CreatedOn                  time.Time
-	CreatedBy                  string
-	UpdatedOn                  time.Time
+	ID                          string
+	Name                        string
+	Number                      string
+	Classification              *string
+	Pod                         *string
+	SfID                        *string
+	Region                      *string
+	Country                     *string
+	City                        *string
+	DriveLocation               *string
+	ActivationDate              *time.Time
+	DeactivationDate            *time.Time
+	TechnicalOwnerID            *string
+	TechnicalOwnerName          *string
+	TechnicalOwnerEmail         *string
+	AccountManagerID            *string
+	AccountManagerName          *string
+	AccountManagerEmail         *string
+	RenewalAccountManagerID     *string
+	RenewalAccountManagerName   *string
+	RenewalAccountManagerEmail  *string
+	CustomerSuccessManagerID    *string
+	CustomerSuccessManagerName  *string
+	CustomerSuccessManagerEmail *string
+	CreTeamID                   *string
+	CreTeamName                 *string
+	SreTeamID                   *string
+	SreTeamName                 *string
+	HasAgent                    *bool
+	HasKbReferences             *bool
+	CreatedOn                   time.Time
+	CreatedBy                   string
+	UpdatedOn                   time.Time
 }
 
 // AccountRepository defines the persistence operations for the account table.
@@ -97,16 +104,25 @@ func NewAccountRepository(db *pgxpool.Pool) AccountRepository {
 // accountSelectColumns' cre/sre joins are the same "group" table
 // change_request_repo.go's own customer_group_id join already uses (see
 // that file's changeRequestDetailJoins) -- account.cre_team_id/sre_team_id
-// (renamed/added by migration 000074, ex-integration_cs_team_id) are real
+// (renamed/added by migration 0075, ex-integration_cs_team_id) are real
 // FKs into "group" now, unlike when CreTeam/SreTeam were first documented
 // as "ServiceNow data source only" on domain.AccountView/AccountDetail;
 // this is what actually reads them back for the Postgres data source.
+// number/country/city/drive_location and the customer-success-manager join
+// were added to expose columns that were already present and populated on
+// the account table but never selected here — confirmed against the actual
+// migration (000008_accounts_table.up.sql): "number" is NOT NULL UNIQUE, not
+// a data gap. ARR and support tier are NOT included here because they
+// genuinely are not in this schema — see accountRowCommonFields' own doc
+// comment in account_service.go.
 const accountSelectColumns = `
-	a.id, a.name, a.classification, a.global_pod, a.sf_id, a.region,
+	a.id, a.name, a.number, a.classification, a.global_pod, a.sf_id, a.region,
+	a.country, a.city, a.drive_location,
 	a.activation_date, a.deactivation_date,
 	tow.id, COALESCE(tow.name, NULLIF(TRIM(CONCAT_WS(' ', tow.first_name, tow.last_name)), '')), tow.email,
 	mgr.id, COALESCE(mgr.name, NULLIF(TRIM(CONCAT_WS(' ', mgr.first_name, mgr.last_name)), '')), mgr.email,
 	ram.id, COALESCE(ram.name, NULLIF(TRIM(CONCAT_WS(' ', ram.first_name, ram.last_name)), '')), ram.email,
+	csm.id, COALESCE(csm.name, NULLIF(TRIM(CONCAT_WS(' ', csm.first_name, csm.last_name)), '')), csm.email,
 	cre.id, cre.name, sre.id, sre.name,
 	a.ai_gen_response_enabled, a.smart_knowledge_base_suggestions_enabled,
 	a.created_on, a.created_by, a.updated_on`
@@ -116,17 +132,20 @@ const accountFromJoins = `
 	LEFT JOIN "user" tow ON tow.id = a.technical_owner_id
 	LEFT JOIN "user" mgr ON mgr.id = a.account_manager_id
 	LEFT JOIN "user" ram ON ram.id = a.renewal_account_manager_id
+	LEFT JOIN "user" csm ON csm.id = a.customer_success_manager_id
 	LEFT JOIN "group" cre ON cre.id = a.cre_team_id
 	LEFT JOIN "group" sre ON sre.id = a.sre_team_id`
 
 func scanAccountRow(row interface{ Scan(...any) error }) (AccountRow, error) {
 	var a AccountRow
 	err := row.Scan(
-		&a.ID, &a.Name, &a.Classification, &a.Pod, &a.SfID, &a.Region,
+		&a.ID, &a.Name, &a.Number, &a.Classification, &a.Pod, &a.SfID, &a.Region,
+		&a.Country, &a.City, &a.DriveLocation,
 		&a.ActivationDate, &a.DeactivationDate,
 		&a.TechnicalOwnerID, &a.TechnicalOwnerName, &a.TechnicalOwnerEmail,
 		&a.AccountManagerID, &a.AccountManagerName, &a.AccountManagerEmail,
 		&a.RenewalAccountManagerID, &a.RenewalAccountManagerName, &a.RenewalAccountManagerEmail,
+		&a.CustomerSuccessManagerID, &a.CustomerSuccessManagerName, &a.CustomerSuccessManagerEmail,
 		&a.CreTeamID, &a.CreTeamName, &a.SreTeamID, &a.SreTeamName,
 		&a.HasAgent, &a.HasKbReferences,
 		&a.CreatedOn, &a.CreatedBy, &a.UpdatedOn,
@@ -144,7 +163,11 @@ func (r *accountRepo) SearchAccounts(ctx context.Context, req domain.SearchAccou
 	if req.Filters.SearchQuery != "" {
 		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(req.Filters.SearchQuery)
 		pattern := "%" + escaped + "%"
-		where += fmt.Sprintf(" AND (a.name ILIKE $%d ESCAPE '\\' OR a.sf_id ILIKE $%d ESCAPE '\\')", argIdx, argIdx)
+		// a.number added so a caller can resolve an account by its
+		// ServiceNow-style number (e.g. "ACC0001") the same way case number
+		// resolution already works elsewhere — search, then match the exact
+		// "number" field in the response (see this repo's own AccountRow.Number).
+		where += fmt.Sprintf(" AND (a.name ILIKE $%d ESCAPE '\\' OR a.sf_id ILIKE $%d ESCAPE '\\' OR a.number ILIKE $%d ESCAPE '\\')", argIdx, argIdx, argIdx)
 		filterArgs = append(filterArgs, pattern)
 		argIdx++
 	}
@@ -156,6 +179,11 @@ func (r *accountRepo) SearchAccounts(ctx context.Context, req domain.SearchAccou
 	if req.Filters.Classification != "" {
 		where += fmt.Sprintf(" AND a.classification = $%d", argIdx)
 		filterArgs = append(filterArgs, req.Filters.Classification)
+		argIdx++
+	}
+	if req.Filters.OwnerEmail != "" {
+		where += fmt.Sprintf(" AND (lower(tow.email) = lower($%d) OR lower(mgr.email) = lower($%d) OR lower(ram.email) = lower($%d))", argIdx, argIdx, argIdx)
+		filterArgs = append(filterArgs, req.Filters.OwnerEmail)
 		argIdx++
 	}
 	if req.Filters.Active != nil {
@@ -260,55 +288,102 @@ func (r *accountRepo) UpdateAccountTeams(ctx context.Context, accountID string, 
 
 const salesforceSyncActor = domain.SalesforceSyncActor
 
+// UpsertFromSalesforce writes one Salesforce Account. account.sf_id is not
+// unique (migration 0095 dropped the constraint, so ON CONFLICT (sf_id) has
+// nothing to arbitrate on), so the row is resolved by hand inside one
+// transaction, serialised per sf_id by an advisory lock so two concurrent
+// events for a new account cannot both insert:
+//
+//  1. update every row already carrying this sf_id;
+//  2. else link the row with the same account number that has no sf_id yet
+//     (a ServiceNow-synced row), rather than tripping account_number_key;
+//  3. else insert.
+//
+// Salesforce does not supply account_vertical or
+// secondary_technical_owner_id, so an update keeps the stored value when the
+// incoming one is NULL instead of blanking it.
 func (r *accountRepo) UpsertFromSalesforce(ctx context.Context, row domain.SalesforceAccountUpsert) error {
-	query := `
-		INSERT INTO account (
-			id, created_on, updated_on, created_by, updated_by,
-			name, number, sf_id,
-			industry, region, global_pod, phone, sales_region, sub_region,
-			account_vertical, life_cycle, naics_industry, sub_industry,
-			classification, technical_owner_id, secondary_technical_owner_id,
-			deactivation_date, sync_time_stamp
-		) VALUES (
-			gen_random_uuid(), now(), now(), $1, $1,
-			$2, $3, $4,
-			$5, $6, $7, $8, $9, $10,
-			$11, $12, $13, $14,
-			$15, $16, $17,
-			NULL, now()
-		)
-		ON CONFLICT (sf_id) DO UPDATE SET
-			name = EXCLUDED.name,
-			industry = EXCLUDED.industry,
-			region = EXCLUDED.region,
-			global_pod = EXCLUDED.global_pod,
-			phone = CASE WHEN $18 THEN account.phone ELSE EXCLUDED.phone END,
-			sales_region = EXCLUDED.sales_region,
-			sub_region = EXCLUDED.sub_region,
-			account_vertical = EXCLUDED.account_vertical,
-			life_cycle = EXCLUDED.life_cycle,
-			naics_industry = EXCLUDED.naics_industry,
-			sub_industry = EXCLUDED.sub_industry,
-			classification = EXCLUDED.classification,
-			technical_owner_id = EXCLUDED.technical_owner_id,
-			secondary_technical_owner_id = EXCLUDED.secondary_technical_owner_id,
-			deactivation_date = NULL,
-			updated_on = now(),
-			updated_by = EXCLUDED.updated_by,
-			sync_time_stamp = now()`
-	_, err := r.db.Exec(ctx, query,
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("upsert account from salesforce: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0::bigint))`, "account-sf:"+row.SfID); err != nil {
+		return fmt.Errorf("upsert account from salesforce: lock: %w", err)
+	}
+
+	args := []any{
 		salesforceSyncActor,
 		row.Name, row.Number, row.SfID,
 		row.Industry, row.Region, row.GlobalPod, row.Phone, row.SalesRegion, row.SubRegion,
 		row.AccountVertical, row.LifeCycle, row.NAICSIndustry, row.SubIndustry,
 		row.Classification, row.TechnicalOwnerID, row.SecondaryTechnicalOwnerID,
 		row.KeepExistingPhone,
-	)
+	}
+	tag, err := tx.Exec(ctx, updateAccountFromSalesforceQuery+` WHERE sf_id = $4`, args...)
 	if err != nil {
-		return fmt.Errorf("upsert account from salesforce: %w", err)
+		return fmt.Errorf("upsert account from salesforce: update by sf_id: %w", err)
+	}
+	if tag.RowsAffected() == 0 && row.Number != "" {
+		tag, err = tx.Exec(ctx, updateAccountFromSalesforceQuery+` WHERE number = $3 AND sf_id IS NULL`, args...)
+		if err != nil {
+			return fmt.Errorf("upsert account from salesforce: link by number: %w", err)
+		}
+	}
+	if tag.RowsAffected() == 0 {
+		if _, err := tx.Exec(ctx, insertAccountFromSalesforceQuery, args[:17]...); err != nil {
+			return fmt.Errorf("upsert account from salesforce: insert: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("upsert account from salesforce: commit: %w", err)
 	}
 	return nil
 }
+
+// updateAccountFromSalesforceQuery is completed with a WHERE clause by
+// UpsertFromSalesforce; its parameters match insertAccountFromSalesforceQuery
+// plus $18 (keep the existing phone).
+const updateAccountFromSalesforceQuery = `
+	UPDATE account SET
+		name = $2,
+		number = COALESCE(account.number, NULLIF($3::text, '')),
+		sf_id = $4,
+		industry = $5,
+		region = $6,
+		global_pod = $7,
+		phone = CASE WHEN $18 THEN account.phone ELSE $8 END,
+		sales_region = $9,
+		sub_region = $10,
+		account_vertical = COALESCE($11, account.account_vertical),
+		life_cycle = $12,
+		naics_industry = $13,
+		sub_industry = $14,
+		classification = $15,
+		technical_owner_id = $16,
+		secondary_technical_owner_id = COALESCE($17, account.secondary_technical_owner_id),
+		deactivation_date = NULL,
+		updated_on = now(),
+		updated_by = $1,
+		sync_time_stamp = now()`
+
+const insertAccountFromSalesforceQuery = `
+	INSERT INTO account (
+		id, created_on, updated_on, created_by, updated_by,
+		name, number, sf_id,
+		industry, region, global_pod, phone, sales_region, sub_region,
+		account_vertical, life_cycle, naics_industry, sub_industry,
+		classification, technical_owner_id, secondary_technical_owner_id,
+		deactivation_date, sync_time_stamp
+	) VALUES (
+		gen_random_uuid(), now(), now(), $1, $1,
+		$2, $3, $4,
+		$5, $6, $7, $8, $9, $10,
+		$11, $12, $13, $14,
+		$15, $16, $17,
+		NULL, now()
+	)`
 
 func (r *accountRepo) SoftDeleteBySfID(ctx context.Context, sfID string) error {
 	_, err := r.db.Exec(ctx, `

@@ -27,7 +27,7 @@ import (
 )
 
 // ITServiceRepository defines the read operations for the standalone
-// service table (migration 000048). service has no FK to any other table in
+// service table (migration 0044). service has no FK to any other table in
 // this schema (project/deployment/deployed_product/work_item all reference
 // it nowhere) -- it exists purely as a searchable catalogue today.
 type ITServiceRepository interface {
@@ -46,7 +46,7 @@ func NewITServiceRepository(db *pgxpool.Pool) ITServiceRepository {
 }
 
 // itServiceBusinessCriticalityFromEnum maps service.business_criticality's
-// real service_business_criticality_enum labels (migration 000048) to
+// real service_business_criticality_enum labels (migration 0044) to
 // domain.BusinessCriticality. Unlike case_severity_enum, this one already
 // matches the domain enum's values 1:1 once case-folded.
 var itServiceBusinessCriticalityFromEnum = map[string]domain.BusinessCriticality{

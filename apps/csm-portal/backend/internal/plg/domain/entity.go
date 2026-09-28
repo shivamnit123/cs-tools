@@ -1164,6 +1164,9 @@ type UserSearchFilters struct {
 	// pickers never want and an attribution lookup always does: a note written
 	// by someone who has since left must still render their name.
 	Active *bool `json:"active"`
+	// Search matches a fragment of the name or email, case-insensitively. Empty
+	// means the default page, which is what an owner picker opens with.
+	Search string `json:"search"`
 }
 
 // SearchUsersRequest is the body of POST /plg/users/search.

@@ -32,11 +32,12 @@ import (
 )
 
 type sentEmail struct {
-	from     string
-	to       []string
-	bcc      []string
-	subject  string
-	htmlBody string
+	from        string
+	to          []string
+	bcc         []string
+	subject     string
+	htmlBody    string
+	attachments []notifications.EmailAttachment
 }
 
 type mockEmailSender struct {
@@ -71,7 +72,7 @@ func (m *mockEmailSender) SendEmailFrom(ctx context.Context, from string, to, cc
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.calls = append(m.calls, sentEmail{from: from, to: to, bcc: bcc, subject: subject, htmlBody: htmlBody})
+	m.calls = append(m.calls, sentEmail{from: from, to: to, bcc: bcc, subject: subject, htmlBody: htmlBody, attachments: attachments})
 	if m.onSend != nil {
 		m.onSend()
 	}
@@ -258,30 +259,77 @@ func TestDispatcher_Handle_CaseCreated(t *testing.T) {
 	}
 }
 
-// TestDispatcher_Handle_CaseCreated_SecurityReportAnalysisUsesDedicatedChatAlert
-// verifies handleCaseCreated's CaseType branch: a security_report_analysis
-// case calls SendSecurityReportAnalysisAlert instead of SendCaseCreatedAlert
-// (whose severity line would have nothing to show, since severity is never
-// set for this case type) — and does NOT also call the generic alert.
-func TestDispatcher_Handle_CaseCreated_SecurityReportAnalysisUsesDedicatedChatAlert(t *testing.T) {
-	chat := &mockGoogleChatSender{}
-	d := newTestDispatcher(&mockEmailSender{}, chat, &mockCallSender{})
+// TestDispatcher_Handle_CaseCreated_NonCaseTypesSkipChatButStillEmail verifies
+// handleCaseCreated's CaseType gate: every non-"CASE" type (engagement,
+// service_request, security_report_analysis, announcement) sends no Google
+// Chat alert at all — explicit product direction, those types notify their
+// audience by email only — while the email reaction is unaffected.
+func TestDispatcher_Handle_CaseCreated_NonCaseTypesSkipChatButStillEmail(t *testing.T) {
+	for _, caseType := range []string{"ENGAGEMENT", "SERVICE_REQUEST", "SECURITY_REPORT_ANALYSIS", "ANNOUNCEMENT"} {
+		t.Run(caseType, func(t *testing.T) {
+			email := &mockEmailSender{}
+			chat := &mockGoogleChatSender{}
+			d := newTestDispatcher(email, chat, &mockCallSender{})
 
-	record := eventbus.Record{Value: []byte(`{"type":"case.created","entityId":"CASE-1","payload":{"reporterName":"Reporter","projectName":"Proj","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseType":"SECURITY_REPORT_ANALYSIS","priority":"","product":"api-manager","createdAt":"2026-01-01","description":"desc","recipients":["test-recipient@example.com"]}}`)}
+			record := eventbus.Record{Value: []byte(`{"type":"case.created","entityId":"CASE-1","payload":{"reporterName":"Reporter","projectName":"Proj","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseType":"` + caseType + `","priority":"","product":"api-manager","createdAt":"2026-01-01","description":"desc","recipients":["test-recipient@example.com"]}}`)}
 
-	if err := d.Handle(context.Background(), record); err != nil {
-		t.Fatalf("Handle() error = %v", err)
-	}
+			if err := d.Handle(context.Background(), record); err != nil {
+				t.Fatalf("Handle() error = %v", err)
+			}
 
-	if len(chat.caseCreatedCalls) != 0 {
-		t.Errorf("expected SendCaseCreatedAlert NOT to be called for a security_report_analysis case, got %d call(s)", len(chat.caseCreatedCalls))
+			if len(chat.caseCreatedCalls) != 0 {
+				t.Errorf("expected SendCaseCreatedAlert NOT to be called for a %s case, got %d call(s)", caseType, len(chat.caseCreatedCalls))
+			}
+			if len(chat.securityReportAnalysisCalls) != 0 {
+				t.Errorf("expected SendSecurityReportAnalysisAlert NOT to be called for a %s case, got %d call(s)", caseType, len(chat.securityReportAnalysisCalls))
+			}
+			if len(email.calls) != 1 {
+				t.Errorf("expected the email reaction to still fire for a %s case, got %d call(s)", caseType, len(email.calls))
+			}
+		})
 	}
-	if len(chat.securityReportAnalysisCalls) != 1 {
-		t.Fatalf("expected 1 SendSecurityReportAnalysisAlert call, got %d", len(chat.securityReportAnalysisCalls))
+}
+
+// TestDispatcher_Handle_CaseCreated_EmailShowsHumanReadableCaseType verifies
+// the "Case Type" row in the case-created email shows a reader-friendly
+// label (e.g. "Security Report Analysis"), not entity-service's raw
+// UPPER_SNAKE_CASE wire value — a real reported issue where a recipient saw
+// "SECURITY_REPORT_ANALYSIS" verbatim in their inbox.
+func TestDispatcher_Handle_CaseCreated_EmailShowsHumanReadableCaseType(t *testing.T) {
+	testCases := []struct {
+		wire  string
+		label string
+	}{
+		{"CASE", "Case"},
+		{"ENGAGEMENT", "Engagement"},
+		{"SERVICE_REQUEST", "Service Request"},
+		{"SECURITY_REPORT_ANALYSIS", "Security Report Analysis"},
+		{"ANNOUNCEMENT", "Announcement"},
 	}
-	got := chat.securityReportAnalysisCalls[0]
-	if got.title != "Something broke" || got.caseLink != "https://csm.example/cases/CASE-1" || got.productName != "api-manager" {
-		t.Errorf("unexpected SendSecurityReportAnalysisAlert args: %+v", got)
+	for _, tc := range testCases {
+		t.Run(tc.wire, func(t *testing.T) {
+			email := &mockEmailSender{}
+			d := newTestDispatcher(email, &mockGoogleChatSender{}, &mockCallSender{})
+
+			// entityId/caseId deliberately avoid the substring "CASE" (unlike
+			// this file's other fixtures), so the "no raw wire value" check
+			// below can't false-positive against it when tc.wire is "CASE".
+			record := eventbus.Record{Value: []byte(`{"type":"case.created","entityId":"C-1","payload":{"reporterName":"Reporter","projectName":"Proj","projectId":"PROJ-1","caseId":"C-1","caseTitle":"Something broke","caseType":"` + tc.wire + `","priority":"","product":"api-manager","createdAt":"2026-01-01","description":"desc","recipients":["test-recipient@example.com"]}}`)}
+
+			if err := d.Handle(context.Background(), record); err != nil {
+				t.Fatalf("Handle() error = %v", err)
+			}
+			if len(email.calls) != 1 {
+				t.Fatalf("expected 1 email sent, got %d", len(email.calls))
+			}
+			body := email.calls[0].htmlBody
+			if !strings.Contains(body, tc.label) {
+				t.Errorf("rendered email doesn't contain the human-readable label %q", tc.label)
+			}
+			if strings.Contains(body, tc.wire) {
+				t.Errorf("rendered email still contains the raw wire value %q", tc.wire)
+			}
+		})
 	}
 }
 
@@ -524,6 +572,44 @@ func TestDispatcher_Handle_CommentAdded(t *testing.T) {
 	}
 }
 
+// TestDispatcher_Handle_CommentAdded_InlineImage verifies a comment
+// containing an inline (data: URI) image ends up sent as a real inline
+// EmailAttachment with a matching Content-ID, referenced from the email
+// body as cid:<contentId> — never as the original data: URI, which Gmail
+// and most major webmail clients strip from received HTML on render.
+func TestDispatcher_Handle_CommentAdded_InlineImage(t *testing.T) {
+	mock := &mockEmailSender{}
+	d := newTestDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{})
+
+	const dataURI = "data:image/png;base64,aGVsbG8="
+	payload := `{"type":"case.comment_added","entityId":"CASE-1","payload":{"name":"Commenter","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseComment":"<p>see attached<img src=\"` + dataURI + `\"></p>","commentId":"C-1","recipients":["test-recipient@example.com"]}}`
+	record := eventbus.Record{Value: []byte(payload)}
+
+	if err := d.Handle(context.Background(), record); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if len(mock.calls) != 1 {
+		t.Fatalf("expected 1 email sent, got %d", len(mock.calls))
+	}
+	call := mock.calls[0]
+	if strings.Contains(call.htmlBody, "data:image") {
+		t.Error("htmlBody must never contain the original data: URI")
+	}
+	if len(call.attachments) != 1 {
+		t.Fatalf("expected 1 attachment, got %d", len(call.attachments))
+	}
+	att := call.attachments[0]
+	if !att.Inline || att.ContentID == "" {
+		t.Errorf("attachment not marked inline with a Content-ID: %+v", att)
+	}
+	if !strings.Contains(call.htmlBody, "cid:"+att.ContentID) {
+		t.Errorf("htmlBody does not reference cid:%s", att.ContentID)
+	}
+	if att.ContentType != "image/png" || string(att.Attachment) != "hello" {
+		t.Errorf("attachment bytes/type not carried through correctly: %+v", att)
+	}
+}
+
 // TestDispatcher_Handle_CommentAdded_InternalNote_UsesInternalNoteLayout
 // verifies that isInternalNote:true routes through RenderInternalNoteEmail
 // instead of RenderCommentAddedEmail: the "added work note" wording (not
@@ -757,7 +843,7 @@ func TestDispatcher_Handle_SeverityChanged(t *testing.T) {
 	if len(gotEmail.to) != 1 || gotEmail.to[0] != testRecipient {
 		t.Errorf("to = %v, want [%s]", gotEmail.to, testRecipient)
 	}
-	if !strings.Contains(gotEmail.htmlBody, "High (P2)") || !strings.Contains(gotEmail.htmlBody, "Low (P4)") {
+	if !strings.Contains(gotEmail.htmlBody, "High(S2)") || !strings.Contains(gotEmail.htmlBody, "Low(S4)") {
 		t.Error("htmlBody does not contain both the old and new severity labels")
 	}
 

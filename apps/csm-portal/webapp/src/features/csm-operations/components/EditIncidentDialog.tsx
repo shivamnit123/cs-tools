@@ -128,6 +128,7 @@ interface EditState {
   changeRequestId: string;
   problemId: string;
   causedById: string;
+  environment: string;
 }
 
 function toEditState(incident: BeIncidentDetail): EditState {
@@ -150,6 +151,7 @@ function toEditState(incident: BeIncidentDetail): EditState {
     changeRequestId: incident.changeRequest?.id ?? "",
     problemId: incident.problem?.id ?? "",
     causedById: incident.causedBy?.id ?? "",
+    environment: incident.environment ?? "",
   };
 }
 
@@ -187,6 +189,7 @@ function buildPatch(initial: EditState, next: EditState): BeUpdateIncidentPayloa
     patch.changeRequestId = next.changeRequestId.trim() || null;
   if (next.problemId.trim() !== initial.problemId) patch.problemId = next.problemId.trim() || null;
   if (next.causedById.trim() !== initial.causedById) patch.causedById = next.causedById.trim() || null;
+  if (next.environment.trim() !== initial.environment) patch.environment = next.environment.trim() || null;
   return patch;
 }
 
@@ -364,6 +367,20 @@ export default function EditIncidentDialog({
                     : undefined,
                 },
               )}
+            </Box>
+          </Box>
+
+          <Box sx={{ display: "flex", gap: 2, flexWrap: "wrap" }}>
+            <Box sx={{ flex: "1 1 220px" }}>
+              <TextField
+                label="Environment"
+                value={state.environment}
+                onChange={(e) => set("environment", e.target.value)}
+                fullWidth
+                size="small"
+                disabled={isSaving}
+                placeholder="e.g. Production, Staging"
+              />
             </Box>
           </Box>
 

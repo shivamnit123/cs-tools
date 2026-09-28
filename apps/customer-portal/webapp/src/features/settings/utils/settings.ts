@@ -17,6 +17,7 @@
 import { colors } from "@wso2/oxygen-ui";
 import { Code, Crown, Monitor, Shield, Star, Users } from "@wso2/oxygen-ui-icons-react";
 import {
+  SETTINGS_CUSTOMER_ADMIN_ROLES,
   NULL_PLACEHOLDER,
   SETTINGS_AVATAR_BACKGROUND_COLORS,
 } from "@features/settings/constants/settingsConstants";
@@ -29,6 +30,21 @@ import type { ProjectContact } from "@features/settings/types/users";
  * @param contact - The project contact.
  * @returns Array of role badges to display.
  */
+/**
+ * Reports whether the user's roles include the customer admin role, in either
+ * of the spellings entity-service uses (see SETTINGS_CUSTOMER_ADMIN_ROLES).
+ * Compare through this rather than against one raw string, which would stop
+ * matching at cutover.
+ *
+ * @param {string[] | undefined} roles - Roles as reported by entity-service.
+ * @returns {boolean} Whether the user is a customer admin.
+ */
+export function hasCustomerAdminRole(roles: string[] | undefined): boolean {
+  return (roles ?? []).some((r) =>
+    SETTINGS_CUSTOMER_ADMIN_ROLES.includes(r.trim().toLowerCase()),
+  );
+}
+
 export function getRoleBadges(contact: ProjectContact): SettingsRoleBadge[] {
   const badges: SettingsRoleBadge[] = [];
 

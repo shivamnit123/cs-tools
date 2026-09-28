@@ -616,6 +616,8 @@ export interface BeAnnouncementCreatePayload {
   projectId: string;
   subject: string;
   description: string;
+  /** Decides the case's default email audience on the backend: SECURITY_CONTACT project-role contacts when true, PORTAL_USER contacts otherwise. */
+  isSecurityAnnouncement: boolean;
 }
 
 /**
@@ -861,8 +863,12 @@ export type BeCaseUpdatePayload =
   | (Omit<BeCaseUpdateNever, "type"> & { type: "security_report_analysis" })
   /** Work sub-state toggle (`ongoing` / `paused`) for an in-progress case. */
   | (Omit<BeCaseUpdateNever, "workState"> & { workState: BeCaseWorkState })
-  /** Email of the engineer to assign (ServiceNow only). */
-  | (Omit<BeCaseUpdateNever, "assigneeEmail"> & { assigneeEmail: string })
+  /**
+   * Email of the engineer to assign (ServiceNow only). `null` clears the
+   * assignee instead of assigning one — distinct from omitting the field,
+   * which the backend rejects as an empty update.
+   */
+  | (Omit<BeCaseUpdateNever, "assigneeEmail"> & { assigneeEmail: string | null })
   /**
    * Full replacement watch list, as platform user UUIDs — not a delta, and
    * not emails: the backend resolves each id to whatever identifier the
@@ -1915,6 +1921,70 @@ export interface BeProjectContactSearchResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Project onboarding steps (GET /projects/{id}/onboarding-steps — behind the
+// CSM_MIGRATION_ONBOARDING_STATUS_ENABLED flag on both backend and webapp)
+// ---------------------------------------------------------------------------
+
+/**
+ * One step of the customer onboarding flow, in the order it runs. DATABASE is
+ * the csm-platform write done by the Salesforce membership ingest; IDENTITY
+ * the Asgardeo user provisioned via the SCIM service; EMAIL the invitation
+ * email; REGISTRATION the member's first sign-in.
+ */
+export type BeOnboardingStepName = "IDENTITY" | "DATABASE" | "EMAIL" | "REGISTRATION";
+
+/** SKIPPED marks a step that does not apply (e.g. IDENTITY and EMAIL for an integration user). */
+export type BeOnboardingStepStatus = "SUCCEEDED" | "FAILED" | "SKIPPED";
+
+/**
+ * The latest recorded outcome of one onboarding step for one membership,
+ * exactly as the entity service's ledger holds it — nothing is derived.
+ */
+export interface BeProjectOnboardingStep {
+  step: BeOnboardingStepName;
+  status: BeOnboardingStepStatus;
+  /** How many times this step has been recorded for the membership; 1 on first write. */
+  attemptCount: number;
+  /**
+   * The error of the most recent FAILED write, null once the step succeeds.
+   * Upstream error text — render it as plain text only.
+   */
+  lastError: string | null;
+  /** The Salesforce event type (CREATED, UPDATED, RESTORED, ...) or caller-defined trigger. */
+  eventType: string;
+  eventModifiedOn: string;
+  updatedOn: string;
+}
+
+/**
+ * Every recorded onboarding step of one Salesforce Project_Contact__c
+ * membership (one invited email on this project), in flow order. Matched to
+ * a {@link BeProjectContact} row by lower-cased `email` — the contact row
+ * carries no membership or `project_contact` id.
+ */
+export interface BeProjectOnboardingMembership {
+  membershipSfId: string;
+  contactSfId: string | null;
+  /** The invited email, lower-cased. */
+  email: string;
+  /** csm-platform project_contact row, set once DATABASE succeeded. */
+  projectContactId: string | null;
+  steps: BeProjectOnboardingStep[];
+}
+
+export interface BeProjectOnboardingStepsResponse {
+  /** Ordered by email, then membership id. */
+  memberships: BeProjectOnboardingMembership[];
+  /** Number of memberships (not of step rows). */
+  total: number;
+  /**
+   * True when the project's ledger had more rows than the backend walks, so
+   * some memberships may be missing or incomplete.
+   */
+  truncated: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // Deployments
 // ---------------------------------------------------------------------------
 
@@ -2310,8 +2380,10 @@ export interface BeCreateCaseGithubIssuePayload {
   hotFixRequired?: boolean;
   /** Issue-type label to apply on GitHub (e.g. "Type/Patch", "Type/Incident"). */
   issueTypeLabel?: string;
-  /** Priority label, applied only when `issueTypeLabel` is "Type/Incident". */
+  /** Priority label, applied when the type is Discussion. */
   priorityLevel?: string;
+  /** Project onboarding status is In-Progress. Adds Onboarding/affected. */
+  onboardingInProgress?: boolean;
 }
 
 /** `POST /cases/{id}/github-issues` response. */
@@ -2851,7 +2923,7 @@ export interface BeItService {
   class?: string | null;
   businessCriticality?: string | null;
   serviceClassification?: string | null;
-  supportGroup?: BeEntityRef | null;
+  assignmentGroup?: BeEntityRef | null;
 }
 
 export interface BeItServiceSearchPayload {
@@ -3155,6 +3227,8 @@ export interface BeIncidentWatchListItem {
  * comments, and the watch list).
  */
 export interface BeIncidentDetail extends BeIncident {
+  /** ServiceNow's incident.description field — the full free-text body, separate from the shorter Subject. */
+  description?: string | null;
   subcategory?: BeIncidentSubcategory | null;
   service?: BeEntityRef | null;
   serviceOffering?: BeEntityRef | null;
@@ -3162,6 +3236,7 @@ export interface BeIncidentDetail extends BeIncident {
   contactType?: BeIncidentContactType | null;
   impact?: BeIncidentImpact | null;
   urgency?: BeIncidentUrgency | null;
+  environment?: string | null;
   changeRequest?: BeEntityRef | null;
   problem?: BeEntityRef | null;
   causedBy?: BeEntityRef | null;
@@ -3212,6 +3287,7 @@ export interface BeCreateIncidentPayload {
   changeRequestId?: string;
   problemId?: string;
   causedById?: string;
+  environment?: string;
 }
 
 /** `POST /incidents` response — the created identifiers. */
@@ -3281,6 +3357,7 @@ export interface BeUpdateIncidentPayload {
   changeRequestId?: string | null;
   problemId?: string | null;
   causedById?: string | null;
+  environment?: string | null;
 }
 
 /** `PATCH /incidents/{id}` response — the full updated incident. */

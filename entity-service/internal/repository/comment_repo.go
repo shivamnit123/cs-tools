@@ -30,7 +30,7 @@ import (
 )
 
 // CommentRow is the raw shape of one row read from the comment table
-// (migration 000037, extended by migration 000086 with DeletedAt/DeletedBy/
+// (migration 0040, extended by migration 0131 with DeletedAt/DeletedBy/
 // LastEditedAt).
 type CommentRow struct {
 	ID         string
@@ -59,7 +59,7 @@ type CommentRow struct {
 }
 
 // CommentEditHistoryRow is one prior version of a comment's body, recorded by
-// UpdateComment before it overwrites comment.content (migration 000086's
+// UpdateComment before it overwrites comment.content (migration 0131's
 // comment_edit_history table). Body is always the PRE-edit content.
 type CommentEditHistoryRow struct {
 	ID        string
@@ -73,7 +73,7 @@ type CommentEditHistoryRow struct {
 // work_item_type_enum value(s) it corresponds to. comment.work_item_id is a
 // foreign key into work_item(id), so only reference types that are
 // themselves work_item subtypes can be commented on through this data
-// source. "deployment" has no entry: deployment (migration 000013) is its
+// source. "deployment" has no entry: deployment (migration 0018) is its
 // own standalone table with its own primary key space, not a work_item
 // subtype, so a comment can never point at one here.
 //

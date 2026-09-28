@@ -45,12 +45,9 @@ import (
 // Owner/Repo are the actual GitHub org/repo an issue filed against this
 // option is created in.
 //
-// GithubLabel is the real GitHub issue label that should eventually be
-// applied to an issue filed against this option — distinct from
-// DisplayLabel, which is dropdown text only and never sent to GitHub. It is
-// stored and served here only: nothing in this backend applies it yet, since
-// doing so requires a separate, larger change to the actual issue-filing
-// path, which lives outside this backend.
+// GithubLabel is the product label applied to an issue filed against this
+// option. DisplayLabel is the name shown in the portal and is not sent to
+// GitHub. The case handler applies GithubLabel when it builds the issue labels.
 type RepoOption struct {
 	Value        string `json:"value"`
 	DisplayLabel string `json:"displayLabel"`

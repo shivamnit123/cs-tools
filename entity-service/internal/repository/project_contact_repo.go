@@ -30,7 +30,7 @@ import (
 )
 
 // ProjectContactRow is the raw shape of one row read from project_contact
-// (migration 000022), joined through account_contact to "user" (to resolve
+// (migration 0027), joined through account_contact to "user" (to resolve
 // a linked platform identity) and through project_contact_group/
 // project_group_role/project_role (migrations 000023-000025) to that
 // contact's roles.

@@ -363,6 +363,10 @@ func (h *UsersHandler) GetUser(w http.ResponseWriter, r *http.Request) {
 	// enrichment above, so a failure in either never blocks the other.
 	enriched = h.withExternalAccountStatus(r.Context(), enriched, user.UserID)
 
+	// Independent of both enrichments above: replaces entity-service's own
+	// role vocabulary with the portal-role one, for an internal target only.
+	enriched = h.withPortalRoles(r.Context(), enriched, user.UserID)
+
 	writeJSON(w, http.StatusOK, enriched)
 }
 

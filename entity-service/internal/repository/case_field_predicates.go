@@ -70,7 +70,7 @@ func escalationEnumLabels(ids []string) ([]string, error) {
 //
 // Column notes: state is matched on caseLikeStateColumn (it exists on all five
 // case-like extension tables); severity, issue type, work state and escalation
-// level live only on "case" (migration 000018) and engagement type only on
+// level live only on "case" (migration 0023) and engagement type only on
 // engagement, so those narrow the result to those rows. escalationLevel matches
 // "case".current_escalation_level, the value the case detail shows. Labels are
 // UPPER_SNAKE_CASE in the enums and lowercase in the domain, hence ToUpper;
@@ -119,7 +119,7 @@ func caseFieldPredicates(f caseFieldSet, argIdx int) ([]string, []any, int, erro
 		add("c.issue_type = ANY($%d::case_issue_type_enum[])", upper(len(f.IssueTypes), func(i int) string { return string(f.IssueTypes[i]) }))
 	}
 	if len(f.EngagementTypes) > 0 {
-		// engagement.type (migration 000019) is a column on the separate
+		// engagement.type (migration 0024) is a column on the separate
 		// engagement subtype table, not on "case".
 		add("eng.type = ANY($%d::engagement_type_enum[])", upper(len(f.EngagementTypes), func(i int) string { return string(f.EngagementTypes[i]) }))
 	}

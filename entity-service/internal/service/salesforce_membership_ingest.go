@@ -58,7 +58,7 @@ func (s *salesforceEventService) handleProjectContactEvent(ctx context.Context, 
 
 	switch req.EventType {
 	case domain.SalesforceEventCreated, domain.SalesforceEventUpdated, domain.SalesforceEventRestored:
-		return s.ingestMembership(ctx, req.ReferenceID, req.EventType)
+		return s.ingestMembership(ctx, req.ReferenceID, req.EventType, nil)
 	case domain.SalesforceEventDeleted:
 		found, err := s.membership.Memberships.DeactivateBySfID(ctx, req.ReferenceID)
 		if err != nil {
@@ -102,7 +102,7 @@ func (s *salesforceEventService) handleContactEvent(ctx context.Context, req dom
 		if id == "" {
 			continue
 		}
-		if err := s.ingestMembership(ctx, id, req.EventType); err != nil {
+		if err := s.ingestMembership(ctx, id, req.EventType, contact.LastModifiedDate); err != nil {
 			slog.ErrorContext(ctx, "salesforce: contact update: membership upsert failed", "contactSfId", req.ReferenceID, "membershipSfId", id, "err", err)
 			if firstErr == nil {
 				firstErr = err
@@ -116,7 +116,10 @@ func (s *salesforceEventService) handleContactEvent(ctx context.Context, req dom
 // sales-entity-service and writes it to Postgres. It is idempotent: the
 // repository resolves every row by natural key, and a replay whose
 // LastModifiedDate is not newer than the recorded DATABASE step is skipped.
-func (s *salesforceEventService) ingestMembership(ctx context.Context, membershipSfID, eventType string) error {
+// contactModified is the Contact's LastModifiedDate when a Contact event
+// drives the upsert (nil otherwise): a contact edit does not touch the
+// membership's LastModifiedDate, so the guard compares the later of the two.
+func (s *salesforceEventService) ingestMembership(ctx context.Context, membershipSfID, eventType string, contactModified *string) error {
 	pc, err := s.membership.SalesEntity.GetProjectContact(ctx, membershipSfID)
 	if err != nil {
 		return err
@@ -132,11 +135,15 @@ func (s *salesforceEventService) ingestMembership(ctx context.Context, membershi
 	// Duplicate-event guard. Salesforce emits several UPDATED events per save
 	// and the portal replays the envelope after its own write, so the same
 	// membership version arrives more than once. eventModifiedOn is the
-	// record's LastModifiedDate; when unparseable the guard is skipped and
+	// record's LastModifiedDate (or the contact's, when a Contact event
+	// carries a later one); when unparseable the guard is skipped and
 	// the (idempotent) upsert simply runs again. A step last touched by a
 	// DELETED event never counts: an undelete (RESTORED) keeps the record's
 	// LastModifiedDate, and the row must leave DEACTIVATED.
 	eventModifiedOn, hasModified := parseSalesforceLastModified(pc.LastModifiedDate)
+	if contactOn, ok := parseSalesforceLastModified(contactModified); ok && (!hasModified || contactOn.After(eventModifiedOn)) {
+		eventModifiedOn, hasModified = contactOn, true
+	}
 	if !hasModified {
 		slog.WarnContext(ctx, "salesforce: project contact has no parseable lastModifiedDate, skipping duplicate guard",
 			"membershipSfId", membershipSfID, "lastModifiedDate", derefString(pc.LastModifiedDate))

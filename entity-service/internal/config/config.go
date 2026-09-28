@@ -26,6 +26,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/validate"
 )
 
 // DataSource identifies which backend the service reads from.
@@ -77,23 +79,6 @@ type Config struct {
 	ServiceNowIntegrationServiceClientID     string
 	ServiceNowIntegrationServiceClientSecret string
 	ServiceNowIntegrationServiceScopes       string
-	// ConsumptionOperationBaseURL is the base URL of the Choreo subscription
-	// operation (operations/choreo-subscription-on-project-create), with the
-	// client credentials it is reached with.
-	//
-	// There is deliberately no default. The operation creates Choreo
-	// applications and issues signed licences for real customers, so a
-	// deployment that forgets to configure it must fail to register the
-	// licence route rather than quietly provision against whatever
-	// environment a baked-in default names.
-	ConsumptionOperationBaseURL      string
-	ConsumptionOperationTokenURL     string
-	ConsumptionOperationClientID     string
-	ConsumptionOperationClientSecret string
-	ConsumptionOperationScopes       string
-	// ConsumptionDualWriteEnabled controls whether provisioning state and
-	// artifacts are mirrored into Postgres alongside ServiceNow. Defaults to true.
-	ConsumptionDualWriteEnabled bool
 	// EventHubBroker/EventHubConnectionString/EventHubTopic configure this
 	// service's EventPublisherService (internal/service/
 	// event_publisher_service.go). Optional — gated on EventHubBroker being
@@ -118,6 +103,13 @@ type Config struct {
 	// false: those envelopes are then acknowledged and ignored, as before
 	// the branch existed. The Account branch is unaffected by this flag.
 	CSMMigrationSalesforceMembershipIngestEnabled bool
+	// CSMMigrationSalesforceAccountIngestEnabled turns on the Account branch
+	// of POST /salesforce/events, from
+	// CSM_MIGRATION_SALESFORCE_ACCOUNT_INGEST_ENABLED=true. Defaults to false:
+	// Account envelopes are then acknowledged and ignored, because the
+	// ServiceNow sync still owns the account table and both writing it would
+	// fight over the same rows.
+	CSMMigrationSalesforceAccountIngestEnabled bool
 	// CSMMigrationMembershipRegistrationEnabled turns on POST /users/me/memberships/register,
 	// which marks the signed-in user's still-INVITED memberships as
 	// REGISTERED in Salesforce (see membership_registration_service.go). Defaults to
@@ -210,6 +202,23 @@ type Config struct {
 	// nothing to do with case state) — the two are read by separate
 	// processes/environments and don't interact.
 	CustomerRoles []string
+	// CSEngineerRole is the ServiceNow role name (e.g. an org-specific
+	// "sn_*" role) whose presence on a case comment's resolved author marks
+	// that comment as a qualifying CS-engineer response — see
+	// sn_case_service.go's applyResponseSLAOnComment, which the CSM-native
+	// SLA engine (internal/service/sla_engine_service.go) uses to complete
+	// a case's "response" SLA clock. Deliberately no committed default:
+	// this is organisation-specific vocabulary, same reasoning
+	// CustomerRoles' own doc comment gives. Left unset, that function
+	// simply can't confirm engineer-authorship and skips (logged) — not
+	// fatal, not required by Validate.
+	CSEngineerRole string
+	// SLARecomputeInterval is how often SLAEngineRecomputeWorker
+	// recomputes every CSM-native "sla" row's elapsed percentage/breach
+	// status (internal/service/sla_engine_recompute_worker.go). Same
+	// envDuration convention as CRNoticePollInterval/GithubOutboundInterval
+	// above.
+	SLARecomputeInterval time.Duration
 	// Auth* configure token validation (internal/auth), always on -- there is
 	// no config flag to disable it. AuthIssuer/AuthJWKSURL/
 	// AuthUserTokenAudiences are required (Validate rejects startup without
@@ -254,6 +263,48 @@ type Config struct {
 	SalesEntityClientID     string
 	SalesEntityClientSecret string
 	SalesEntityScopes       string
+	// M2MTrustedActorEmails is the allowlist of service-account emails an
+	// M2M caller (no x-user-id-token, e.g. UMT via csm-integration-service)
+	// may claim as the acting user via AddCaseTagRequest.ActorEmail. An
+	// unset/empty var means no email is trusted and every such request is
+	// rejected -- this is deliberately not a default-open list, since it
+	// exists specifically to stop an M2M caller from spoofing an arbitrary
+	// actor. Compared case-insensitively in the handler.
+	M2MTrustedActorEmails []string
+
+	// Escalation* configure the fixed, deployment-specific notification
+	// recipient GROUPS EscalationService.CreateEscalation (Postgres data
+	// source) layers on top of the per-case-derived ones (account technical
+	// owner, CRE team lead, product routing, CSM) -- see that method's own
+	// doc comment for the full EL1..EL5 cumulative rule these feed. Each one
+	// is a "group".id (migration 0074), resolved to its real member list
+	// via team_member.group_id, NOT a single fixed address -- every
+	// configured tier notifies however many people are actually in that
+	// group. Every one of these is OPTIONAL: an unset/empty value means "no
+	// recipients from this slot," never a startup failure or a request
+	// error -- not every deployment configures every tier on day one, same
+	// reasoning CustomerRoles/CSEngineerRole's own doc comments give for
+	// org-specific vocabulary that doesn't belong hardcoded in this repo.
+	// None of these are required by Validate for that reason, though a SET
+	// value is still checked there for being a well-formed UUID (a
+	// misconfigured group id would otherwise silently resolve zero
+	// recipients instead of surfacing the typo at startup).
+	EscalationEL1AmericasTLGroupID string
+	EscalationEL2AmericasTUGroupID string
+	// EscalationEL2ServiceProductGroupID/EscalationEL2IdentityServerGroupID/
+	// EscalationEL2DefaultProductGroupID are the three product-routed EL2
+	// buckets: the case's deployed product's category/business_unit picks
+	// exactly one (SERVICE -> service; SOFTWARE with business_unit IAM ->
+	// identity server; everything else, including no business_unit -> the
+	// software default). A case with no deployed product/product info at
+	// all gets none of the three, silently.
+	EscalationEL2ServiceProductGroupID string
+	EscalationEL2IdentityServerGroupID string
+	EscalationEL2DefaultProductGroupID string
+	EscalationEL3CREHeadGroupID        string
+	EscalationEL4CCOGroupID            string
+	EscalationEL4CROGroupID            string
+	EscalationEL5CEOGroupID            string
 }
 
 // Load reads configuration from environment variables and returns a populated
@@ -275,12 +326,6 @@ func Load() *Config {
 		ServiceNowIntegrationServiceClientID:     os.Getenv("SERVICENOW_INTEGRATION_SERVICE_CLIENT_ID"),
 		ServiceNowIntegrationServiceClientSecret: os.Getenv("SERVICENOW_INTEGRATION_SERVICE_CLIENT_SECRET"),
 		ServiceNowIntegrationServiceScopes:       os.Getenv("SERVICENOW_INTEGRATION_SERVICE_SCOPES"),
-		ConsumptionOperationBaseURL:              os.Getenv("PRODUCT_CONSUMPTION_OPERATION_URL"),
-		ConsumptionOperationTokenURL:             os.Getenv("PRODUCT_CONSUMPTION_OPERATION_TOKEN_URL"),
-		ConsumptionOperationClientID:             os.Getenv("PRODUCT_CONSUMPTION_OPERATION_CLIENT_ID"),
-		ConsumptionOperationClientSecret:         os.Getenv("PRODUCT_CONSUMPTION_OPERATION_CLIENT_SECRET"),
-		ConsumptionOperationScopes:               os.Getenv("PRODUCT_CONSUMPTION_OPERATION_SCOPES"),
-		ConsumptionDualWriteEnabled:              getBoolOrDefault("CONSUMPTION_DUAL_WRITE_ENABLED", true),
 		EventHubBroker:                           os.Getenv("EVENT_HUB_BROKER"),
 		EventHubConnectionString:                 os.Getenv("EVENT_HUB_CONNECTION_STRING"),
 		EventHubTopic:                            os.Getenv("EVENT_HUB_TOPIC"),
@@ -298,6 +343,7 @@ func Load() *Config {
 		GithubLabelStatusAssigned:                os.Getenv("GITHUB_LABEL_STATUS_ASSIGNED"),
 		CRNoticesEnabled:                         os.Getenv("CR_NOTICES_ENABLED") == "true",
 		CSMMigrationSalesforceMembershipIngestEnabled: os.Getenv("CSM_MIGRATION_SALESFORCE_MEMBERSHIP_INGEST_ENABLED") == "true",
+		CSMMigrationSalesforceAccountIngestEnabled:    os.Getenv("CSM_MIGRATION_SALESFORCE_ACCOUNT_INGEST_ENABLED") == "true",
 		CSMMigrationPortalWritesEnabled:               os.Getenv("CSM_MIGRATION_PORTAL_WRITES_ENABLED") == "true",
 		CREventHubTopic:                               getEnvOrDefault("CR_EVENT_HUB_TOPIC", "cr-events"),
 		ProjectEventHubTopic:                          getEnvOrDefault("PROJECT_EVENT_HUB_TOPIC", "project-events"),
@@ -308,12 +354,24 @@ func Load() *Config {
 		AuthClockSkew:                                 envDuration("AUTH_CLOCK_SKEW", 30*time.Second),
 		AuthInternalClientIDsRaw:                      os.Getenv("AUTH_INTERNAL_CLIENT_IDS"),
 		CustomerRoles:                                 splitComma(os.Getenv("CUSTOMER_ROLES")),
+		CSEngineerRole:                                os.Getenv("CS_ENGINEER_ROLE"),
+		SLARecomputeInterval:                          envDuration("SLA_RECOMPUTE_INTERVAL", 45*time.Second),
 		SalesEntityBaseURL:                            os.Getenv("SALES_ENTITY_BASE_URL"),
 		SalesEntityTokenURL:                           os.Getenv("SALES_ENTITY_TOKEN_URL"),
 		SalesEntityClientID:                           os.Getenv("SALES_ENTITY_CLIENT_ID"),
 		SalesEntityClientSecret:                       os.Getenv("SALES_ENTITY_CLIENT_SECRET"),
 		SalesEntityScopes:                             os.Getenv("SALES_ENTITY_SCOPES"),
 		CSMMigrationMembershipRegistrationEnabled:     os.Getenv("CSM_MIGRATION_MEMBERSHIP_REGISTRATION_ENABLED") == "true",
+		M2MTrustedActorEmails:                         splitComma(os.Getenv("M2M_TRUSTED_ACTOR_EMAILS")),
+		EscalationEL1AmericasTLGroupID:                os.Getenv("ESCALATION_EL1_AMERICAS_TL_GROUP_ID"),
+		EscalationEL2AmericasTUGroupID:                os.Getenv("ESCALATION_EL2_AMERICAS_TU_GROUP_ID"),
+		EscalationEL2ServiceProductGroupID:            os.Getenv("ESCALATION_EL2_SERVICE_PRODUCT_GROUP_ID"),
+		EscalationEL2IdentityServerGroupID:            os.Getenv("ESCALATION_EL2_IDENTITY_SERVER_GROUP_ID"),
+		EscalationEL2DefaultProductGroupID:            os.Getenv("ESCALATION_EL2_DEFAULT_PRODUCT_GROUP_ID"),
+		EscalationEL3CREHeadGroupID:                   os.Getenv("ESCALATION_EL3_CRE_HEAD_GROUP_ID"),
+		EscalationEL4CCOGroupID:                       os.Getenv("ESCALATION_EL4_CCO_GROUP_ID"),
+		EscalationEL4CROGroupID:                       os.Getenv("ESCALATION_EL4_CRO_GROUP_ID"),
+		EscalationEL5CEOGroupID:                       os.Getenv("ESCALATION_EL5_CEO_GROUP_ID"),
 	}
 	cfg.AuthInternalClientIDs = ParseInternalClientIDs(cfg.AuthInternalClientIDsRaw)
 	return cfg
@@ -515,19 +573,54 @@ func (c *Config) Validate() error {
 	if salesEntitySet && !c.SalesEntityConfigured() {
 		return fmt.Errorf("SALES_ENTITY_BASE_URL, SALES_ENTITY_TOKEN_URL, SALES_ENTITY_CLIENT_ID, and SALES_ENTITY_CLIENT_SECRET must be set together or not at all")
 	}
+	// Each Escalation*GroupID is optional (unset = no recipients from that
+	// slot, see the field's own doc comment) but, if SET, must be a
+	// well-formed "group".id -- otherwise a typo'd env var would silently
+	// resolve to zero recipients at request time instead of failing loudly
+	// at startup where it's actually actionable.
+	escalationGroupIDs := map[string]string{
+		"ESCALATION_EL1_AMERICAS_TL_GROUP_ID":     c.EscalationEL1AmericasTLGroupID,
+		"ESCALATION_EL2_AMERICAS_TU_GROUP_ID":     c.EscalationEL2AmericasTUGroupID,
+		"ESCALATION_EL2_SERVICE_PRODUCT_GROUP_ID": c.EscalationEL2ServiceProductGroupID,
+		"ESCALATION_EL2_IDENTITY_SERVER_GROUP_ID": c.EscalationEL2IdentityServerGroupID,
+		"ESCALATION_EL2_DEFAULT_PRODUCT_GROUP_ID": c.EscalationEL2DefaultProductGroupID,
+		"ESCALATION_EL3_CRE_HEAD_GROUP_ID":        c.EscalationEL3CREHeadGroupID,
+		"ESCALATION_EL4_CCO_GROUP_ID":             c.EscalationEL4CCOGroupID,
+		"ESCALATION_EL4_CRO_GROUP_ID":             c.EscalationEL4CROGroupID,
+		"ESCALATION_EL5_CEO_GROUP_ID":             c.EscalationEL5CEOGroupID,
+	}
+	for envVar, value := range escalationGroupIDs {
+		if value != "" && !validate.IsUUID(value) {
+			return fmt.Errorf("%s %q is not a valid UUID", envVar, value)
+		}
+	}
 	return nil
 }
 
+// PostgresAuthoritative reports whether PostgreSQL is the system of record:
+// DATA_SOURCE=postgres, or postgres-servicenow-dual-write, which serves every
+// read and write from PostgreSQL too and only mirrors some writes to
+// ServiceNow afterwards.
+//
+// The customer onboarding features (the Salesforce membership ingest, the
+// portal membership writes, first-access registration) need exactly this and
+// nothing more. Memberships never go through the ServiceNow mirror: ServiceNow
+// gets them from Salesforce, through its own Service Bus subscription, so it
+// stays current in either mode.
+func (c *Config) PostgresAuthoritative() bool {
+	return c.DataSource == DataSourcePostgres || c.DataSource == DataSourcePostgresServiceNowDualWrite
+}
+
 // HasPortalMembershipWrites reports whether the portal-driven membership
-// write endpoints may be registered: the flag is on, the data source is
-// Postgres (the write is a Postgres transaction — there is no ServiceNow
+// write endpoints may be registered: the flag is on, PostgreSQL is
+// authoritative (the write is a Postgres transaction — there is no ServiceNow
 // equivalent), and the REST sales/sales-entity-service connection is
 // complete, since half of every one of those writes goes to Salesforce.
 // routes.go ANDs this with db != nil, the same way every other
 // Postgres-only feature set is gated.
 func (c *Config) HasPortalMembershipWrites() bool {
 	return c.CSMMigrationPortalWritesEnabled &&
-		c.DataSource == DataSourcePostgres &&
+		c.PostgresAuthoritative() &&
 		c.SalesEntityConfigured()
 }
 

@@ -31,11 +31,11 @@ import (
 )
 
 // ConversationRepository defines the persistence operations for conversation
-// (migration 000057), a work_item type extension (id IS work_item.id) --
+// (migration 0057), a work_item type extension (id IS work_item.id) --
 // same shared-PK pattern as "case"/change_request. conversation itself has
 // only a `state` column beyond the shared PK; InitialMessage/MessageCount
 // have no backing column at all and are derived from the generic `comment`
-// table (migration 000037, keyed by work_item_id): InitialMessage is the
+// table (migration 0040, keyed by work_item_id): InitialMessage is the
 // earliest comment's content, MessageCount is the total comment count --
 // the only tables in this schema that could plausibly answer "what was said
 // in this conversation."

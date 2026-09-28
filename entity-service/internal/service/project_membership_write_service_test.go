@@ -167,6 +167,7 @@ type fakeWriteMembershipRepo struct {
 	upserts   []domain.SalesforceMembershipUpsert
 	steps     []domain.UpsertOnboardingStepRequest
 	getErr    error
+	resolves  int
 }
 
 func (f *fakeWriteMembershipRepo) Upsert(context.Context, domain.SalesforceMembershipUpsert, domain.UpsertOnboardingStepRequest) (domain.SalesforceMembershipUpsertResult, error) {
@@ -199,6 +200,14 @@ func (f *fakeWriteMembershipRepo) UpsertWithin(ctx context.Context, _, _ string,
 		return res, fmt.Errorf("%w: connection reset", repository.ErrMembershipCommitFailed)
 	}
 	return res, nil
+}
+
+func (f *fakeWriteMembershipRepo) ResolveWriteContext(context.Context, string, string) (repository.MembershipWriteContext, error) {
+	f.resolves++
+	if f.targetErr != nil {
+		return repository.MembershipWriteContext{}, f.targetErr
+	}
+	return repository.MembershipWriteContext{Target: f.target, Existing: f.existing}, nil
 }
 
 func (f *fakeWriteMembershipRepo) GetMembershipByEmail(context.Context, string, string) (domain.ProjectMembershipRow, error) {

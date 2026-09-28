@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
@@ -101,19 +102,26 @@ func TestUserService_GetMe_RejectsMalformedToken(t *testing.T) {
 }
 
 // TestUserService_GetMe_PropagatesRepoNotFound proves a token whose email has
-// no matching Postgres user surfaces the repository's NotFoundError verbatim.
+// no matching Postgres user surfaces the repository's NotFoundError verbatim
+// -- and that its message never carries the caller's email address, since
+// writeServiceError (internal/handler/decode.go) logs every NotFoundError's
+// Msg verbatim.
 func TestUserService_GetMe_PropagatesRepoNotFound(t *testing.T) {
 	repo := stubUserRepo{
 		getUserByEmail: func(context.Context, string) (domain.User, error) {
-			return domain.User{}, &apierror.NotFoundError{Msg: "no user found with email: ghost@example.com"}
+			return domain.User{}, &apierror.NotFoundError{Msg: "no user found with that email"}
 		},
 	}
 	svc := NewUserService(repo)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "ghost@example.com"))
 
 	_, err := svc.GetMe(ctx)
-	if _, ok := err.(*apierror.NotFoundError); !ok {
+	nfe, ok := err.(*apierror.NotFoundError)
+	if !ok {
 		t.Fatalf("GetMe error = %v (%T), want *apierror.NotFoundError", err, err)
+	}
+	if strings.Contains(nfe.Msg, "ghost@example.com") {
+		t.Errorf("NotFoundError.Msg = %q, must never contain the caller's email address", nfe.Msg)
 	}
 }
 
@@ -395,13 +403,17 @@ func TestUserService_CreateUser(t *testing.T) {
 	t.Run("propagates the repository's conflict on a duplicate email", func(t *testing.T) {
 		repo := stubUserRepo{
 			createUser: func(context.Context, domain.CreateUserRequest, string) (domain.User, error) {
-				return domain.User{}, &apierror.ConflictError{Msg: "a user with this email already exists: jane.doe@example.com"}
+				return domain.User{}, &apierror.ConflictError{Msg: "a user with this email already exists"}
 			},
 		}
 		ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "admin@example.com"))
 		_, err := NewUserService(repo).CreateUser(ctx, validReq)
-		if _, ok := err.(*apierror.ConflictError); !ok {
+		ce, ok := err.(*apierror.ConflictError)
+		if !ok {
 			t.Fatalf("err = %v (%T), want *apierror.ConflictError", err, err)
+		}
+		if strings.Contains(ce.Msg, "jane.doe@example.com") {
+			t.Errorf("ConflictError.Msg = %q, must never contain the submitted email address", ce.Msg)
 		}
 	})
 }

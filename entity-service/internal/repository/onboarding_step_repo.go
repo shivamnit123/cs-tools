@@ -28,7 +28,7 @@ import (
 )
 
 // OnboardingStepRepository persists the per-membership, per-step outcome of
-// the customer onboarding flow (table onboarding_step, migration 000075).
+// the customer onboarding flow (table onboarding_step, migration 0118).
 type OnboardingStepRepository interface {
 	// Upsert writes the latest outcome of one step for one membership. The
 	// (membership_sf_id, step) pair is unique: a repeat updates the row and

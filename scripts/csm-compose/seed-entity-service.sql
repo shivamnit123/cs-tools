@@ -43,8 +43,8 @@ INSERT INTO user_role (id, created_on, updated_on, user_id, role_id) VALUES
 ON CONFLICT (id) DO NOTHING;
 
 -- Account + project + deployment.
-INSERT INTO account (id, created_on, updated_on, created_by, updated_by, name, number, sf_id, customer_success_manager_id) VALUES
-  ('00000000-0000-0000-0000-000000000301', now(), now(), 'seed', 'seed', 'Example Corp', 'ACC-0001', 'SF-0001', '00000000-0000-0000-0000-000000000001')
+INSERT INTO account (id, created_on, updated_on, created_by, updated_by, name, number, sf_id, customer_success_manager_id, country, city, drive_location) VALUES
+  ('00000000-0000-0000-0000-000000000301', now(), now(), 'seed', 'seed', 'Example Corp', 'ACC-0001', 'SF-0001', '00000000-0000-0000-0000-000000000001', 'United States', 'Mountain View', 'https://drive.example.com/example-corp')
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO project (id, created_on, updated_on, created_by, updated_by, key, sf_id, name, account_id, is_active) VALUES
@@ -73,5 +73,27 @@ ON CONFLICT (id) DO NOTHING;
 INSERT INTO time_card (id, created_on, updated_on, created_by, updated_by, case_id, customer_project_id, user_id, work_date, is_billable, state, analyzing_minutes, work_log_comment) VALUES
   ('00000000-0000-0000-0000-000000000801', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000000601', '00000000-0000-0000-0000-000000000401', '00000000-0000-0000-0000-000000000001', CURRENT_DATE, true, 'SUBMITTED', 30, 'Seeded time card for local dev.')
 ON CONFLICT (id) DO NOTHING;
+
+-- One ABT team with both seeded users as members, for GET /teams/{id}/members.
+INSERT INTO team (id, created_on, updated_on, created_by, updated_by, name, type) VALUES
+  ('00000000-0000-0000-0000-000000000901', now(), now(), 'seed', 'seed', 'Example Corp ABT', 'ABT')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO team_member (id, created_on, updated_on, created_by, updated_by, team_id, user_id) VALUES
+  ('00000000-0000-0000-0000-000000000902', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000000901', '00000000-0000-0000-0000-000000000001'),
+  ('00000000-0000-0000-0000-000000000903', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000000901', '00000000-0000-0000-0000-000000000002')
+ON CONFLICT (id) DO NOTHING;
+
+-- Same id as the team above, in "group" too: account.cre_team_id (what
+-- AccountView.CreTeam resolves from) is an FK into "group", not "team" --
+-- in a real synced environment both are derived from the same ServiceNow
+-- sys_user_group sys_id, so they share an id there too. This is what makes
+-- an account's CreTeam.ID usable as GET /teams/{id}/members' teamId.
+INSERT INTO "group" (id, created_on, updated_on, created_by, updated_by, name, is_active) VALUES
+  ('00000000-0000-0000-0000-000000000901', now(), now(), 'seed', 'seed', 'Example Corp ABT', true)
+ON CONFLICT (id) DO NOTHING;
+
+UPDATE account SET cre_team_id = '00000000-0000-0000-0000-000000000901'
+WHERE id = '00000000-0000-0000-0000-000000000301';
 
 COMMIT;

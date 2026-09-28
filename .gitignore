@@ -49,3 +49,21 @@ apps/csm-portal/backend/plg-source-map.json
 
 # PLG's own documentation, kept locally rather than pushed.
 apps/csm-portal/plg-docs/
+docs/*
+
+# The CS ABT roster sheet holds real staff names and leave. Neither the sheet
+# nor anything generated from it -- exports, copies, import SQL -- belongs in
+# this repository; scripts/csm-compose/import-abt-roster.py (no data) does.
+*ABT Roster*
+*abt-roster*.csv
+*abt-roster*.sql
+*abt-roster*.xlsx
+# The importer's own output, whose documented name says nothing about the
+# roster -- `import-abt-roster.py <sheet.xlsx> <tab> out.sql` -- so the
+# patterns above miss it. It is full of real names and leave.
+out.sql
+scripts/csm-compose/out.sql
+# The SRE team's rotation workbook, and SQL generated from it.
+*ABT-Rotation*
+*sre-rotation*.sql
+*sre-rotation*.csv

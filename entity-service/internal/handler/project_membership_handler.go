@@ -18,7 +18,10 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/service"
@@ -36,6 +39,28 @@ type ProjectMembershipHandler struct {
 	svc service.ProjectMembershipWriteService
 }
 
+// membershipWriteDeadline is how long a membership write may take to send
+// its response. The server-wide WriteTimeout (15s) is shorter than a write
+// that goes through several Salesforce calls can take when Salesforce is
+// slow, and when it expires the connection is closed after the write has
+// committed: the caller then sees a failure for a change that happened. The
+// portals' own clients stop waiting well before this, so it only has to
+// outlast them.
+const membershipWriteDeadline = 60 * time.Second
+
+// extendWriteDeadline raises this response's write deadline to
+// membershipWriteDeadline, leaving every other route on the server default.
+// A writer that cannot reach the connection (http.ErrNotSupported) keeps the
+// default; that is logged, not fatal.
+func extendWriteDeadline(w http.ResponseWriter, r *http.Request) {
+	err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(membershipWriteDeadline))
+	if err != nil && !errors.Is(err, http.ErrNotSupported) {
+		slog.WarnContext(r.Context(), "membership write: could not extend the write deadline", "err", err)
+	} else if errors.Is(err, http.ErrNotSupported) {
+		slog.WarnContext(r.Context(), "membership write: response writer cannot extend the write deadline")
+	}
+}
+
 // NewProjectMembershipHandler constructs a ProjectMembershipHandler.
 func NewProjectMembershipHandler(svc service.ProjectMembershipWriteService) *ProjectMembershipHandler {
 	return &ProjectMembershipHandler{svc: svc}
@@ -43,6 +68,7 @@ func NewProjectMembershipHandler(svc service.ProjectMembershipWriteService) *Pro
 
 // InviteProjectContact handles POST /projects/{id}/contacts.
 func (h *ProjectMembershipHandler) InviteProjectContact(w http.ResponseWriter, r *http.Request) {
+	extendWriteDeadline(w, r)
 	var req domain.CreateProjectMembershipRequest
 	if !decodeRequest(w, r, &req) {
 		return
@@ -57,8 +83,29 @@ func (h *ProjectMembershipHandler) InviteProjectContact(w http.ResponseWriter, r
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+// ValidateProjectContact handles POST /projects/{id}/contacts/validate, the
+// invitation's dry run. It answers 200 whether or not the invitation would
+// be allowed; the body's valid flag says which. Error statuses mean the check
+// itself failed.
+func (h *ProjectMembershipHandler) ValidateProjectContact(w http.ResponseWriter, r *http.Request) {
+	// Several Salesforce reads, like the writes: the same deadline applies.
+	extendWriteDeadline(w, r)
+	var req domain.ValidateProjectMembershipRequest
+	if !decodeRequest(w, r, &req) {
+		return
+	}
+	resp, err := h.svc.ValidateInvitation(r.Context(), r.PathValue("id"), req)
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
 // UpdateProjectContactRoles handles PATCH /projects/{id}/contacts/{email}.
 func (h *ProjectMembershipHandler) UpdateProjectContactRoles(w http.ResponseWriter, r *http.Request) {
+	extendWriteDeadline(w, r)
 	var req domain.UpdateProjectMembershipRolesRequest
 	if !decodeRequest(w, r, &req) {
 		return
@@ -76,6 +123,7 @@ func (h *ProjectMembershipHandler) UpdateProjectContactRoles(w http.ResponseWrit
 // The membership is deactivated, never deleted — see the service's own doc
 // comment.
 func (h *ProjectMembershipHandler) DeactivateProjectContact(w http.ResponseWriter, r *http.Request) {
+	extendWriteDeadline(w, r)
 	if err := h.svc.Deactivate(r.Context(), r.PathValue("id"), pathEmail(r)); err != nil {
 		writeServiceError(w, r, err)
 		return
@@ -86,6 +134,7 @@ func (h *ProjectMembershipHandler) DeactivateProjectContact(w http.ResponseWrite
 // ResendProjectContactInvitation handles
 // POST /projects/{id}/contacts/{email}/resend-invitation.
 func (h *ProjectMembershipHandler) ResendProjectContactInvitation(w http.ResponseWriter, r *http.Request) {
+	extendWriteDeadline(w, r)
 	if err := h.svc.ResendInvitation(r.Context(), r.PathValue("id"), pathEmail(r)); err != nil {
 		writeServiceError(w, r, err)
 		return

@@ -116,12 +116,17 @@ export default function AnnouncementDetailsPanel({
   const statusColorPath = getStatusColor(statusLabel ?? undefined);
   const resolvedStatusColor = resolveColorFromTheme(statusColorPath, theme);
   const updatedOnLabel = formatAnnouncementDateDisplay(data.updatedOn);
-  // Matches the CSM portal's own SECURITY_ANNOUNCEMENT_TAG_LABEL constant --
-  // the two apps have no shared code to import it from, so it's duplicated
-  // here as a literal, same as every other cross-app label match in this file.
-  const isSecurityAnnouncement = (data.tags ?? []).some(
-    (t) => t.label.toLowerCase() === "security announcement",
-  );
+  // announcementType is the real classification (entity-service's
+  // announcement.announcement_type column); the tag fallback stays for
+  // historical data created before that column existed (migration 0088
+  // defaulted every existing row to GENERAL with no backfill, so an old
+  // security announcement is only identifiable by its tag). Matches the CSM
+  // portal's own SECURITY_ANNOUNCEMENT_TAG_LABEL constant -- the two apps
+  // have no shared code to import it from, so it's duplicated here as a
+  // literal, same as every other cross-app label match in this file.
+  const isSecurityAnnouncement =
+    data.announcementType === "SECURITY" ||
+    (data.tags ?? []).some((t) => t.label.toLowerCase() === "security announcement");
 
   return (
     <Box sx={{ display: "flex", flexDirection: "column", gap: 2 }}>

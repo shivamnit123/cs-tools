@@ -97,13 +97,41 @@ func (c *Client) PatchCase(ctx context.Context, id string, body []byte) ([]byte,
 	return c.do(ctx, http.MethodPatch, fmt.Sprintf("/cases/%s", url.PathEscape(id)), body)
 }
 
+// SearchCases calls POST /cases/search on the entity service, mirroring
+// SearchAccounts's shape. A generic passthrough — callers build whatever
+// filter/pagination shape they need (e.g. an exact-match filter on "number"
+// to resolve a case number to this platform's own case UUID, never a
+// ServiceNow sys_id, which the entity service's case model never exposes).
+// Postgres-backed; a pure M2M call succeeds here, no forwarded identity
+// required. Response is returned as raw JSON; typed response structs are
+// deferred.
+func (c *Client) SearchCases(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/cases/search", body)
+}
+
+// AddCaseTag calls POST /cases/{id}/tags on the entity service. Postgres-backed;
+// unlike PatchCase's general field set, tagging supports an M2M caller
+// supplying an actorEmail in the request body when no end-user identity token
+// is forwarded, provided that email is on entity-service's configured
+// M2M_TRUSTED_ACTOR_EMAILS allowlist (otherwise entity-service returns 403).
+// This client method forwards the body verbatim; the caller is responsible
+// for populating actorEmail. Response is returned as raw JSON; typed response
+// structs are deferred.
+func (c *Client) AddCaseTag(ctx context.Context, caseID string, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, fmt.Sprintf("/cases/%s/tags", url.PathEscape(caseID)), body)
+}
+
 // CreateCaseComment calls POST /cases/{id}/comments on the entity service.
-// Unlike PatchCase, this entity-service operation requires a forwarded
-// end-user identity token unconditionally, on both data sources (the comment's
-// author is resolved from that token). This service is strictly M2M with no
-// mechanism to carry one, so this call is expected to always receive a mapped
-// 401 — kept for API-shape completeness, not because it currently succeeds.
-// Response is returned as raw JSON; typed response structs are deferred.
+// Mirrors AddCaseTag: on DATA_SOURCE=postgres, entity-service supports an
+// M2M caller supplying an actorEmail in the request body when no end-user
+// identity token is forwarded, provided that email is on entity-service's
+// configured M2M_TRUSTED_ACTOR_EMAILS allowlist (otherwise entity-service
+// returns 403). On DATA_SOURCE=servicenow, entity-service's ServiceNow path
+// still requires a forwarded end-user identity token unconditionally and
+// ignores actorEmail, so this service (strictly M2M, no mechanism to carry
+// one) still gets a mapped 401 there. This client method forwards the body
+// verbatim; the caller is responsible for populating actorEmail. Response is
+// returned as raw JSON; typed response structs are deferred.
 func (c *Client) CreateCaseComment(ctx context.Context, caseID string, body []byte) ([]byte, error) {
 	return c.do(ctx, http.MethodPost, fmt.Sprintf("/cases/%s/comments", url.PathEscape(caseID)), body)
 }

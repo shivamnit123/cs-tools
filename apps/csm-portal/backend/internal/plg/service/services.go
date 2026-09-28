@@ -16,7 +16,7 @@ import (
 // ReferenceService serves products, engineers and the lifecycle catalogue.
 type ReferenceService interface {
 	ListProducts(ctx context.Context) ([]domain.Product, error)
-	ListCSUsers(ctx context.Context) ([]domain.UserRef, error)
+	ListCSUsers(ctx context.Context, search string) ([]domain.UserRef, error)
 	LifecycleCatalogue(ctx context.Context) (*domain.LifecycleCatalogue, error)
 }
 
@@ -33,8 +33,8 @@ func (s *referenceService) ListProducts(ctx context.Context) ([]domain.Product, 
 	return s.repo.ListProducts(ctx)
 }
 
-func (s *referenceService) ListCSUsers(ctx context.Context) ([]domain.UserRef, error) {
-	return s.repo.ListCSUsers(ctx)
+func (s *referenceService) ListCSUsers(ctx context.Context, search string) ([]domain.UserRef, error) {
+	return s.repo.ListCSUsers(ctx, search)
 }
 
 // There is deliberately no Me method here. The identity middleware resolves the

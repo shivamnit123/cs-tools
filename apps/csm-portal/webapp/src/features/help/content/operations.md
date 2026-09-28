@@ -108,8 +108,8 @@ action) opens a form for Caller, Service, and a classification (category,
 subcategory, contact type, impact, urgency — Priority is computed live from
 impact × urgency and not itself editable). **Assignment group** is not a
 manual pick here: it's shown read-only, auto-filled from the selected
-Service's ServiceNow support group, and blank with a hint if that service
-has none set in ServiceNow.
+Service's assignment group, and blank with a hint if that service
+has none set.
 
 The detail page shows:
 

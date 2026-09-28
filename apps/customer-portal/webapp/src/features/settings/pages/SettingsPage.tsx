@@ -26,7 +26,6 @@ import SettingsDisplay from "@features/settings/components/SettingsDisplay";
 import SettingsUserManagement from "@features/settings/components/SettingsUserManagement";
 import SettingsRegistryTokens from "@features/settings/components/SettingsRegistryTokens";
 import {
-  SETTINGS_CUSTOMER_ADMIN_ROLE,
   SETTINGS_PAGE_TABS,
   SETTINGS_PROJECT_NOT_FOUND_MESSAGE,
 } from "@features/settings/constants/settingsConstants";
@@ -35,6 +34,7 @@ import { resolveSettingsPageTabId } from "@features/settings/utils/settingsPage"
 import { consumePendingSettingsTab } from "@features/settings/utils/settingsStorage";
 import { ProjectType } from "@/types/permission";
 import { isProjectRestricted } from "@utils/permission";
+import { hasCustomerAdminRole } from "@features/settings/utils/settings";
 
 /**
  * Settings page with User Management and AI Assistant tabs.
@@ -53,7 +53,7 @@ export default function SettingsPage(): JSX.Element {
   const { data: projectDetails } = useGetProjectDetails(projectId || "");
 
   const isCustomerAdmin = useMemo(
-    () => (userDetails?.roles ?? []).includes(SETTINGS_CUSTOMER_ADMIN_ROLE),
+    () => hasCustomerAdminRole(userDetails?.roles),
     [userDetails?.roles],
   );
 

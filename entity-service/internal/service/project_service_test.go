@@ -31,12 +31,18 @@ import (
 type recordingProjectRepo struct {
 	called bool
 	gotReq domain.SearchProjectsRequest
+	// toReturn lets a test control what SearchProjects hands back to the
+	// service layer, to prove a repo-returned field survives the
+	// domain.Project -> domain.ProjectView mapping (see
+	// TestSearchProjects_ClosureStateReachesResponse below). Left nil,
+	// SearchProjects returns no rows, matching every test above this one.
+	toReturn []domain.Project
 }
 
 func (r *recordingProjectRepo) SearchProjects(_ context.Context, req domain.SearchProjectsRequest, _ repository.SearchScope) ([]domain.Project, int, error) {
 	r.called = true
 	r.gotReq = req
-	return nil, 0, nil
+	return r.toReturn, len(r.toReturn), nil
 }
 
 func (r *recordingProjectRepo) GetProjectByID(context.Context, string, repository.SearchScope) (domain.ProjectDetailsView, error) {
@@ -110,5 +116,26 @@ func TestSearchProjectsExcludeClosureStatesAndProjectKeysPassThrough(t *testing.
 				t.Fatalf("repository received %+v, want the same exclude filters as %+v", repo.gotReq, tt.req)
 			}
 		})
+	}
+}
+
+// TestSearchProjects_ClosureStateReachesResponse is the regression guard for
+// a real bug: domain.Project already carried ClosureState from the
+// repository (project.wso2_closure_state), but the service layer's
+// domain.Project -> domain.ProjectView mapping never copied it across, so
+// every search result's closureState silently came back null regardless of
+// what the repository returned — the same class of bug this file's own
+// comment on StartDate above already describes and fixes for that field.
+func TestSearchProjects_ClosureStateReachesResponse(t *testing.T) {
+	closureState := "Suspended"
+	repo := &recordingProjectRepo{toReturn: []domain.Project{{ID: "p1", ClosureState: &closureState}}}
+	svc := NewProjectService(repo, alwaysUnrestrictedAccess{})
+
+	resp, err := svc.SearchProjects(t.Context(), domain.SearchProjectsRequest{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(resp.Projects) != 1 || resp.Projects[0].ClosureState == nil || *resp.Projects[0].ClosureState != closureState {
+		t.Fatalf("Projects[0].ClosureState = %+v, want %q", resp.Projects, closureState)
 	}
 }

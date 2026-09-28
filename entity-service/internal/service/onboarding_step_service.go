@@ -34,7 +34,7 @@ import (
 const onboardingStepDefaultActor = "onboarding-step-api"
 
 // maxOnboardingStepEventTypeLen is onboarding_step.event_type's column width
-// (migration 000086). A longer value is refused here as a 400 rather than
+// (migration 0132). A longer value is refused here as a 400 rather than
 // reaching Postgres and coming back as a 500 (SQLSTATE 22001).
 const maxOnboardingStepEventTypeLen = 64
 

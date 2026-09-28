@@ -48,6 +48,33 @@ type GetUserMeResponse struct {
 	Roles     []string `json:"roles"`
 }
 
+// SearchUsersFilters mirrors entity-service's own filter struct field-for-field,
+// but this backend only ever sets Emails — used to resolve a set of watch-list
+// email addresses (from the project-contact onboarding service, a different
+// identity space) to entity-service's own "user" table ids before they're
+// forwarded to CreateCase/UpdateCase, which require real UUIDs.
+type SearchUsersFilters struct {
+	Emails []string `json:"emails,omitempty"`
+}
+
+// SearchUsersRequest is the request body for POST /users/search.
+type SearchUsersRequest struct {
+	Pagination Pagination         `json:"pagination"`
+	Filters    SearchUsersFilters `json:"filters"`
+}
+
+// UserSummary is the subset of entity-service's user search result this
+// backend actually needs (id + email, for the watch-list resolution above).
+type UserSummary struct {
+	ID    string `json:"id"`
+	Email string `json:"email"`
+}
+
+// SearchUsersResponse is entity-service's paginated response for POST /users/search.
+type SearchUsersResponse struct {
+	Users []UserSummary `json:"users"`
+}
+
 // PatchUserMeRequest is the request body for PATCH /users/me.
 type PatchUserMeRequest struct {
 	TimeZone string `json:"timeZone"`
@@ -715,6 +742,12 @@ type WatchListUser struct {
 	UserName string `json:"userName"`
 	Name     string `json:"name,omitempty"`
 	Email    string `json:"email,omitempty"`
+	// Locked mirrors entity-service's own domain.WatchListUser.Locked: true
+	// when this watcher is one of the case's account's four named
+	// stakeholders, which entity-service always re-adds on the next write
+	// regardless of what a caller submits -- see dto.CaseWatchListUser.Locked
+	// for what the frontend does with this.
+	Locked bool `json:"locked"`
 }
 
 // UpdatedCase carries the case fields entity-service returns after a
@@ -843,6 +876,10 @@ type CaseView struct {
 	Duration        *string `json:"duration"`
 	EscalationLevel *string `json:"escalationLevel"`
 	IsEscalated     *bool   `json:"isEscalated"`
+	// AnnouncementType is only meaningful when Type is "announcement" --
+	// "GENERAL" or "SECURITY" (entity-service's announcement.announcement_type
+	// column). Nil for every other case-like type.
+	AnnouncementType *string `json:"announcementType"`
 }
 
 // --- deployments ---

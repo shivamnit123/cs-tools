@@ -115,7 +115,16 @@ func (c *EmailClient) do(ctx context.Context, method, path string, body []byte) 
 	return respBody, nil
 }
 
-// EmailAttachment is a single file attached to an outgoing email.
+// EmailAttachment is a single file attached to an outgoing email. Inline
+// and ContentID are optional and mirror email-service's own EmailAttachment
+// schema exactly (openapi-send-email.yaml in that repo) — omitting both
+// keeps this attachment a plain Content-Disposition: attachment part,
+// unrelated to the HTML body, same as before this pair existed. Setting
+// Inline: true (with a non-empty ContentID, required by that service) marks
+// the part Content-Disposition: inline instead, so the HTML body can
+// reference this exact file as <img src="cid:<contentId>"> — see
+// notifications.InlineImage, which is what produces these two fields for a
+// comment/description's own embedded images.
 type EmailAttachment struct {
 	// ContentName is the attachment's file name (e.g. "invoice.pdf").
 	ContentName string `json:"contentName"`
@@ -124,6 +133,13 @@ type EmailAttachment struct {
 	// Attachment is the raw file content; encoding/json base64-encodes it
 	// automatically since the field type is []byte.
 	Attachment []byte `json:"attachment"`
+	// Inline marks this attachment Content-Disposition: inline instead of
+	// attachment. Requires ContentID.
+	Inline bool `json:"inline,omitempty"`
+	// ContentID is this part's Content-ID (without angle brackets --
+	// email-service adds those), referenced from the HTML template as
+	// cid:<contentId>. Ignored unless Inline is true.
+	ContentID string `json:"contentId,omitempty"`
 }
 
 // sendEmailRequest is the wire shape expected by POST /send-email.

@@ -32,7 +32,7 @@ import (
 )
 
 // TimeCardRepository defines the persistence operations for the time_card
-// and time_card_approver tables (migration 000039).
+// and time_card_approver tables (migration 0041).
 type TimeCardRepository interface {
 	// SearchTimeCards returns a filtered, sorted, paginated slice of time
 	// cards together with the total count of matching rows before
@@ -94,6 +94,17 @@ type TimeCardRepository interface {
 	// resolved the card, so any mismatch here means it changed concurrently
 	// or was never theirs to delete.
 	DeleteTimeCard(ctx context.Context, id, submitterID string) error
+	// SetTimeCardSNSysID best-effort persists ServiceNow's own sys_id for the
+	// time card identified by id (migration 0135) -- called from
+	// CreateTimeCard's async ServiceNow mirror success path, never from the
+	// synchronous request path. A no-op (returns nil) if id does not exist.
+	SetTimeCardSNSysID(ctx context.Context, id, snSysID string) error
+	// GetTimeCardSNSysID returns the ServiceNow sys_id previously stored for
+	// id by SetTimeCardSNSysID, or nil if none is stored yet. Returns a
+	// NotFoundError if id does not exist -- callers that need this before a
+	// DELETE (which removes the row entirely, taking sn_sys_id with it) must
+	// call this first, synchronously, while the row still exists.
+	GetTimeCardSNSysID(ctx context.Context, id string) (*string, error)
 }
 
 type timeCardRepo struct {
@@ -105,17 +116,25 @@ func NewTimeCardRepository(db *pgxpool.Pool) TimeCardRepository {
 	return &timeCardRepo{db: db}
 }
 
+// The five per-activity minute columns are wrapped in COALESCE(...,0) --
+// same reasoning and same precedent as project_stats_repo.go's own
+// timeCardMinutesExpr: these columns are nullable, and scanTimeCardView
+// below scans them into plain (non-pointer) int locals, which errors
+// ("cannot scan NULL into *int") the moment any one of them is NULL on any
+// row this query returns. COALESCE at the SQL layer is the minimal,
+// root-cause fix -- no Go struct/scan-target change is needed once the SQL
+// itself guarantees non-NULL.
 const timeCardSelectColumns = `
 	tc.id, tc.work_date, tc.is_billable, tc.state::TEXT, tc.issue_complexity::TEXT,
-	tc.analyzing_minutes, tc.setting_up_minutes, tc.reproducing_debugging_minutes,
-	tc.providing_solution_minutes, tc.patching_minutes, tc.work_log_comment, tc.lead_comment,
+	COALESCE(tc.analyzing_minutes,0), COALESCE(tc.setting_up_minutes,0), COALESCE(tc.reproducing_debugging_minutes,0),
+	COALESCE(tc.providing_solution_minutes,0), COALESCE(tc.patching_minutes,0), tc.work_log_comment, tc.lead_comment,
 	u.id, TRIM(COALESCE(u.name, CONCAT_WS(' ', u.first_name, u.last_name))),
 	ab.id, TRIM(COALESCE(ab.name, CONCAT_WS(' ', ab.first_name, ab.last_name))),
 	p.id, p.name,
 	wi.id, wi.number, wi.subject`
 
 // timeCardFromJoins joins work_item directly (not "case"): time_card.case_id
-// now references work_item(id) generically (migration 000039's most recent
+// now references work_item(id) generically (migration 0041's most recent
 // revision), not "case"(id) specifically -- a time card can be logged
 // against any case-like work_item type, not just CASE. Only wi.number/
 // wi.subject are ever read for the case reference, so no "case"-specific
@@ -151,7 +170,7 @@ func scanTimeCardView(row interface{ Scan(...any) error }) (domain.TimeCardView,
 		return domain.TimeCardView{}, err
 	}
 	// time_card_state_enum/time_card_issue_complexity_enum are UPPER_SNAKE_CASE
-	// (migration 000039's most recent revision); domain.TimeCardState's own
+	// (migration 0041's most recent revision); domain.TimeCardState's own
 	// values, and every caller-supplied issueComplexity string, are lowercase.
 	if state != nil {
 		lower := strings.ToLower(*state)
@@ -502,7 +521,7 @@ func (r *timeCardRepo) CreateTimeCard(ctx context.Context, req domain.CreateTime
 	defer tx.Rollback(ctx)
 
 	// The case's own project is work_item.project_id -- case_id now
-	// references work_item(id) generically (migration 000039's most recent
+	// references work_item(id) generically (migration 0041's most recent
 	// revision), not "case"(id) specifically, so this looks up work_item
 	// directly rather than joining through "case".
 	// time_card.customer_project_id is a separate, independently-settable
@@ -531,7 +550,7 @@ func (r *timeCardRepo) CreateTimeCard(ctx context.Context, req domain.CreateTime
 
 	// 'SUBMITTED' (not 'submitted') and issue_complexity's ::text::enum cast:
 	// time_card_state_enum/time_card_issue_complexity_enum are UPPER_SNAKE_CASE
-	// (migration 000039's most recent revision). The ::text::enum cast on
+	// (migration 0041's most recent revision). The ::text::enum cast on
 	// issue_complexity -- not a direct ::enum cast -- avoids the same pgx v5
 	// codec issue this file's date fields already work around: once the
 	// server infers a parameter's OID as a custom enum type, pgx has no
@@ -767,4 +786,26 @@ func (r *timeCardRepo) DeleteTimeCard(ctx context.Context, id, submitterID strin
 		return &apierror.ConflictError{Msg: "time card cannot be deleted (it may not exist, may not belong to you, or is no longer in the submitted state)"}
 	}
 	return nil
+}
+
+// SetTimeCardSNSysID implements TimeCardRepository.
+func (r *timeCardRepo) SetTimeCardSNSysID(ctx context.Context, id, snSysID string) error {
+	_, err := r.db.Exec(ctx, `UPDATE time_card SET sn_sys_id = $1 WHERE id = $2`, snSysID, id)
+	if err != nil {
+		return fmt.Errorf("set time card sn sys id: %w", err)
+	}
+	return nil
+}
+
+// GetTimeCardSNSysID implements TimeCardRepository.
+func (r *timeCardRepo) GetTimeCardSNSysID(ctx context.Context, id string) (*string, error) {
+	var snSysID *string
+	err := r.db.QueryRow(ctx, `SELECT sn_sys_id FROM time_card WHERE id = $1`, id).Scan(&snSysID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, &apierror.NotFoundError{Msg: "time card not found"}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get time card sn sys id: %w", err)
+	}
+	return snSysID, nil
 }

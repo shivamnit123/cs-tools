@@ -38,6 +38,7 @@ var membershipWriteRoutes = []struct {
 	{"invite", http.MethodPost, "/projects/3f1e8d6a-3b4c-4d5e-8f90-123456789abc/contacts", `{"email":"jane@acme.com","roles":["Portal user"]}`},
 	{"change roles", http.MethodPatch, "/projects/3f1e8d6a-3b4c-4d5e-8f90-123456789abc/contacts/jane%40acme.com", `{"roles":["Portal user"]}`},
 	{"deactivate", http.MethodDelete, "/projects/3f1e8d6a-3b4c-4d5e-8f90-123456789abc/contacts/jane%40acme.com", ""},
+	{"validate invitation", http.MethodPost, "/projects/3f1e8d6a-3b4c-4d5e-8f90-123456789abc/contacts/validate", `{"email":"jane@acme.com"}`},
 	{"resend invitation", http.MethodPost, "/projects/3f1e8d6a-3b4c-4d5e-8f90-123456789abc/contacts/jane%40acme.com/resend-invitation", ""},
 }
 
@@ -69,7 +70,7 @@ func newPortalWriteRouter(t *testing.T, flagOn bool) http.Handler {
 }
 
 // TestPortalMembershipWriteRoutesAreAbsentWhenTheFlagIsOff is the guard on the
-// kill switch: off, the four routes do not exist at all. Not registering them
+// kill switch: off, these routes do not exist at all. Not registering them
 // (rather than registering a handler that refuses) is deliberate — until the
 // Sales Entity create endpoints these depend on are deployed, a portal built
 // against them must fail loudly instead of writing one system and not the

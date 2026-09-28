@@ -21,6 +21,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
@@ -31,6 +32,8 @@ import (
 // stubIncidentRepo (incident_service_test.go).
 type stubProblemRepo struct {
 	createProblemFromServiceNow func(ctx context.Context, req domain.CreateProblemRequest, id, number, createdBy string, state *string) (domain.ProblemDetail, error)
+	getProblem                  func(ctx context.Context, id string) (domain.ProblemDetail, error)
+	updateProblemFields         func(ctx context.Context, req domain.UpdateProblemRequest, actorEmail string) (time.Time, error)
 }
 
 func (s *stubProblemRepo) SearchProblems(context.Context, domain.SearchProblemsRequest, []string, []string) ([]domain.SearchProblemView, int, error) {
@@ -39,7 +42,10 @@ func (s *stubProblemRepo) SearchProblems(context.Context, domain.SearchProblemsR
 func (s *stubProblemRepo) AggregateProblems(context.Context, domain.SearchProblemsRequest, []string, []string, string, int) (domain.AggregateResponse, error) {
 	panic("not implemented")
 }
-func (s *stubProblemRepo) GetProblem(context.Context, string) (domain.ProblemDetail, error) {
+func (s *stubProblemRepo) GetProblem(ctx context.Context, id string) (domain.ProblemDetail, error) {
+	if s.getProblem != nil {
+		return s.getProblem(ctx, id)
+	}
 	panic("not implemented")
 }
 func (s *stubProblemRepo) CreateProblemFromServiceNow(ctx context.Context, req domain.CreateProblemRequest, id, number, createdBy string, state *string) (domain.ProblemDetail, error) {
@@ -48,19 +54,31 @@ func (s *stubProblemRepo) CreateProblemFromServiceNow(ctx context.Context, req d
 	}
 	panic("CreateProblemFromServiceNow called unexpectedly: Postgres must stay untouched when ServiceNow never accepts the problem")
 }
+func (s *stubProblemRepo) UpdateProblemFields(ctx context.Context, req domain.UpdateProblemRequest, actorEmail string) (time.Time, error) {
+	if s.updateProblemFields != nil {
+		return s.updateProblemFields(ctx, req, actorEmail)
+	}
+	panic("not implemented")
+}
 
 // stubMirrorProblemService embeds ProblemService (nil) and overrides only
-// CreateProblem -- same convention as stubMirrorIncidentService
+// CreateProblem/UpdateProblem -- same convention as stubMirrorIncidentService
 // (incident_service_test.go). Any other method being called would panic on
 // the nil embedded interface, which is the point: this pilot's problem mode
-// only ever calls the mirror's CreateProblem.
+// only ever calls the mirror's CreateProblem (synchronously) and
+// UpdateProblem (via the async writeback dispatch).
 type stubMirrorProblemService struct {
 	ProblemService
 	createProblem func(ctx context.Context, req domain.CreateProblemRequest) (domain.ProblemDetail, error)
+	updateProblem func(ctx context.Context, req domain.UpdateProblemRequest) (domain.UpdateProblemResponse, error)
 }
 
 func (s *stubMirrorProblemService) CreateProblem(ctx context.Context, req domain.CreateProblemRequest) (domain.ProblemDetail, error) {
 	return s.createProblem(ctx, req)
+}
+
+func (s *stubMirrorProblemService) UpdateProblem(ctx context.Context, req domain.UpdateProblemRequest) (domain.UpdateProblemResponse, error) {
+	return s.updateProblem(ctx, req)
 }
 
 func validCreateProblemRequest() domain.CreateProblemRequest {
@@ -90,7 +108,7 @@ func TestProblemService_CreateProblem_SNFailureLeavesPostgresUntouched(t *testin
 	// it's ever called, which is exactly the assertion: Postgres must stay
 	// untouched.
 	repo := &stubProblemRepo{}
-	svc := NewProblemServiceWithSNMirror(repo, mirror)
+	svc := NewProblemServiceWithSNMirror(repo, mirror, nil)
 
 	_, err := svc.CreateProblem(ctx, validCreateProblemRequest())
 	if err == nil {
@@ -141,7 +159,7 @@ func TestProblemService_CreateProblem_SNSuccessCreatesPostgresRowWithMatchingIde
 			return domain.ProblemDetail{ID: &id, Number: &number, State: state}, nil
 		},
 	}
-	svc := NewProblemServiceWithSNMirror(repo, mirror)
+	svc := NewProblemServiceWithSNMirror(repo, mirror, nil)
 
 	resp, err := svc.CreateProblem(ctx, validCreateProblemRequest())
 	if err != nil {
@@ -181,7 +199,7 @@ func TestProblemService_CreateProblem_DoesNotRetryValidationError(t *testing.T) 
 		},
 	}
 	repo := &stubProblemRepo{}
-	svc := NewProblemServiceWithSNMirror(repo, mirror)
+	svc := NewProblemServiceWithSNMirror(repo, mirror, nil)
 
 	_, err := svc.CreateProblem(ctx, validCreateProblemRequest())
 	var ve *apierror.ValidationError
@@ -212,7 +230,7 @@ func TestProblemService_CreateProblem_MissingUserIDTokenRejected(t *testing.T) {
 		},
 	}
 	repo := &stubProblemRepo{}
-	svc := NewProblemServiceWithSNMirror(repo, mirror)
+	svc := NewProblemServiceWithSNMirror(repo, mirror, nil)
 
 	_, err := svc.CreateProblem(ctx, validCreateProblemRequest())
 	if _, ok := err.(*apierror.UnauthorizedError); !ok {
@@ -220,5 +238,218 @@ func TestProblemService_CreateProblem_MissingUserIDTokenRejected(t *testing.T) {
 	}
 	if mirrorCalled {
 		t.Error("ServiceNow must not be called when the caller's identity cannot be resolved")
+	}
+}
+
+// TestProblemService_UpdateProblem_UnsupportedOnPlainDataSource guards the
+// plain-PostgreSQL-only path: with no snWriteback (as NewProblemService
+// constructs), UpdateProblem must still 503, exactly as the original stub
+// always did.
+func TestProblemService_UpdateProblem_UnsupportedOnPlainDataSource(t *testing.T) {
+	svc := NewProblemService(&stubProblemRepo{})
+	causeNotes := "root cause found"
+	_, err := svc.UpdateProblem(context.Background(), domain.UpdateProblemRequest{ID: testDeploymentUUID, CauseNotes: &causeNotes})
+	var se *apierror.ServiceUnavailableError
+	if !errors.As(err, &se) {
+		t.Fatalf("expected *apierror.ServiceUnavailableError, got %T: %v", err, err)
+	}
+}
+
+// TestProblemService_UpdateProblem_TransitionRejected and
+// TestProblemService_UpdateProblem_AssignmentGroupIDRejected guard the two
+// fields with nowhere to write them: Transition (ServiceNow's workflow
+// engine owns transition validation, no fixed rule set to reimplement) and
+// AssignmentGroupID (no CMDB/assignment-group table anywhere in this
+// schema). Both must be rejected before ever reaching the repository or the
+// mirror.
+func TestProblemService_UpdateProblem_TransitionRejected(t *testing.T) {
+	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
+	svc := NewProblemServiceWithSNMirror(&stubProblemRepo{}, &stubMirrorProblemService{}, dispatcher)
+
+	transition := "assess"
+	_, err := svc.UpdateProblem(context.Background(), domain.UpdateProblemRequest{ID: testDeploymentUUID, Transition: &transition})
+	var ve *apierror.ValidationError
+	if !asValidationError(err, &ve) {
+		t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
+	}
+}
+
+func TestProblemService_UpdateProblem_AssignmentGroupIDRejected(t *testing.T) {
+	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
+	svc := NewProblemServiceWithSNMirror(&stubProblemRepo{}, &stubMirrorProblemService{}, dispatcher)
+
+	groupID := testUUID
+	_, err := svc.UpdateProblem(context.Background(), domain.UpdateProblemRequest{ID: testDeploymentUUID, AssignmentGroupID: &groupID})
+	var ve *apierror.ValidationError
+	if !asValidationError(err, &ve) {
+		t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
+	}
+}
+
+// TestProblemService_UpdateProblem_AtLeastOneFieldRequired guards the
+// "nothing to do" rejection: a request setting none of the 5 supported
+// fields (and neither of the 2 rejected ones) must fail validation rather
+// than silently no-op a write.
+func TestProblemService_UpdateProblem_AtLeastOneFieldRequired(t *testing.T) {
+	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
+	svc := NewProblemServiceWithSNMirror(&stubProblemRepo{}, &stubMirrorProblemService{}, dispatcher)
+
+	_, err := svc.UpdateProblem(context.Background(), domain.UpdateProblemRequest{ID: testDeploymentUUID})
+	var ve *apierror.ValidationError
+	if !asValidationError(err, &ve) {
+		t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
+	}
+}
+
+// TestProblemService_UpdateProblem_WritesOnlyNonNilFields covers the
+// dynamic-SET partial-update contract: only the fields actually set on the
+// request must reach ProblemRepository.UpdateProblemFields, and the mirror
+// dispatch must carry that same narrow set (never a raw forward of req).
+func TestProblemService_UpdateProblem_WritesOnlyNonNilFields(t *testing.T) {
+	var gotUpdateReq domain.UpdateProblemRequest
+	var gotActorEmail string
+	updatedOn := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	repo := &stubProblemRepo{
+		updateProblemFields: func(_ context.Context, req domain.UpdateProblemRequest, actorEmail string) (time.Time, error) {
+			gotUpdateReq = req
+			gotActorEmail = actorEmail
+			return updatedOn, nil
+		},
+		getProblem: func(_ context.Context, id string) (domain.ProblemDetail, error) {
+			return domain.ProblemDetail{ID: &id}, nil
+		},
+	}
+
+	mirrorCalled := make(chan domain.UpdateProblemRequest, 1)
+	mirror := &stubMirrorProblemService{
+		updateProblem: func(_ context.Context, req domain.UpdateProblemRequest) (domain.UpdateProblemResponse, error) {
+			mirrorCalled <- req
+			return domain.UpdateProblemResponse{}, nil
+		},
+	}
+	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
+	svc := NewProblemServiceWithSNMirror(repo, mirror, dispatcher)
+
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	fixNotes := "applied patch"
+	resp, err := svc.UpdateProblem(ctx, domain.UpdateProblemRequest{ID: testDeploymentUUID, FixNotes: &fixNotes})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Problem.ID == nil || *resp.Problem.ID != testDeploymentUUID {
+		t.Errorf("response problem ID = %v, want %q", resp.Problem.ID, testDeploymentUUID)
+	}
+	if resp.Problem.UpdatedBy == nil || *resp.Problem.UpdatedBy != "jane.doe@example.com" {
+		t.Errorf("response UpdatedBy = %v, want %q", resp.Problem.UpdatedBy, "jane.doe@example.com")
+	}
+
+	if gotUpdateReq.ID != testDeploymentUUID || gotUpdateReq.FixNotes == nil || *gotUpdateReq.FixNotes != fixNotes {
+		t.Errorf("UpdateProblemFields got %+v, want ID=%q FixNotes=%q", gotUpdateReq, testDeploymentUUID, fixNotes)
+	}
+	if gotUpdateReq.CauseNotes != nil || gotUpdateReq.Workaround != nil || gotUpdateReq.TargetResolutionDate != nil || gotUpdateReq.AssignedToID != nil {
+		t.Errorf("UpdateProblemFields got extra fields set: %+v, want only FixNotes", gotUpdateReq)
+	}
+	if gotActorEmail != "jane.doe@example.com" {
+		t.Errorf("UpdateProblemFields actorEmail = %q, want %q", gotActorEmail, "jane.doe@example.com")
+	}
+
+	select {
+	case mirrorReq := <-mirrorCalled:
+		if mirrorReq.ID != testDeploymentUUID {
+			t.Errorf("mirror got ID %q, want %q", mirrorReq.ID, testDeploymentUUID)
+		}
+		if mirrorReq.FixNotes == nil || *mirrorReq.FixNotes != fixNotes {
+			t.Errorf("mirror got FixNotes %v, want %q", mirrorReq.FixNotes, fixNotes)
+		}
+		if mirrorReq.CauseNotes != nil || mirrorReq.Workaround != nil || mirrorReq.TargetResolutionDate != nil || mirrorReq.AssignedToID != nil {
+			t.Errorf("mirror got extra fields set: %+v, want only ID+FixNotes", mirrorReq)
+		}
+		if mirrorReq.Transition != nil || mirrorReq.AssignmentGroupID != nil {
+			t.Errorf("mirror got Transition/AssignmentGroupID set: %+v, want both nil", mirrorReq)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mirror.UpdateProblem was never called")
+	}
+}
+
+// TestProblemService_UpdateProblem_InvalidTargetResolutionDateRejected
+// guards the RFC3339 validation on TargetResolutionDate: a malformed value
+// must be rejected before any repository write is attempted.
+func TestProblemService_UpdateProblem_InvalidTargetResolutionDateRejected(t *testing.T) {
+	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
+	svc := NewProblemServiceWithSNMirror(&stubProblemRepo{}, &stubMirrorProblemService{}, dispatcher)
+
+	bad := "not-a-date"
+	_, err := svc.UpdateProblem(contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com")), domain.UpdateProblemRequest{ID: testDeploymentUUID, TargetResolutionDate: &bad})
+	var ve *apierror.ValidationError
+	if !asValidationError(err, &ve) {
+		t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
+	}
+}
+
+// TestProblemService_UpdateProblem_MirrorNotConfiguredReturnsUnavailable
+// guards the s.snWriteback == nil branch specifically via
+// NewProblemServiceWithSNMirror(nil dispatcher) -- distinct from
+// TestProblemService_UpdateProblem_UnsupportedOnPlainDataSource, which uses
+// NewProblemService (no snMirror at all). Both must produce the same
+// ServiceUnavailableError.
+func TestProblemService_UpdateProblem_MirrorNotConfiguredReturnsUnavailable(t *testing.T) {
+	svc := NewProblemServiceWithSNMirror(&stubProblemRepo{}, &stubMirrorProblemService{}, nil)
+
+	causeNotes := "root cause found"
+	_, err := svc.UpdateProblem(context.Background(), domain.UpdateProblemRequest{ID: testDeploymentUUID, CauseNotes: &causeNotes})
+	var se *apierror.ServiceUnavailableError
+	if !errors.As(err, &se) {
+		t.Fatalf("expected *apierror.ServiceUnavailableError, got %T: %v", err, err)
+	}
+}
+
+// TestProblemService_UpdateProblem_MirrorDispatchedEvenWhenReReadFails is
+// the CodeRabbit-flagged regression guard on PR #2042: UpdateProblemFields
+// has already committed the Postgres write by the time GetProblem runs, so
+// a re-read failure must NOT skip the ServiceNow mirror dispatch. Skipping
+// it would mean the caller gets an error for a write that actually
+// succeeded, ServiceNow never gets the update, and -- since
+// s.snWriteback.Dispatch itself would never have been called -- nothing
+// would even land in sn_writeback_failures to flag the drift. This asserts
+// the mirror fires (checked via the channel) even though GetProblem returns
+// an error and UpdateProblem itself therefore also returns an error.
+func TestProblemService_UpdateProblem_MirrorDispatchedEvenWhenReReadFails(t *testing.T) {
+	repo := &stubProblemRepo{
+		updateProblemFields: func(context.Context, domain.UpdateProblemRequest, string) (time.Time, error) {
+			return time.Now(), nil
+		},
+		getProblem: func(context.Context, string) (domain.ProblemDetail, error) {
+			return domain.ProblemDetail{}, errors.New("re-read: connection reset")
+		},
+	}
+
+	mirrorCalled := make(chan domain.UpdateProblemRequest, 1)
+	mirror := &stubMirrorProblemService{
+		updateProblem: func(_ context.Context, req domain.UpdateProblemRequest) (domain.UpdateProblemResponse, error) {
+			mirrorCalled <- req
+			return domain.UpdateProblemResponse{}, nil
+		},
+	}
+	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
+	svc := NewProblemServiceWithSNMirror(repo, mirror, dispatcher)
+
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	fixNotes := "applied patch"
+	_, err := svc.UpdateProblem(ctx, domain.UpdateProblemRequest{ID: testDeploymentUUID, FixNotes: &fixNotes})
+	if err == nil {
+		t.Fatal("expected an error surfaced from the failed post-write re-read")
+	}
+
+	select {
+	case mirrorReq := <-mirrorCalled:
+		if mirrorReq.ID != testDeploymentUUID {
+			t.Errorf("mirror got ID %q, want %q", mirrorReq.ID, testDeploymentUUID)
+		}
+		if mirrorReq.FixNotes == nil || *mirrorReq.FixNotes != fixNotes {
+			t.Errorf("mirror got FixNotes %v, want %q", mirrorReq.FixNotes, fixNotes)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mirror.UpdateProblem was never called despite the Postgres write succeeding -- the re-read failure must not skip the mirror dispatch")
 	}
 }
