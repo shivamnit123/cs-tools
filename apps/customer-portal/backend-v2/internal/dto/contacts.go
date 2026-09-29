@@ -53,6 +53,11 @@ type Contact struct {
 	IsSecurityContact   bool            `json:"isSecurityContact"`
 	MembershipStatus    *string         `json:"membershipStatus,omitempty"`
 	Account             *ContactAccount `json:"account,omitempty"`
+	// CanResendInvitation is set only on database-backed rows
+	// (CSM_MIGRATION_PORTAL_CONTACTS_ENABLED) whose invitation is still
+	// outstanding, so the webapp shows the resend action exactly when
+	// POST .../resend-invitation can succeed. It is never set before cutover.
+	CanResendInvitation bool `json:"canResendInvitation,omitempty"`
 }
 
 // MapContact builds the portal response from a usermanagement.Contact.

@@ -21,9 +21,9 @@ shutdown_grace = "25s"
 # After SIGTERM, /healthz answers 503 for this long before the listener closes.
 drain_delay = "5s"
 # How long a request waits for its ids, and how long in-flight requests get on shutdown.
-request_wait = "8s"
+request_wait = "10s"
 # The allocator's own time to claim and write what is queued, even if requests overran.
-allocator_drain = "7s"
+allocator_drain = "10s"
 read_timeout = "10s"
 write_timeout = "30s"
 # Keep-alive connections idle this long are closed.
@@ -38,23 +38,29 @@ mode = "none"
 [allocator]
 # Alerts waiting to be claimed; when full, new webhooks get 503 immediately.
 queue_size = 5000
+# Memory cap on everything accepted but not finished; new webhooks get 503 when full.
+# Keep it about half the container memory limit.
+queue_max_bytes = 268435456
 # Max alerts claimed with a single compare-and-set on alert_seq.
 max_batch = 200
-# Parallel row writers per replica.
-write_concurrency = 64
+# Parallel row writers per replica; ids are only claimed for free writers.
+write_concurrency = 16
 # Compare-and-set attempts per batch before its requests fail with 503.
 claim_max_attempts = 20
 
 [store]
-# Insert attempts on the same id before writing a filler row.
-insert_attempts = 3
-# Delay before the second attempt; doubles each time (100ms, then 200ms).
-insert_base_delay = "100ms"
+# Attempts on the same id for errors other than throttling, before the filler row.
+insert_attempts = 5
+# Delay before the second attempt; doubles each time (250ms, 500ms, 1s, 2s).
+insert_base_delay = "250ms"
 # Per-query timeout for row inserts and read-backs.
 query_timeout = "1.5s"
 # Timeout for the alert_seq read and compare-and-set; longer, so a slow claim isn't mistaken
 # for a failure that may leave claimed ids without rows.
 claim_timeout = "5s"
+# How long, from the claim, a throttled write keeps retrying before the filler row.
+# Must stay under alerts-core's gap_timeout (10m).
+write_deadline = "5m"
 
 [cassandra]
 # Startup connection retry, so a transient blip doesn't crash-loop the pod.

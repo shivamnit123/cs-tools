@@ -884,7 +884,7 @@ func (r *caseRepo) GetCaseByID(ctx context.Context, id string, scope SearchScope
 		ackID, ackName, ackEmail                 *string
 		pcID, pcNum, pcType                      *string
 		rcID, rcNum                              *string
-		accountID, accountName                   *string
+		accountID, accountName, accountTier      *string
 		severity, issueType, workState, caseType *string
 		announcementType                         *string
 		state, cause, closeNotes, resolutionCode *string
@@ -922,7 +922,7 @@ func (r *caseRepo) GetCaseByID(ctx context.Context, id string, scope SearchScope
 		        d.id, d.name,
 		        dp.id, prod.name || COALESCE(' ' || pv.version, ''),
 		        prod.id, prod.name,
-		        a.id, a.name,
+		        a.id, a.name, a.support_tier::TEXT,
 		        cre.id, cre.name, sre.id, sre.name,
 		        ae.id, COALESCE(ae.name, NULLIF(TRIM(CONCAT_WS(' ', ae.first_name, ae.last_name)), '')), ae.email,
 		        ack.id, COALESCE(ack.name, NULLIF(TRIM(CONCAT_WS(' ', ack.first_name, ack.last_name)), '')), ack.email,
@@ -958,7 +958,7 @@ func (r *caseRepo) GetCaseByID(ctx context.Context, id string, scope SearchScope
 		&depID, &depName,
 		&dpID, &dpDisplayName,
 		&prodID, &prodName,
-		&accountID, &accountName,
+		&accountID, &accountName, &accountTier,
 		&creTeamID, &creTeamName, &sreTeamID, &sreTeamName,
 		&aeID, &aeName, &aeEmail,
 		&ackID, &ackName, &ackEmail,
@@ -1067,13 +1067,13 @@ func (r *caseRepo) GetCaseByID(ctx context.Context, id string, scope SearchScope
 		if accountName != nil {
 			name = *accountName
 		}
-		// Type (support tier) has no real column anywhere in the migrations
-		// -- account has no tier-like column at all -- so it is left "".
-		// CreTeam/SreTeam are account.cre_team_id/sre_team_id (migration
-		// 000074, ex-integration_cs_team_id), real FKs into "group" now --
-		// see accountSelectColumns' own comment in account_repo.go for the
-		// same join, added for the dedicated /accounts endpoint.
-		accountRef := &domain.AccountRef{ID: *accountID, Name: name}
+		// Type (support tier) is account.support_tier (migration 0101,
+		// BASIC/ENTERPRISE), same column GetProjectByID already reads into
+		// ProjectAccountRef.Tier. CreTeam/SreTeam are account.cre_team_id/
+		// sre_team_id, real FKs into "group" -- see accountSelectColumns' own
+		// comment in account_repo.go for the same join, added for the
+		// dedicated /accounts endpoint.
+		accountRef := &domain.AccountRef{ID: *accountID, Name: name, Type: stringOrEmpty(accountTier)}
 		if creTeamID != nil {
 			accountRef.CreTeam = &domain.EntityRef{ID: *creTeamID, Name: stringOrEmpty(creTeamName)}
 		}

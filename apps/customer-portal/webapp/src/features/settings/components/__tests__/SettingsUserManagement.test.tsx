@@ -14,7 +14,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import SettingsUserManagementComponent from "@features/settings/components/SettingsUserManagement";
@@ -32,6 +32,8 @@ function SettingsUserManagement(props: { projectId: string }) {
 const DEFAULT_CONTACTS = [{ id: "1", email: "user@test.dev", membershipStatus: "Active" }];
 // The contact list each test sees; tests replace it before rendering.
 const contactsState = vi.hoisted(() => ({ data: [] as unknown[] }));
+const resendMutate = vi.hoisted(() => vi.fn());
+const { showSuccess, showError } = vi.hoisted(() => ({ showSuccess: vi.fn(), showError: vi.fn() }));
 
 vi.mock("@features/settings/api/useGetProjectContacts", () => ({
   default: () => ({
@@ -49,14 +51,17 @@ vi.mock("@features/settings/api/usePostProjectContact", () => ({
 vi.mock("@features/settings/api/useDeleteProjectContact", () => ({
   useDeleteProjectContact: () => ({ mutate: vi.fn(), isPending: false }),
 }));
+vi.mock("@features/settings/api/useResendProjectContactInvitation", () => ({
+  useResendProjectContactInvitation: () => ({ mutateAsync: resendMutate, isPending: false }),
+}));
 vi.mock("@features/settings/api/usePatchProjectContact", () => ({
   usePatchProjectContact: () => ({ mutate: vi.fn(), isPending: false }),
 }));
 vi.mock("@context/error-banner/ErrorBannerContext", () => ({
-  useErrorBanner: () => ({ showError: vi.fn() }),
+  useErrorBanner: () => ({ showError }),
 }));
 vi.mock("@context/success-banner/SuccessBannerContext", () => ({
-  useSuccessBanner: () => ({ showSuccess: vi.fn() }),
+  useSuccessBanner: () => ({ showSuccess }),
 }));
 vi.mock("@features/settings/components/AddUserModal", () => ({
   default: ({ open, onSubmit }: { open: boolean; onSubmit: (r: unknown) => void }) =>
@@ -92,6 +97,9 @@ vi.mock("@features/settings/components/RemoveUserModal", () => ({
 
 describe("SettingsUserManagement", () => {
   beforeEach(() => {
+    resendMutate.mockReset();
+    showSuccess.mockClear();
+    showError.mockClear();
     resetPendingInvitesForTests();
     contactsState.data = DEFAULT_CONTACTS;
   });
@@ -139,6 +147,75 @@ describe("SettingsUserManagement", () => {
       fireEvent.click(within(row).getByRole("button", { name: "Retry invitation" }));
     });
     expect(within(screen.getByTestId("pending-invite-new@acme.com")).getByText("Inviting…")).toBeInTheDocument();
+  });
+
+  it("offers a resend only on rows the backend marks as resendable, behind a confirmation", async () => {
+    contactsState.data = [
+      { id: "c-1", email: "invited@acme.com", firstName: "Ina", lastName: "Vite", membershipStatus: "INVITED", canResendInvitation: true },
+      { id: "c-2", email: "registered@acme.com", membershipStatus: "REGISTERED" },
+      // A pre-cutover row never carries the flag, even while INVITED.
+      { id: "c-3", email: "legacy@acme.com", membershipStatus: "INVITED" },
+    ];
+    resendMutate.mockResolvedValueOnce(undefined);
+    render(<SettingsUserManagement projectId="p-1" />);
+
+    const buttons = screen.getAllByRole("button", { name: "Resend invitation" });
+    expect(buttons).toHaveLength(1);
+
+    // The row button only asks; nothing is sent yet.
+    fireEvent.click(buttons[0]);
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText("Resend Invitation")).toBeInTheDocument();
+    expect(within(dialog).getByText("Ina Vite")).toBeInTheDocument();
+    expect(dialog).toHaveTextContent("(invited@acme.com)");
+    expect(resendMutate).not.toHaveBeenCalled();
+
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Yes, Resend" }));
+    });
+    expect(resendMutate).toHaveBeenCalledWith("invited@acme.com");
+    expect(showSuccess).toHaveBeenCalledWith("Invitation resent to invited@acme.com");
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  });
+
+  it("sends nothing when the resend confirmation is cancelled", async () => {
+    contactsState.data = [
+      { id: "c-1", email: "invited@acme.com", membershipStatus: "INVITED", canResendInvitation: true },
+    ];
+    render(<SettingsUserManagement projectId="p-1" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Resend invitation" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Cancel" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(resendMutate).not.toHaveBeenCalled();
+  });
+
+  it("keeps the confirmation busy until the resend finishes, then reports its outcome", async () => {
+    contactsState.data = [
+      { id: "c-1", email: "a@acme.com", membershipStatus: "INVITED", canResendInvitation: true },
+    ];
+    let failA: (e: Error) => void = () => {};
+    resendMutate.mockReturnValueOnce(new Promise<void>((_, reject) => { failA = reject; }));
+    render(<SettingsUserManagement projectId="p-1" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Resend invitation" }));
+    const dialog = screen.getByRole("dialog");
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Yes, Resend" }));
+    });
+    expect(within(dialog).getByRole("button", { name: /Resending/ })).toBeDisabled();
+    expect(within(dialog).getByRole("button", { name: "Cancel" })).toBeDisabled();
+    // The row's own button stays disabled while its resend runs (the page
+    // behind the modal is aria-hidden, hence hidden: true).
+    expect(screen.getByRole("button", { name: "Resend invitation", hidden: true })).toBeDisabled();
+
+    await act(async () => {
+      failA(new Error("An invitation was sent a few minutes ago. Please try again later."));
+    });
+    expect(showError).toHaveBeenCalledWith("An invitation was sent a few minutes ago. Please try again later.");
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Resend invitation" })).not.toBeDisabled();
   });
 
   describe("pagination", () => {

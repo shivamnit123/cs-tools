@@ -136,11 +136,12 @@ type IncidentRepository interface {
 	// "DOS/ DDOS"), which has no established mapping back from
 	// domain.IncidentSubcategory's enum spelling (e.g. IP_ADDRESS,
 	// DOS_DDOS) anywhere in this codebase yet -- same class of gap as
-	// incidentWhereClause's already-documented assignmentGroupId/productName
-	// "accepted but not applied" fields. req.ConfigurationItemID and
-	// req.AssignmentGroupID are also not applied, for the same
-	// no-backing-column reason UpdateIncident's own doc comment already
-	// gives.
+	// incidentWhereClause's already-documented productName "accepted but
+	// not applied" field. req.ConfigurationItemID is also not applied, for
+	// the same no-backing-column reason UpdateIncident's own doc comment
+	// already gives. req.AssignmentGroupID, by contrast, DOES have a
+	// backing column (work_item.assignment_group_id, migration 0075) and
+	// IS written here.
 	CreateIncidentFromServiceNow(ctx context.Context, req domain.CreateIncidentRequest, id, number, createdBy string) (domain.CreateIncidentResponse, error)
 }
 
@@ -741,11 +742,11 @@ const createIncidentFromServiceNowQuery = `
 	WITH inserted_work_item AS (
 		INSERT INTO work_item (
 			id, created_on, updated_on, created_by, updated_by,
-			number, subject, type, parent_id
+			number, subject, type, parent_id, assignment_group_id
 		)
 		VALUES (
 			$1, NOW(), NOW(), $2, $2,
-			$3, $4, 'INCIDENT'::work_item_type_enum, $5::uuid
+			$3, $4, 'INCIDENT'::work_item_type_enum, $5::uuid, $6::uuid
 		)
 		RETURNING id, number, subject, created_on, updated_on, created_by
 	),
@@ -757,10 +758,10 @@ const createIncidentFromServiceNowQuery = `
 			opened_on, correlation_id, environment
 		)
 		VALUES (
-			$1, $6::uuid, $7::incident_category_enum, $8::incident_impact_enum, $9::incident_urgency_enum,
-			$10::uuid, $11::uuid, $12::incident_contact_type_enum,
-			$13::uuid, $14::uuid, $15::uuid, $16::uuid,
-			NOW(), $17, $18
+			$1, $7::uuid, $8::incident_category_enum, $9::incident_impact_enum, $10::incident_urgency_enum,
+			$11::uuid, $12::uuid, $13::incident_contact_type_enum,
+			$14::uuid, $15::uuid, $16::uuid, $17::uuid,
+			NOW(), $18, $19
 		)
 		RETURNING id
 	)
@@ -782,7 +783,7 @@ func (r *incidentRepo) CreateIncidentFromServiceNow(ctx context.Context, req dom
 	)
 	err := r.db.QueryRow(ctx, createIncidentFromServiceNowQuery,
 		id, createdBy,
-		number, req.Subject, req.ParentID,
+		number, req.Subject, req.ParentID, req.AssignmentGroupID,
 		req.CallerID, string(req.Category), string(req.Impact), string(req.Urgency),
 		req.ServiceID, req.ServiceOfferingID, contactType,
 		req.ChangeRequestID, req.CausedByID, req.ParentIncidentID, req.ProblemID,

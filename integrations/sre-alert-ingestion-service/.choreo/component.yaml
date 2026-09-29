@@ -17,10 +17,82 @@
 schemaVersion: 1.2
 
 endpoints:
-  - name: sre-alert-api
-    displayName: SRE Alert API
+  - name: aws-alerts
+    displayName: SRE Alert API - AWS
     service:
-      basePath: /api/wso2/v1/sre_alert_api
+      basePath: /api/wso2/v1/sre_alert_api/aws
+      port: 8080
+    type: REST
+    networkVisibilities:
+      - Public
+  - name: azure-alerts
+    displayName: SRE Alert API - Azure
+    service:
+      basePath: /api/wso2/v1/sre_alert_api/azure
+      port: 8080
+    type: REST
+    networkVisibilities:
+      - Public
+  - name: datadog-alerts
+    displayName: SRE Alert API - Datadog
+    service:
+      basePath: /api/wso2/v1/sre_alert_api/datadog
+      port: 8080
+    type: REST
+    networkVisibilities:
+      - Public
+  - name: elasticsearch-alerts
+    displayName: SRE Alert API - Elasticsearch
+    service:
+      basePath: /api/wso2/v1/sre_alert_api/elasticsearch
+      port: 8080
+    type: REST
+    networkVisibilities:
+      - Public
+  - name: gcp-alerts
+    displayName: SRE Alert API - GCP
+    service:
+      basePath: /api/wso2/v1/sre_alert_api/gcp
+      port: 8080
+    type: REST
+    networkVisibilities:
+      - Public
+  - name: icinga-alerts
+    displayName: SRE Alert API - Icinga
+    service:
+      basePath: /api/wso2/v1/sre_alert_api/icinga
+      port: 8080
+    type: REST
+    networkVisibilities:
+      - Public
+  - name: openobserve-alerts
+    displayName: SRE Alert API - OpenObserve
+    service:
+      basePath: /api/wso2/v1/sre_alert_api/openobserve
+      port: 8080
+    type: REST
+    networkVisibilities:
+      - Public
+  - name: opensearch-alerts
+    displayName: SRE Alert API - OpenSearch
+    service:
+      basePath: /api/wso2/v1/sre_alert_api/opensearch
+      port: 8080
+    type: REST
+    networkVisibilities:
+      - Public
+  - name: prometheus-alerts
+    displayName: SRE Alert API - Prometheus
+    service:
+      basePath: /api/wso2/v1/sre_alert_api/prometheus
+      port: 8080
+    type: REST
+    networkVisibilities:
+      - Public
+  - name: site24x7-alerts
+    displayName: SRE Alert API - Site24x7
+    service:
+      basePath: /api/wso2/v1/sre_alert_api/site24x7
       port: 8080
     type: REST
     networkVisibilities:

@@ -18,6 +18,7 @@ package middleware
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 )
@@ -56,7 +57,7 @@ func Recovery(next http.Handler) http.Handler {
 		rw := &recoveryWriter{ResponseWriter: w}
 		defer func() {
 			if rec := recover(); rec != nil {
-				log.Printf("panic recovered correlationID=%s value=%v (type: %T)", CorrelationIDFromContext(r.Context()), rec, rec)
+				log.Printf("panic recovered correlationID=%s value=%s (type: %T)", CorrelationIDFromContext(r.Context()), sanitizePath(fmt.Sprintf("%v", rec)), rec) // #nosec G706 -- panic value sanitized
 				if !rw.headerWritten {
 					rw.ResponseWriter.Header().Set("Content-Type", "application/json")
 					rw.ResponseWriter.WriteHeader(http.StatusInternalServerError)

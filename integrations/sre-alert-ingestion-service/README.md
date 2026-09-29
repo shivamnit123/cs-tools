@@ -20,9 +20,16 @@ vendor ──POST──▶ ingestion (transform → allocator: CAS-claim ids →
 - **Ids**: every replica claims ranges of ids from the `alert_seq` row with a lightweight
   transaction (compare-and-set), so ids never repeat across replicas. One claim covers everything
   queued at that moment (up to `allocator.max_batch`), so a burst costs a handful of transactions.
-- **Writes**: each alert is inserted, then read back. After `store.insert_attempts` failures a
-  `VOID: <reason>` filler row is written (with the same retries) under the same id so alerts-core skips it immediately
-  instead of waiting its 10-minute gap timeout, and a DB-failure Chat card is posted.
+  Ids are only claimed for alerts that have a free writer (`allocator.write_concurrency`); the
+  rest wait in the queue, unclaimed.
+- **Writes**: each alert is inserted, then read back. When Cosmos DB throttles ("Request rate is
+  large"), the write is retried on the same id after the delay Cosmos asks for, until
+  `store.write_deadline` (5m from the claim); throttling doesn't use up `store.insert_attempts`.
+  After the deadline, or `store.insert_attempts` other failures, a `VOID: <reason>` filler row is
+  written under the same id so alerts-core skips it immediately instead of waiting its gap
+  timeout, and a DB-failure Chat card is posted.
+- **Memory**: everything accepted but not finished is capped at `allocator.queue_max_bytes`; past
+  it, new webhooks get `503` at once.
 - **Response**: `201` only after every alert in the request has been written and read back.
 - **Wake-up**: one `POST /alert` to alerts-core per written batch. Calls are coalesced so at most
   one is in flight. If it fails, alerts-core's own 10-second poll still picks the rows up.
@@ -117,19 +124,25 @@ default and a comment. The main knobs:
 |---|---|---|
 | `server.shutdown_grace` | `25s` | Total SIGTERM budget; must cover the three below |
 | `server.drain_delay` | `5s` | `/healthz` answers `503` this long before the listener closes |
-| `server.request_wait` | `8s` | A request waits this long for its ids, then gets `503`; also in-flight requests' time on shutdown |
-| `server.allocator_drain` | `7s` | The allocator's own time on shutdown to write everything already claimed |
+| `server.request_wait` | `10s` | A request waits this long for its ids, then gets `503`; also in-flight requests' time on shutdown |
+| `server.allocator_drain` | `10s` | The allocator's own time on shutdown to write everything already claimed |
 | `server.write_timeout` | `30s` | Connection write limit; must be at least 1s above `request_wait` |
 | `server.idle_timeout` | `60s` | Idle keep-alive connections are closed after this |
 | `server.max_body_bytes` | `1048576` | Larger bodies get `413` |
 | `auth.mode` | `none` | Hook for vendor authentication; only `none` exists today |
 | `allocator.queue_size` | `5000` | Queued submissions per replica before `503` |
+| `allocator.queue_max_bytes` | `268435456` | Memory cap (256 MiB) on accepted, unfinished alerts before `503`; about half the container memory limit |
 | `allocator.max_batch` | `200` | Most ids claimed in one compare-and-set |
-| `allocator.write_concurrency` | `64` | Parallel inserts per replica |
-| `store.insert_attempts` | `3` | Insert + read-back attempts before the filler row |
+| `allocator.write_concurrency` | `16` | Parallel inserts per replica; ids are only claimed for free writers |
+| `store.insert_attempts` | `5` | Attempts for errors other than throttling before the filler row (`insert_base_delay` 250ms, doubling) |
+| `store.write_deadline` | `5m` | How long, from the claim, a throttled write keeps retrying; must stay under alerts-core's `gap_timeout` (10m) |
 | `store.claim_timeout` | `5s` | Timeout for the `alert_seq` read and compare-and-set (inserts use `store.query_timeout`, 1.5s) |
 | `reject.window` | `15m` | Rejected-webhook card window: one per vendor + error class, 10 in total, per replica |
 | `fallback.cards_per_minute` | `5` | DB-failure cards per minute, per replica, before summarising |
+
+**Why `write_deadline` is under 10 minutes:** alerts-core skips an id that stays missing for its
+`gap_timeout` (10m). A write still retrying past that would land after alerts-core gave up on the
+id, and the alert would be silently ignored. Stopping at 5m leaves time for the filler row.
 
 ## Example requests
 
@@ -174,7 +187,11 @@ curl -sS -X POST "$BASE/site24x7" -H 'Content-Type: application/json' -d '{"STAT
    `integrations/sre-alert-ingestion-service` and the Dockerfile build preset. The Dockerfile runs the
    tests, builds a static binary and runs it as user `10014`.
 2. **Endpoints** come from [`.choreo/component.yaml`](.choreo/component.yaml):
-   - `sre-alert-api`, base path `/api/wso2/v1/sre_alert_api`, Public: the vendor webhooks.
+   - One Public endpoint per vendor (`aws-alerts`, `azure-alerts`, … `site24x7-alerts`), base path
+     `/api/wso2/v1/sre_alert_api/<vendor>`. Each has its own public URL; vendors POST to it with
+     nothing appended (a trailing `/` or extra path answers `404`). Choreo enables OAuth2 on new
+     Public endpoints by default, so set each endpoint's security to what that vendor can send.
+     Adding a vendor needs a new endpoint here as well as its transform.
    - `healthz`, Public; use `/healthz` as the readiness probe.
    - `livez`, Project; use `/livez` as the liveness probe.
 3. **Environment variables**: set everything from [Environment variables](#environment-variables).
@@ -191,7 +208,12 @@ curl -sS -X POST "$BASE/site24x7" -H 'Content-Type: application/json' -d '{"STAT
    `CASSANDRA_*` values: this service writes the `alerts` rows that alerts-core reads.
 6. **Replicas**: any number. Ids stay unique across replicas because every claim is a
    compare-and-set on `alert_seq`.
-7. **Shutdown**: on SIGTERM `/healthz` turns `503` for `drain_delay`, in-flight requests get
+7. **Cosmos DB throughput**: use **autoscale** (max 2000 RU/s) on the account. Throttled writes
+   are retried, but a burst still waits on the RU budget.
+8. **Memory**: set `allocator.queue_max_bytes` to about half the container memory limit.
+   Queued alerts live in memory only: if the pod crashes, alerts not yet written are lost (their
+   senders got no `201`).
+9. **Shutdown**: on SIGTERM `/healthz` turns `503` for `drain_delay`, in-flight requests get
    `request_wait`, then the allocator gets its own `allocator_drain` so every claimed id gets its
    row (or filler), all within `server.shutdown_grace` (25s by default). **Set Choreo's
    termination grace period to 30s or more.**
@@ -200,4 +222,5 @@ curl -sS -X POST "$BASE/site24x7" -H 'Content-Type: application/json' -d '{"STAT
 
 JSON on stdout, one `request` line per webhook with `request_id` (from `X-Request-ID` if sent),
 `vendor`, `status`, `alt_ids`, `count`, `duration_ms` and `error`. The allocator logs
-`batch claimed` and `batch written` with the id range and timings. Health probes are not logged.
+`batch claimed` (id range, timings, `queue_len`, `queue_bytes`) and `batch written` (timings,
+`throttled` count, and `total_ru` when Cosmos reports request charges). Health probes are not logged.

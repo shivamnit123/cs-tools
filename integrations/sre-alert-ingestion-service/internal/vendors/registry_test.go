@@ -21,6 +21,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -170,5 +172,38 @@ func TestRegistry_OpenObserveKeepsOnlyCanonicalFields(t *testing.T) {
 	if a.UniqueIdentifier != "9f3a7c2e-4b1d-4e8a-9c3f-2b8d5e6f1a9c" || a.Source != "OpenObserve" ||
 		a.Description != "p99 latency has been above 2000ms for 5 minutes\n\nRaw payload: "+compactFile(t, "openobserve", "firing") {
 		t.Errorf("alert = %+v", a)
+	}
+}
+
+// vendorBasePath matches active basePath lines only, so a commented-out endpoint isn't counted.
+var vendorBasePath = regexp.MustCompile(`(?m)^[ \t]*basePath:[ \t]*/api/wso2/v1/sre_alert_api/(\S+)[ \t]*$`)
+
+func TestVendorBasePathIgnoresComments(t *testing.T) {
+	yaml := "    service:\n      basePath: /api/wso2/v1/sre_alert_api/aws\n" +
+		"#      basePath: /api/wso2/v1/sre_alert_api/azure\n" +
+		"      # basePath: /api/wso2/v1/sre_alert_api/gcp\n"
+	var got []string
+	for _, m := range vendorBasePath.FindAllStringSubmatch(yaml, -1) {
+		got = append(got, m[1])
+	}
+	if !slices.Equal(got, []string{"aws"}) {
+		t.Errorf("matched %v, want only the active aws line", got)
+	}
+}
+
+// TestComponentYAMLHasAnEndpointPerVendor keeps .choreo/component.yaml in step with the
+// registry: every vendor needs its own Choreo endpoint, and every endpoint a vendor.
+func TestComponentYAMLHasAnEndpointPerVendor(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", ".choreo", "component.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, m := range vendorBasePath.FindAllStringSubmatch(string(raw), -1) {
+		paths = append(paths, m[1])
+	}
+	slices.Sort(paths)
+	if names := newTestRegistry(t).Names(); !slices.Equal(paths, names) {
+		t.Errorf("component.yaml vendor endpoints = %v, registry = %v", paths, names)
 	}
 }

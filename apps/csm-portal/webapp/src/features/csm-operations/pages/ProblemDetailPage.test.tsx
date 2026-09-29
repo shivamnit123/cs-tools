@@ -86,6 +86,7 @@ const BASE_PROBLEM: BeProblemDetail = {
   id: "prb-1",
   number: "PRB0040157",
   subject: "Intermittent 502s on the gateway",
+  description: "Gateway pods intermittently return 502s under load.",
   state: "CLOSED",
   priority: "High",
   category: "",
@@ -192,6 +193,14 @@ describe("ProblemDetailPage", () => {
     // should trigger navigation when clicked directly as text.
     const plainTextOccurrence = originLabels.find((el) => el.closest('[role="button"]') === null);
     expect(plainTextOccurrence).toBeDefined();
+  });
+
+  it("renders the description when present", () => {
+    mockQueryResult({ data: BASE_PROBLEM });
+    render(<ProblemDetailPage />);
+    expect(
+      screen.getByText("Gateway pods intermittently return 502s under load."),
+    ).toBeInTheDocument();
   });
 
   it("renders resolution notes when present", () => {

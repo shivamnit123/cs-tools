@@ -16590,7 +16590,7 @@ components:
             - business_service
             - technology_management_service
             - application_service
-        assignmentGroup:
+        supportGroup:
           nullable: true
           allOf:
             - $ref: '#/components/schemas/EntityRef'
@@ -18065,6 +18065,13 @@ components:
       properties:
         subject:
           type: string
+        description:
+          type: string
+          nullable: true
+          description: >-
+            Accepted and validated, but not yet forwarded to ServiceNow -- the
+            Choreo integration's own POST /problems contract has no field to
+            receive it. Silently dropped after validation until that changes.
         category:
           type: string
           nullable: true

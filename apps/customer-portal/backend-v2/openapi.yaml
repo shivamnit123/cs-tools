@@ -5765,6 +5765,78 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorPayload'
 
+  /projects/{id}/contacts/{email}/resend-invitation:
+    post:
+      summary: Re-send a contact's invitation.
+      description: >-
+        Republishes the invitation for a contact still in INVITED or
+        RE-INVITED, so csm-notification-service sends the reminder email.
+        Only when CSM_MIGRATION_PORTAL_CONTACTS_ENABLED is on (404
+        otherwise). The caller must be an admin with an active membership on
+        the project.
+      operationId: postProjectsIdContactsEmailResendInvitation
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: email
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteResponse'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: NotFound (unknown contact, or resending is not available)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "409":
+          description: Conflict (the contact is no longer waiting on an invitation)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "429":
+          description: TooManyRequests (an invitation was sent within the cooldown)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
   /projects/{id}/contacts/validate:
     post:
       summary: Validate whether an email can be added as a project contact.
@@ -9851,6 +9923,9 @@ components:
           type: boolean
         isSecurityContact:
           type: boolean
+        canResendInvitation:
+          type: boolean
+          description: Set only when a resend can succeed (invitation outstanding, contacts served from the CSM database).
         membershipStatus:
           type: string
         account:

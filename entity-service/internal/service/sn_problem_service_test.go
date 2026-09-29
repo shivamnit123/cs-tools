@@ -265,3 +265,38 @@ func TestSNProblemService_AggregateProblems_StateGroupByRemapsKeyToDomainEnum(t 
 		t.Errorf("groups[2].Key: got %q, want %q (unrecognized state key falls back to raw key)", got, want)
 	}
 }
+
+// TestSNProblemService_CreateProblem_DescriptionNotForwarded pins the
+// deliberate stub behavior documented on CreateProblem's own doc comment:
+// the Choreo integration's POST /problems contract has no description field,
+// so a caller-supplied Description must not appear anywhere in the outgoing
+// payload, and the call must still succeed rather than error.
+func TestSNProblemService_CreateProblem_DescriptionNotForwarded(t *testing.T) {
+	var gotBody map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("/problems", func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"message": "created", "problem": {"id": "abc123", "number": "PRB0010001", "subject": "Recurring outage"}}`))
+	})
+
+	client := newTestSNClient(t, mux)
+	svc := NewServiceNowProblemService(client)
+
+	_, err := svc.CreateProblem(contextWithUserIDToken("token"), domain.CreateProblemRequest{
+		Subject:     "Recurring outage",
+		Description: strPtr("<p>Started after the 14:00 deploy.</p>"),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, hasDescription := gotBody["description"]; hasDescription {
+		t.Fatalf("expected no description key in the outgoing SN payload, got %+v", gotBody)
+	}
+	if gotBody["subject"] != "Recurring outage" {
+		t.Fatalf("subject: got %v, want %q", gotBody["subject"], "Recurring outage")
+	}
+}

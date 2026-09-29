@@ -64,18 +64,20 @@ describe("getPortalAccess", () => {
     });
   });
 
-  it("CS engineer and admin can do everything except admin can also create users", () => {
+  it("CS engineer and admin can do everything except admin can also create users and escalate", () => {
     const all = {
       hasAnyRole: true,
-      canEscalate: true,
       canDownloadAttachment: true,
       canUseOperations: true,
       canUseTimeCardsAndUpdates: true,
       canWrite: true,
       canUseSecurityCenter: true,
     };
-    expect(getPortalAccess(["cs_engineer"])).toEqual({ ...all, canCreateUser: false });
-    expect(getPortalAccess(["admin"])).toEqual({ ...all, canCreateUser: true });
+    // canEscalate is the one further exception beyond canCreateUser: admin
+    // holds it, cs_engineer does not (escalation is a dedicated
+    // responsibility -- see canEscalate's own doc comment).
+    expect(getPortalAccess(["cs_engineer"])).toEqual({ ...all, canCreateUser: false, canEscalate: false });
+    expect(getPortalAccess(["admin"])).toEqual({ ...all, canCreateUser: true, canEscalate: true });
   });
 
   it("only admin can create a user -- CS engineer does not share this one", () => {
@@ -90,6 +92,21 @@ describe("getPortalAccess", () => {
       "dashboard_designer",
     ]) {
       expect(getPortalAccess([role]).canCreateUser).toBe(false);
+    }
+  });
+
+  it("only admin and escalator can escalate -- CS engineer does not share this one", () => {
+    expect(getPortalAccess(["admin"]).canEscalate).toBe(true);
+    expect(getPortalAccess(["escalator"]).canEscalate).toBe(true);
+    for (const role of [
+      "cs_engineer",
+      "viewer",
+      "attachment_downloader",
+      "usage_metrics_viewer",
+      "timecard_approver",
+      "dashboard_designer",
+    ]) {
+      expect(getPortalAccess([role]).canEscalate).toBe(false);
     }
   });
 

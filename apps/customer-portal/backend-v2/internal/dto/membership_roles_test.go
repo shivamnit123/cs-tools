@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/wso2-open-operations/cs-tools/apps/customer-portal/backend-v2/internal/entity"
+	"github.com/wso2-open-operations/cs-tools/apps/customer-portal/backend-v2/internal/usermanagement"
 )
 
 // TestSalesforceRoleLabelsArePinned guards the literal strings. Salesforce
@@ -215,5 +216,35 @@ func TestMapEntityProjectContact_OneWordName(t *testing.T) {
 	got := MapEntityProjectContact(entity.ProjectContact{Name: &name, Email: "cher@acme.com"})
 	if got.FirstName != nil || got.LastName != "Cher" {
 		t.Errorf("first/last = %v/%q, want nil/Cher", got.FirstName, got.LastName)
+	}
+}
+
+func TestMapEntityProjectContact_CanResendInvitation(t *testing.T) {
+	for _, tt := range []struct {
+		state string
+		want  bool
+	}{
+		{"INVITED", true},
+		{"RE-INVITED", true},
+		{" invited ", true},
+		{"REGISTERED", false},
+		{"DEACTIVATED", false},
+		{"", false},
+	} {
+		t.Run(tt.state, func(t *testing.T) {
+			got := MapEntityProjectContact(entity.ProjectContact{Email: "a@acme.com", RegistrationState: tt.state})
+			if got.CanResendInvitation != tt.want {
+				t.Errorf("CanResendInvitation for %q = %v, want %v", tt.state, got.CanResendInvitation, tt.want)
+			}
+		})
+	}
+}
+
+// The pre-cutover list never offers a resend: the route answers 404 there.
+func TestMapContact_NeverOffersResend(t *testing.T) {
+	state := "INVITED"
+	got := MapContact(usermanagement.Contact{Email: "a@acme.com", MembershipStatus: &state})
+	if got.CanResendInvitation {
+		t.Error("a pre-cutover contact must not offer a resend")
 	}
 }

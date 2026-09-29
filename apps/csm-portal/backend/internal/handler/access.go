@@ -40,12 +40,26 @@ const (
 	PermViewOperations
 	// PermTimeCardsAndUpdates is the Time Cards and Updates areas: every time-card
 	// route (search, create, update, delete) and the update-level lookups. Held by
-	// the CS engineer and admin, and by the time-card approver so approving does
-	// not require being a CS engineer. Narrower than PermView on purpose: a
-	// view-only role sees neither area.
+	// the CS engineer and admin, and by the time-card approver so viewing/managing
+	// time cards does not require being a CS engineer. This is deliberately
+	// broader than approving one — see PermApproveTimeCard below, which is what's
+	// actually narrowed to the approver role.
 	PermTimeCardsAndUpdates
-	// PermEscalate is escalating or de-escalating a case.
+	// PermEscalate is escalating or de-escalating a case. Held ONLY by the
+	// escalator role and admin — NOT the CS engineer, unlike most other
+	// permissions here. Escalation is a dedicated responsibility, not something
+	// being a CS engineer alone should grant.
 	PermEscalate
+	// PermApproveTimeCard is approving or rejecting a time card — a state
+	// transition on the same PATCH /time-cards/{id} route ordinary field edits
+	// use (see UpdateTimeCardRequest.State in entity-service's own domain
+	// types), so a route-level permission alone can't express this; TimeCardHandler
+	// inspects the request body itself (mirroring CaseHandler's identical
+	// approach for PermViewSecurityCenter — see that permission's own doc
+	// comment) and additionally requires this permission only when `state` is
+	// present. Held ONLY by the time-card approver role and admin — NOT the CS
+	// engineer, same narrowing as PermEscalate above.
+	PermApproveTimeCard
 	// PermDownloadAttachment is downloading attachment content, or minting a
 	// link that does.
 	PermDownloadAttachment
@@ -113,18 +127,22 @@ type portalRole struct {
 
 // NewAccessGuard builds a guard from cfg. Admin satisfies every permission.
 // CS engineer (renamed from support_engineer -- see AccessConfig.CsEngineer's
-// own doc comment), the role for people who work cases, satisfies every one
-// too, EXCEPT PermAdmin — that one is admin-only, held by no other role,
-// unlike PermWrite which both share. The escalator and attachment-downloader
-// roles exist separately so other staff can be granted just that one ability.
-// The time-card approver also holds PermTimeCardsAndUpdates, so it can
-// approve without being a CS engineer. The usage-metrics and
-// dashboard-designer roles gate nothing here (this backend has no route for
-// those features) and grant only View. Every role implies View, so a user
-// granted only one specialised role can still open the pages it acts on.
-// PermViewSecurityCenter is the one exception to "every role implies View
-// covers it": plain viewer/escalator/attachment_downloader/usage_metrics_viewer/
-// timecard_approver/dashboard_designer all hold PermView but not this.
+// own doc comment), the role for people who work cases, satisfies every other
+// permission EXCEPT THREE: PermAdmin (admin-only, held by no other role,
+// unlike PermWrite which both share), PermEscalate, and PermApproveTimeCard —
+// escalating a case and approving a time card are each a dedicated
+// responsibility, held only by their own role (escalator / time-card
+// approver) plus admin, not by being a CS engineer alone. CS engineer DOES
+// still hold the broader PermTimeCardsAndUpdates (viewing/managing time
+// cards short of approving them). The attachment-downloader role exists
+// separately so other staff can be granted just that one ability. The
+// usage-metrics and dashboard-designer roles gate nothing here (this backend
+// has no route for those features) and grant only View. Every role implies
+// View, so a user granted only one specialised role can still open the pages
+// it acts on. PermViewSecurityCenter is the one further exception to "every
+// role implies View covers it": plain viewer/escalator/attachment_downloader/
+// usage_metrics_viewer/timecard_approver/dashboard_designer all hold PermView
+// but not this.
 func NewAccessGuard(cfg AccessConfig) *AccessGuard {
 	build := func(lists ...[]string) map[string]struct{} {
 		set := make(map[string]struct{})
@@ -151,12 +169,13 @@ func NewAccessGuard(cfg AccessConfig) *AccessGuard {
 				cfg.UsageMetricsViewer, cfg.CsEngineer, cfg.Admin, cfg.TimecardApprover, cfg.DashboardDesigner),
 			PermViewOperations:      build(cfg.CsEngineer, cfg.Admin),
 			PermTimeCardsAndUpdates: build(cfg.CsEngineer, cfg.Admin, cfg.TimecardApprover),
-			PermEscalate:            build(cfg.Escalator, cfg.CsEngineer, cfg.Admin),
+			PermEscalate:            build(cfg.Escalator, cfg.Admin),
 			PermDownloadAttachment:  build(cfg.AttachmentDownloader, cfg.CsEngineer, cfg.Admin),
 			PermWrite:               build(cfg.CsEngineer, cfg.Admin),
 			PermViewAllDashboards:   build(cfg.CsEngineer, cfg.Admin),
 			PermAdmin:               build(cfg.Admin),
 			PermViewSecurityCenter:  build(cfg.CsEngineer, cfg.Admin),
+			PermApproveTimeCard:     build(cfg.TimecardApprover, cfg.Admin),
 		},
 	}
 }

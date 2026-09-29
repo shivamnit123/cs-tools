@@ -305,7 +305,7 @@ func rejectedCard(r server.Rejection, now time.Time, replica string, previewChar
 		details += line("Other rejections", fmt.Sprintf("+%d more since %s", c.other, c.otherSince.Format(timeLayout)))
 	}
 	preview, truncated := textutil.Truncate(string(r.Body), previewChars)
-	if truncated {
+	if truncated || int64(len(r.Body)) < r.BodySize { // Body may already be just the preview
 		preview += " …"
 	}
 	if preview == "" {

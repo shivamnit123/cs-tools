@@ -259,13 +259,12 @@ func TestIncidentService_CreateIncident_DoesNotRetryValidationError(t *testing.T
 	}
 }
 
-// TestIncidentService_CreateIncident_RejectsUnsupportedFields guards the
-// two fields with no backing column at all on this data source
-// (ConfigurationItemID, AssignmentGroupID): rejecting them explicitly is
-// strictly better than silently accepting and dropping them, since
-// ServiceNow would already have stored them by the time Postgres is ever
-// touched.
-func TestIncidentService_CreateIncident_RejectsUnsupportedFields(t *testing.T) {
+// TestIncidentService_CreateIncident_RejectsConfigurationItemID guards the
+// one field with no backing column at all on this data source
+// (ConfigurationItemID): rejecting it explicitly is strictly better than
+// silently accepting and dropping it, since ServiceNow would already have
+// stored it by the time Postgres is ever touched.
+func TestIncidentService_CreateIncident_RejectsConfigurationItemID(t *testing.T) {
 	mirror := &stubMirrorIncidentService{
 		createIncident: func(context.Context, domain.CreateIncidentRequest) (domain.CreateIncidentResponse, error) {
 			t.Fatal("ServiceNow must never be called when an unsupported field is rejected up front")
@@ -281,12 +280,44 @@ func TestIncidentService_CreateIncident_RejectsUnsupportedFields(t *testing.T) {
 	if _, err := svc.CreateIncident(context.Background(), req); !asValidationError(err, new(*apierror.ValidationError)) {
 		t.Errorf("expected *apierror.ValidationError for configurationItemId, got %T: %v", err, err)
 	}
+}
 
+// TestIncidentService_CreateIncident_PersistsAssignmentGroupID guards the
+// fix for work_item.assignment_group_id (migration 0075): unlike
+// ConfigurationItemID, this field DOES have a backing column, so it must be
+// forwarded through to CreateIncidentFromServiceNow rather than rejected.
+func TestIncidentService_CreateIncident_PersistsAssignmentGroupID(t *testing.T) {
 	assignmentGroupID := "88888888-8888-8888-8888-888888888888"
-	req2 := validCreateIncidentRequest()
-	req2.AssignmentGroupID = &assignmentGroupID
-	if _, err := svc.CreateIncident(context.Background(), req2); !asValidationError(err, new(*apierror.ValidationError)) {
-		t.Errorf("expected *apierror.ValidationError for assignmentGroupId, got %T: %v", err, err)
+
+	mirror := &stubMirrorIncidentService{
+		createIncident: func(context.Context, domain.CreateIncidentRequest) (domain.CreateIncidentResponse, error) {
+			resp := domain.CreateIncidentResponse{Message: "Incident created successfully."}
+			resp.Incident.ID = "55555555-5555-5555-5555-555555555555"
+			resp.Incident.Number = "INC0023003"
+			resp.Incident.CreatedBy = "jane.doe@example.com"
+			return resp, nil
+		},
+	}
+	var gotAssignmentGroupID *string
+	repo := &stubIncidentRepo{
+		createIncidentFromServiceNow: func(_ context.Context, req domain.CreateIncidentRequest, id, number, createdBy string) (domain.CreateIncidentResponse, error) {
+			gotAssignmentGroupID = req.AssignmentGroupID
+			resp := domain.CreateIncidentResponse{Message: "Incident created successfully."}
+			resp.Incident.ID = id
+			resp.Incident.Number = number
+			resp.Incident.CreatedBy = createdBy
+			return resp, nil
+		},
+	}
+	svc := NewIncidentServiceWithSNMirror(repo, nil, mirror, nil, nil)
+
+	req := validCreateIncidentRequest()
+	req.AssignmentGroupID = &assignmentGroupID
+	if _, err := svc.CreateIncident(context.Background(), req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotAssignmentGroupID == nil || *gotAssignmentGroupID != assignmentGroupID {
+		t.Errorf("expected assignmentGroupId %q to be forwarded to CreateIncidentFromServiceNow, got %v", assignmentGroupID, gotAssignmentGroupID)
 	}
 }
 

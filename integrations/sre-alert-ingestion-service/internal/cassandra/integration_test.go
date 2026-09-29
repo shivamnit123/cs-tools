@@ -160,6 +160,7 @@ func TestIntegration_AllocatorWritesConsecutiveReadableRows(t *testing.T) {
 	a := allocator.New(slog.New(slog.NewTextHandler(io.Discard, nil)), s, nil, nil, allocator.Config{
 		QueueSize: 1000, MaxBatch: 200, WriteConcurrency: 32, ClaimMaxAttempts: 20,
 		InsertAttempts: 3, InsertBaseDelay: 100 * time.Millisecond, ClaimJitter: 10 * time.Millisecond,
+		QueueMaxBytes: 1 << 30, QueryTimeout: time.Second, WriteDeadline: time.Minute,
 	})
 
 	const total = 200
@@ -213,6 +214,7 @@ func TestIntegration_RowParsesAsAlertsCoreAlert(t *testing.T) {
 	a := allocator.New(slog.New(slog.NewTextHandler(io.Discard, nil)), s, nil, nil, allocator.Config{
 		QueueSize: 10, MaxBatch: 10, WriteConcurrency: 4, ClaimMaxAttempts: 5,
 		InsertAttempts: 3, InsertBaseDelay: 100 * time.Millisecond,
+		QueueMaxBytes: 1 << 30, QueryTimeout: time.Second, WriteDeadline: time.Minute,
 	})
 	defer a.Close(context.Background())
 

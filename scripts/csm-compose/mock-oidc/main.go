@@ -51,6 +51,16 @@ import (
 
 const kid = "mock-oidc-1"
 
+// allowedLogoutRedirectOrigins are the local dev webapp origins this mock
+// provider is meant to serve (see docker-compose.yml: the csm-portal webapp
+// on 3001, the customer-portal webapp on 3000). handleLogout only follows a
+// post_logout_redirect_uri that matches one of these, so the endpoint can't
+// be used to redirect a browser to an arbitrary external site.
+var allowedLogoutRedirectOrigins = map[string]bool{
+	"http://localhost:3000": true,
+	"http://localhost:3001": true,
+}
+
 type server struct {
 	key      *rsa.PrivateKey
 	issuer   string
@@ -370,6 +380,11 @@ func (s *server) handleUserinfo(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if redirect := r.URL.Query().Get("post_logout_redirect_uri"); redirect != "" {
+		u, err := url.Parse(redirect)
+		if err != nil || !allowedLogoutRedirectOrigins[u.Scheme+"://"+u.Host] {
+			http.Error(w, "bad post_logout_redirect_uri", http.StatusBadRequest)
+			return
+		}
 		http.Redirect(w, r, redirect, http.StatusFound)
 		return
 	}

@@ -148,7 +148,7 @@ export default function CreateIncidentPage(): JSX.Element {
   const [serviceId, setServiceId] = useState("");
   const [serviceOfferingId, setServiceOfferingId] = useState("");
   const [configurationItemId, setConfigurationItemId] = useState("");
-  // Derived from the selected Service's assignment group — not
+  // Derived from the selected Service's ServiceNow `support_group` — not
   // independently pickable. `assignmentGroupId` is what's actually submitted
   // (unchanged shape); `derivedAssignmentGroup` only carries the name for
   // display in the read-only field below.
@@ -514,8 +514,8 @@ export default function CreateIncidentPage(): JSX.Element {
                   setServiceOfferingId("");
                   // Assignment group is derived from the service, not
                   // independently pickable — see the read-only field below.
-                  setAssignmentGroupId(service?.assignmentGroup?.id ?? "");
-                  setDerivedAssignmentGroup(service?.assignmentGroup ?? null);
+                  setAssignmentGroupId(service?.supportGroup?.id ?? "");
+                  setDerivedAssignmentGroup(service?.supportGroup ?? null);
                 }}
                 disabled={postIncident.isPending}
                 useSearch={useSearchItServices}
@@ -539,7 +539,7 @@ export default function CreateIncidentPage(): JSX.Element {
                 }}
                 helperText={
                   serviceId && !derivedAssignmentGroup
-                    ? "No assignment group set for this service."
+                    ? "No support group set for this service in ServiceNow."
                     : "Derived from the selected Service."
                 }
               />

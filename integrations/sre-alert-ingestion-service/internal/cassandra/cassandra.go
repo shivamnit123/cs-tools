@@ -125,10 +125,16 @@ func (s *Store) ReadSeq(ctx context.Context) (int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.claimTimeout)
 	defer cancel()
 	var seq int64
-	if err := s.session.Query(
+	iter := s.session.Query(
 		fmt.Sprintf(`SELECT seq FROM %s WHERE name = ?`, SeqTable), SeqName,
-	).WithContext(ctx).Scan(&seq); err != nil {
+	).WithContext(ctx).Iter()
+	recordRU(ctx, iter)
+	found := iter.Scan(&seq)
+	if err := iter.Close(); err != nil {
 		return 0, fmt.Errorf("read %s: %w", SeqTable, err)
+	}
+	if !found {
+		return 0, fmt.Errorf("read %s: %w", SeqTable, gocql.ErrNotFound)
 	}
 	return seq, nil
 }
@@ -163,10 +169,12 @@ func (s *Store) CompareAndSet(ctx context.Context, from, to int64) (applied bool
 func (s *Store) Insert(ctx context.Context, id, vendor, alert string) error {
 	ctx, cancel := context.WithTimeout(ctx, s.queryTimeout)
 	defer cancel()
-	if err := s.session.Query(
+	iter := s.session.Query(
 		`INSERT INTO alerts (id, vendor, alert, created_at) VALUES (?, ?, ?, ?)`,
 		id, vendor, alert, time.Now().UTC(),
-	).WithContext(ctx).Exec(); err != nil {
+	).WithContext(ctx).Iter()
+	recordRU(ctx, iter)
+	if err := iter.Close(); err != nil {
 		return fmt.Errorf("insert %s: %w", id, err)
 	}
 	return nil
@@ -195,13 +203,11 @@ func (s *Store) Exists(ctx context.Context, id string) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, s.queryTimeout)
 	defer cancel()
 	var got string
-	err := s.session.Query(`SELECT id FROM alerts WHERE id = ?`, id).WithContext(ctx).Scan(&got)
-	switch {
-	case err == nil:
-		return true, nil
-	case errors.Is(err, gocql.ErrNotFound):
-		return false, nil
-	default:
+	iter := s.session.Query(`SELECT id FROM alerts WHERE id = ?`, id).WithContext(ctx).Iter()
+	recordRU(ctx, iter)
+	found := iter.Scan(&got)
+	if err := iter.Close(); err != nil {
 		return false, fmt.Errorf("read back %s: %w", id, err)
 	}
+	return found, nil
 }

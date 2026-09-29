@@ -164,7 +164,33 @@ func (r *slaPolicyResolver) resolve(ctx context.Context, severity domain.CaseSev
 			return repository.SLAPolicyRef{}, false, err
 		}
 	}
-	slog.WarnContext(ctx, "sla engine: no sla_policy found for severity/clockType under either plan",
+
+	// Third tier: a looser pattern match, tried only after both exact plan
+	// names above found nothing. Confirmed on wso2sndev.service-now.com's
+	// synced data (not prod, which the exact-name lookup above was verified
+	// against) that a real environment's policy catalog doesn't always
+	// follow the "<prefix> - <label> (<plan>)" convention -- e.g.
+	// "P2 - IR - Resolution (Open Source)" instead of
+	// "P2 - Resolution (Open Source)". Without this, such an environment
+	// gets NO clock for that severity/clockType at all despite a policy
+	// for it clearly existing, purely because of a naming variant this
+	// engine's exact lookup can't see past. See
+	// SLAEngineRepository.FindPolicyByPattern's own doc comment for the
+	// matching rule and why it's safe to also leave enabled on prod (it
+	// only ever fires once both exact-name attempts above have failed).
+	ref, err := r.repo.FindPolicyByPattern(ctx, prefix, label, target, derivedPlan)
+	if err == nil {
+		slog.WarnContext(ctx, "sla engine: resolved policy by loose pattern match, not exact name -- the environment's sla_policy naming may not follow the P{n} - {type} (plan) convention",
+			"severity", severity, "clockType", clockType, "triedPlans", []string{derivedPlan, altPlan}, "matchedName", ref.Name)
+		return ref, true, nil
+	}
+	var notFound *apierror.NotFoundError
+	if !errors.As(err, &notFound) {
+		slog.ErrorContext(ctx, "sla engine: pattern policy lookup failed", "prefix", prefix, "label", label, "err", err)
+		return repository.SLAPolicyRef{}, false, err
+	}
+
+	slog.WarnContext(ctx, "sla engine: no sla_policy found for severity/clockType under either plan or the loose pattern fallback",
 		"severity", severity, "clockType", clockType, "triedPlans", []string{derivedPlan, altPlan})
 	return repository.SLAPolicyRef{}, false, nil
 }

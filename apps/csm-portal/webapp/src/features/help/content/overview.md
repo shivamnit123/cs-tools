@@ -19,11 +19,13 @@ The sections below appear in the left sidebar in this order:
   management.
 - **Engagements**: professional-services work such as migrations, implementations,
   onboarding, and training.
+- **Announcements**: portal-wide announcements.
 - **Security Center**: two tabs: Security reports and Vulnerabilities.
+- **Customers**: two tabs: Accounts and Projects.
+- **PLG**: the PLG Customer Success Portal pages.
 - **Updates**: product/version update tracking.
 - **Time cards**: engineer time logged against a case, with an approval flow.
-- **Announcements**: portal-wide announcements.
-- **Customers**: two tabs: Accounts and Projects.
+- **Team Schedule**: the team rota.
 - **Settings**: user management: users, roles, groups, teams, and permissions.
 - **Help**: this section.
 

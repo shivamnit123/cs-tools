@@ -65,10 +65,19 @@ type fakeStore struct {
 	// neverVisible makes every read-back miss.
 	neverVisible bool
 
+	// throttleInserts throttles the next N real inserts; throttleAllInserts throttles all of them.
+	throttleInserts    int
+	throttleAllInserts bool
+	// throttleCAS throttles the next N compare-and-sets.
+	throttleCAS int
+
 	// readGate, if set, blocks ReadSeq until closed; readEntered is signalled on entry.
 	readGate    chan struct{}
 	readEntered chan struct{}
 }
+
+// errThrottled is a Cosmos DB 429 asking for a 1 ms wait, to keep tests fast.
+var errThrottled = errors.New("Request rate is large. More Request Units may be needed. RetryAfterMs=1")
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{rows: map[string]fakeRow{}, inserts: map[string]int{}, hideOnce: map[string]bool{}}
@@ -96,6 +105,10 @@ func (f *fakeStore) CompareAndSet(_ context.Context, from, to int64) (bool, int6
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.throttleCAS > 0 {
+		f.throttleCAS--
+		return false, 0, errThrottled
+	}
 	if f.stealNext > 0 {
 		f.stealNext--
 		f.seq += f.stealBy
@@ -116,6 +129,12 @@ func (f *fakeStore) Insert(_ context.Context, id, vendor, alert string) error {
 	defer f.mu.Unlock()
 	f.inserts[id]++
 	isFiller := strings.HasPrefix(alert, fillerPrefix)
+	if !isFiller && (f.throttleAllInserts || f.throttleInserts > 0) {
+		if f.throttleInserts > 0 {
+			f.throttleInserts--
+		}
+		return errThrottled
+	}
 	if isFiller && f.failFillers > 0 {
 		f.failFillers--
 		return errors.New("write timeout")
@@ -173,6 +192,7 @@ func testConfig() Config {
 	return Config{
 		QueueSize: 5000, MaxBatch: 200, WriteConcurrency: 64, ClaimMaxAttempts: 20,
 		InsertAttempts: 3, InsertBaseDelay: time.Millisecond, ClaimJitter: time.Millisecond,
+		QueueMaxBytes: 1 << 30, QueryTimeout: time.Millisecond, WriteDeadline: time.Minute,
 	}
 }
 

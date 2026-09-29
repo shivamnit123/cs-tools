@@ -46,6 +46,44 @@ describe("nav tree invariants", () => {
   });
 });
 
+describe("top-level nav order", () => {
+  const ids = CSM_NAV_ITEMS.map((section) => section.id);
+  const below = (upper: string, lower: string): void => {
+    expect(ids.indexOf(lower)).toBe(ids.indexOf(upper) + 1);
+  };
+
+  it("puts Announcements directly below Engagements", () => {
+    below("engagements", "announcements");
+  });
+
+  it("puts Customers directly below Security Center, and PLG directly below Customers", () => {
+    below("security-center", "customers");
+    below("customers", "plg");
+  });
+
+  it("puts Team Schedule directly below Time cards", () => {
+    below("time-cards", "team-schedule");
+  });
+
+  it("keeps the remaining sections in their existing relative order", () => {
+    expect(ids.filter((id) => id !== "spl")).toEqual([
+      "dashboard",
+      "support",
+      "operations",
+      "engagements",
+      "announcements",
+      "security-center",
+      "customers",
+      "plg",
+      "updates",
+      "time-cards",
+      "team-schedule",
+      "admin",
+      "help",
+    ]);
+  });
+});
+
 describe("help section", () => {
   it("sits immediately after Settings in the top-level nav order", () => {
     const ids = CSM_NAV_ITEMS.map((section) => section.id);

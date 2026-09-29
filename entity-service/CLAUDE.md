@@ -2330,8 +2330,10 @@ decision, not overlooked.
 
 ## IT services (CMDB services)
 
-`service` (migration 0044) is a standalone table — no FK to or from any
-other table in this schema. `ITServiceRepository.SearchITServices`
+`service` (migration 0044) is the CMDB service catalogue: `incident`,
+`incident_task`, `change_request`, `outage` and `cloud_monitor` reference it
+via `service_id`, `service_offering` via `parent_id`, and its five group
+columns (migration 0075) reference `"group"`. `ITServiceRepository.SearchITServices`
 (`it_service_repo.go`) wires `POST /services/search` up to it on Postgres;
 previously this route only existed on the ServiceNow data source.
 `domain.ITService.Class` is mapped from `service.category` (a free-text
@@ -2343,6 +2345,16 @@ literally named "class". `BusinessCriticality` maps 1:1 (case-folded) via
 ServiceNow data source) has no corresponding column on `service` at all —
 `category`/`subcategory` are free text, not drawn from that three-value set
 — so it is always left `nil` on Postgres rather than guessed at.
+
+**`SupportGroup` comes from `service.support_group_id`** (LEFT JOIN `"group"`).
+It was never selected before, so the CSM portal's Create Incident page — which
+defaults the incident's assignment group to the service's support group —
+always showed it blank. Use `support_group_id`, not `service.assignment_group_id`:
+support group is the ServiceNow/CSDM "team that handles this service's
+incidents" field (in synced data, 98% of incidents with both a service and an
+assignment group carry that service's support group), while a CI's own
+`assignment_group` is a different, generic field that no synced service sets.
+The incident's own group belongs on `work_item.assignment_group_id`.
 
 ## time_card.state/issue_complexity became real enums; case_id now targets work_item
 

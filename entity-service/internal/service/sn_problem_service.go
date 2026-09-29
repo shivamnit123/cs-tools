@@ -338,6 +338,15 @@ type snCreateProblemPayload struct {
 }
 
 // CreateProblem implements ProblemService for the ServiceNow data source.
+//
+// req.Description is deliberately not forwarded to ServiceNow: snCreateProblemPayload
+// (below) has no description field, because the Choreo integration's own POST /problems
+// contract does not accept one -- confirmed against every field that struct's sibling
+// response type (snProblemDetailResponse) and the Choreo API define for a problem, none
+// of which is a description. It is still accepted and validated at this layer (and by
+// the CSM portal backend above it) so the field can ship end-to-end the moment that
+// integration adds support, without another round of API changes; until then a caller
+// that sets it gets a normal 201 with the description silently dropped, not an error.
 func (s *snProblemService) CreateProblem(ctx context.Context, req domain.CreateProblemRequest) (domain.ProblemDetail, error) {
 	token := middleware.UserIDTokenFromContext(ctx)
 

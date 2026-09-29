@@ -58,6 +58,7 @@ func (in *Ingestor) Ingest(ctx context.Context, req Request) Result {
 		return Result{Status: http.StatusBadRequest, Error: "unknown vendor"}
 	}
 	alerts, err := transform(req.Body)
+	req.Body = nil // not needed while Submit waits
 	if err != nil {
 		return Result{Status: http.StatusBadRequest, Error: err.Error()}
 	}

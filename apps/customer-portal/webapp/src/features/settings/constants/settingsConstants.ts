@@ -219,6 +219,19 @@ export const SETTINGS_USER_EDIT_TOOLTIP = "Edit user";
 
 export const SETTINGS_USER_REMOVE_TOOLTIP = "Remove user";
 
+export const SETTINGS_USER_RESEND_TOOLTIP = "Resend invitation";
+
+export const SETTINGS_USER_RESEND_SUCCESS = "Invitation resent";
+
+export const SETTINGS_USER_RESEND_ERROR =
+  "Failed to resend the invitation. Please try again.";
+
+export const SETTINGS_USER_RESEND_COOLDOWN =
+  "An invitation was sent a few minutes ago. Please try again later.";
+
+export const SETTINGS_USER_RESEND_ALREADY_ACCEPTED =
+  "This user is no longer waiting on an invitation. Refresh the page to see their current status.";
+
 export const ADD_USER_EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export const ADD_USER_ROLE_OPTIONS = [

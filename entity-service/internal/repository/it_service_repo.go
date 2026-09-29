@@ -26,10 +26,11 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// ITServiceRepository defines the read operations for the standalone
-// service table (migration 0044). service has no FK to any other table in
-// this schema (project/deployment/deployed_product/work_item all reference
-// it nowhere) -- it exists purely as a searchable catalogue today.
+// ITServiceRepository defines the read operations for the service table
+// (migration 0044), the CMDB service catalogue. Other tables reference it
+// (incident/incident_task/change_request/outage/cloud_monitor.service_id,
+// service_offering.parent_id), and its group columns (migration 0075)
+// reference "group"; this repository only reads it.
 type ITServiceRepository interface {
 	// SearchITServices returns a filtered, paginated slice of services
 	// together with the total count of matching rows before pagination.
@@ -67,20 +68,34 @@ var itServiceBusinessCriticalityFromEnum = map[string]domain.BusinessCriticality
 // column anywhere on service -- category/subcategory are free text, not
 // drawn from that three-value set -- so it is always left nil rather than
 // guessed at from category's contents.
+//
+// domain.ITService.SupportGroup is resolved via service.support_group_id
+// (migration 0075) LEFT JOINed against "group". That column existed since
+// 0075 but was never selected here, so every service came back with no
+// support group and the CSM portal's Create Incident page -- which defaults
+// the incident's assignment group to the selected service's support group --
+// always showed it blank. Support group is the ServiceNow/CSDM field for the
+// team that handles a service's incidents; service.assignment_group_id is a
+// different, generic CI field (empty for every synced service when checked)
+// and is deliberately not used for this. managed_by_group_id/
+// approval_group_id/user_group_id from the same migration stay unselected:
+// domain.ITService has no field for them.
 func (r *itServiceRepo) SearchITServices(ctx context.Context, searchQuery string, limit, offset int) ([]domain.ITService, int, error) {
 	where := "WHERE 1=1"
 	args := []any{}
 	if searchQuery != "" {
 		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(searchQuery)
 		args = append(args, "%"+escaped+"%")
-		where += fmt.Sprintf(" AND (name ILIKE $%d ESCAPE '\\' OR number ILIKE $%d ESCAPE '\\')", len(args), len(args))
+		where += fmt.Sprintf(" AND (s.name ILIKE $%d ESCAPE '\\' OR s.number ILIKE $%d ESCAPE '\\')", len(args), len(args))
 	}
 
-	countQuery := "SELECT COUNT(*) FROM service " + where
+	countQuery := "SELECT COUNT(*) FROM service s " + where
 	dataQuery := fmt.Sprintf(
-		`SELECT id, name, category, business_criticality::TEXT
-		 FROM service %s
-		 ORDER BY created_on DESC, id
+		`SELECT s.id, s.name, s.category, s.business_criticality::TEXT, sg.id, sg.name
+		 FROM service s
+		 LEFT JOIN "group" sg ON sg.id = s.support_group_id
+		 %s
+		 ORDER BY s.created_on DESC, s.id
 		 LIMIT $%d OFFSET $%d`,
 		where, len(args)+1, len(args)+2,
 	)
@@ -108,11 +123,12 @@ func (r *itServiceRepo) SearchITServices(ctx context.Context, searchQuery string
 		result := make([]domain.ITService, 0, limit)
 		for rows.Next() {
 			var (
-				id                  string
-				name, category      *string
-				businessCriticality *string
+				id                               string
+				name, category                   *string
+				businessCriticality              *string
+				supportGroupID, supportGroupName *string
 			)
-			if err := rows.Scan(&id, &name, &category, &businessCriticality); err != nil {
+			if err := rows.Scan(&id, &name, &category, &businessCriticality, &supportGroupID, &supportGroupName); err != nil {
 				return fmt.Errorf("scan service: %w", err)
 			}
 			item := domain.ITService{ID: id, Name: name, Class: category}
@@ -120,6 +136,9 @@ func (r *itServiceRepo) SearchITServices(ctx context.Context, searchQuery string
 				if bc, ok := itServiceBusinessCriticalityFromEnum[*businessCriticality]; ok {
 					item.BusinessCriticality = &bc
 				}
+			}
+			if supportGroupID != nil {
+				item.SupportGroup = &domain.EntityRef{ID: *supportGroupID, Name: stringOrEmpty(supportGroupName)}
 			}
 			result = append(result, item)
 		}

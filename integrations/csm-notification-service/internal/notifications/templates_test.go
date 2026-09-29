@@ -638,7 +638,7 @@ func TestRenderProjectContactInvitedEmail_SignInButton(t *testing.T) {
 		"reminder": RenderProjectContactInvitedReminderEmail,
 	} {
 		got := render(ProjectContactInvitedEmailData{DisplayName: "jane", Email: "jane@acme.com", ProjectName: "Acme Cloud", ProjectKey: "ACMECLOUD", PortalURL: portal})
-		for _, want := range []string{`bgcolor="#c2410c"`, "border-radius:999px", "Sign in to the Support Portal", "Button not working? Paste this link into your browser:"} {
+		for _, want := range []string{`bgcolor="#ff7300"`, "border-radius:999px", "Sign in to the Support Portal", "Button not working? Paste this link into your browser:"} {
 			if !strings.Contains(got, want) {
 				t.Errorf("%s: rendered email does not contain %q", name, want)
 			}

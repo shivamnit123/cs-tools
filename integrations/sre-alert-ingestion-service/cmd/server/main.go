@@ -114,11 +114,14 @@ func main() {
 
 	alloc := allocator.New(base.With("component", "allocator"), store, cards, waker, allocator.Config{
 		QueueSize:        cfg.Allocator.QueueSize,
+		QueueMaxBytes:    cfg.Allocator.QueueMaxBytes,
 		MaxBatch:         cfg.Allocator.MaxBatch,
 		WriteConcurrency: cfg.Allocator.WriteConcurrency,
 		ClaimMaxAttempts: cfg.Allocator.ClaimMaxAttempts,
 		InsertAttempts:   cfg.Store.InsertAttempts,
 		InsertBaseDelay:  cfg.Store.InsertBaseDelay.Duration(),
+		QueryTimeout:     cfg.Store.QueryTimeout.Duration(),
+		WriteDeadline:    cfg.Store.WriteDeadline.Duration(),
 		ClaimJitter:      claimJitter,
 	})
 
@@ -129,6 +132,7 @@ func main() {
 		Rejects:      cards,
 		Vendors:      registry.Names(),
 		MaxBodyBytes: cfg.Server.MaxBodyBytes,
+		PreviewChars: cfg.Reject.BodyPreviewChars,
 		ReadTimeout:  cfg.Server.ReadTimeout.Duration(),
 		WriteTimeout: cfg.Server.WriteTimeout.Duration(),
 		IdleTimeout:  cfg.Server.IdleTimeout.Duration(),

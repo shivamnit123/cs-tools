@@ -4572,7 +4572,7 @@ type ITService struct {
 	Class                 *string                `json:"class"`
 	BusinessCriticality   *BusinessCriticality   `json:"businessCriticality"`
 	ServiceClassification *ServiceClassification `json:"serviceClassification"`
-	AssignmentGroup       *EntityRef             `json:"assignmentGroup"`
+	SupportGroup          *EntityRef             `json:"supportGroup"`
 }
 
 // ConfigurationItem is a single CMDB configuration item returned in a search response.
@@ -5681,10 +5681,17 @@ type ProblemDetail struct {
 }
 
 // CreateProblemRequest is the request body for POST /problems. Subject is required;
-// Category, Subcategory, OriginCaseID, and PrimaryIncidentID are optional. OriginCaseID
-// and PrimaryIncidentID are UUIDs from the caller's perspective.
+// Description, Category, Subcategory, OriginCaseID, and PrimaryIncidentID are optional.
+// OriginCaseID and PrimaryIncidentID are UUIDs from the caller's perspective.
+//
+// Description is accepted and validated but, for the ServiceNow data source, not yet
+// forwarded anywhere -- see ProblemService.CreateProblem's ServiceNow implementation
+// (sn_problem_service.go) for why: the Choreo integration's POST /problems payload has
+// no description field to receive it. It is silently dropped after validation until
+// that integration adds one; do not assume it round-trips to a created problem.
 type CreateProblemRequest struct {
 	Subject           string  `json:"subject"`
+	Description       *string `json:"description,omitempty"`
 	Category          *string `json:"category,omitempty"`
 	Subcategory       *string `json:"subcategory,omitempty"`
 	OriginCaseID      *string `json:"originCaseId,omitempty"`

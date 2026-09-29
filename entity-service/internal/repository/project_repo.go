@@ -305,8 +305,18 @@ func (r *projectRepo) GetProjectByID(ctx context.Context, id string, scope Searc
 	var supportTier *string
 	// project_type is a LEFT JOIN for the same reason account is: a project
 	// with no project_type_id set (or one pointing at a deleted row) must
-	// still resolve, just with SubscriptionType left at its zero value below.
+	// still resolve, just with SubscriptionType/HasSr left at their zero
+	// value below.
 	var projectTypeName *string
+	// has_service_request_write_access (migration 0130) is a direct port of
+	// ServiceNow's ProjectTypeFeatureManager.FEATURE_MATRIX (see
+	// reference_data_repo.go's own doc comment) -- reusing it here is what
+	// makes HasSr answer the same question on this data source that
+	// ServiceNow's own ProjectDeploymentClassification.isSREnabledForProject
+	// answers on that one, keyed off the same project type, rather than
+	// leaving HasSr at its Go zero value (false) for every project
+	// regardless of type, which is what this data source used to do.
+	var hasSr *bool
 	// tou/amu: this view's Account.OwnerEmail/TechnicalOwnerEmail were
 	// previously left at their zero value unconditionally -- both are real
 	// columns' worth of data, just not this project's own; they're the
@@ -325,7 +335,7 @@ func (r *projectRepo) GetProjectByID(ctx context.Context, id string, scope Searc
 		        a.id, a.name, a.number, a.activation_date, a.region,
 		        a.ai_gen_response_enabled, a.smart_knowledge_base_suggestions_enabled,
 		        a.support_tier::TEXT,
-		        pt.name,
+		        pt.name, pt.has_service_request_write_access,
 		        -- wso2_closure_state/onboarding_status (migration 0014) are stored
 		        -- SCREAMING_SNAKE_CASE ('SUSPENDED', 'NOT_STARTED'), but the documented
 		        -- response vocabulary isn't -- and the two don't even share a separator:
@@ -375,7 +385,7 @@ func (r *projectRepo) GetProjectByID(ctx context.Context, id string, scope Searc
 		&aID, &aName, &aNumber, &v.Account.ActivationDate, &v.Account.Region,
 		&agentEnabled, &kbReferencesEnabled,
 		&supportTier,
-		&projectTypeName,
+		&projectTypeName, &hasSr,
 		&v.ClosureState, &v.OnboardingStatus,
 		&v.GoLivePlanDate, &v.GoLiveDate, &v.OnboardingExpiryDate,
 		&v.TotalQueryHours, &v.RemainingQueryHours,
@@ -412,6 +422,7 @@ func (r *projectRepo) GetProjectByID(ctx context.Context, id string, scope Searc
 	if projectTypeName != nil {
 		v.SubscriptionType = projectTypeNameToSubscriptionType(*projectTypeName)
 	}
+	v.HasSr = hasSr != nil && *hasSr
 	return v, nil
 }
 

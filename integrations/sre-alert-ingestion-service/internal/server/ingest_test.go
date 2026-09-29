@@ -172,6 +172,20 @@ func TestIngest_400NeverSubmitsAndReportsRejection(t *testing.T) {
 	}
 }
 
+func TestIngest_400KeepsOnlyThePreview(t *testing.T) {
+	rejects := &recordingRejects{}
+	body := "not json " + strings.Repeat("x", 3000)
+	rec := do(t, newIngestServer(t, &fakeSubmitter{}, rejects), "POST", VendorRoutePrefix+"datadog", body)
+	if rec.Code != http.StatusBadRequest || len(rejects.list) != 1 {
+		t.Fatalf("status = %d, rejections = %d", rec.Code, len(rejects.list))
+	}
+	r := rejects.list[0]
+	if len(r.Body) != logPreviewChars || string(r.Body) != body[:logPreviewChars] || r.BodySize != int64(len(body)) {
+		t.Errorf("rejection body = %d bytes, size = %d; want the %d-char preview and the full size %d",
+			len(r.Body), r.BodySize, logPreviewChars, len(body))
+	}
+}
+
 func TestIngest_413ReportsRejectionWithoutSubmitting(t *testing.T) {
 	sub := &fakeSubmitter{}
 	rejects := &recordingRejects{}

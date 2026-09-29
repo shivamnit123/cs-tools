@@ -13,7 +13,8 @@ info:
     | `view` | every other `GET`, `*/search` and `*/aggregate` | any role below |
     | `view_operations` | the same reads under `/incidents`, `/change-requests`, `/problems`, `/incident-tasks`, `/outages`, `/alerts`, `/smart-alerts` | cs-engineer, admin |
     | `time_cards_and_updates` | every `/time-cards` route and `GET /updates/product-update-levels`, `POST /updates/levels/search` | cs-engineer, time-card-approver, admin |
-    | `escalate` | `POST /cases/{id}/escalations` | escalator, cs-engineer, admin |
+    | `approve_time_card` | `PATCH /time-cards/{id}` when the body sets `state` (approve/reject) | time-card-approver, admin |
+    | `escalate` | `POST /cases/{id}/escalations` | escalator, admin |
     | `download_attachment` | `GET /attachments/{id}/content`, `POST /attachments/{id}/share` | attachment-downloader, cs-engineer, admin |
     | `write` | every other `POST`/`PATCH`/`DELETE`, including case, incident and change-request comments | cs-engineer, admin |
     | `admin` | `POST /users` | admin only |
@@ -16418,6 +16419,8 @@ components:
       properties:
         subject:
           type: string
+        description:
+          type: string
         category:
           type: string
         subcategory:
@@ -16563,6 +16566,12 @@ components:
         - $ref: '#/components/schemas/Problem'
         - type: object
           properties:
+            description:
+              type: string
+              nullable: true
+              description: >-
+                Free-text description of the problem. May be null/empty on
+                many records.
             priority:
               type: string
               nullable: true

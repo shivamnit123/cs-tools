@@ -32,6 +32,10 @@ import (
 // DefaultPath is used when CONFIG_PATH is unset; expected at the working directory root.
 const DefaultPath = "config.toml"
 
+// MaxWriteDeadline is alerts-core's gap_timeout. A claimed id still being retried when
+// alerts-core gives up on it would be skipped, so write_deadline must stay under it.
+const MaxWriteDeadline = Duration(10 * time.Minute)
+
 // WriteMargin keeps request_wait under write_timeout, so a slow store answers 503 instead of
 // the connection being cut.
 const WriteMargin = Duration(time.Second)
@@ -69,10 +73,11 @@ type AuthConfig struct {
 // AllocatorConfig tunes the id allocator: queue depth before 503, alerts claimed
 // per compare-and-set, parallel row writers, and compare-and-set attempts before giving up.
 type AllocatorConfig struct {
-	QueueSize        int `toml:"queue_size"`
-	MaxBatch         int `toml:"max_batch"`
-	WriteConcurrency int `toml:"write_concurrency"`
-	ClaimMaxAttempts int `toml:"claim_max_attempts"`
+	QueueSize        int   `toml:"queue_size"`
+	QueueMaxBytes    int64 `toml:"queue_max_bytes"`
+	MaxBatch         int   `toml:"max_batch"`
+	WriteConcurrency int   `toml:"write_concurrency"`
+	ClaimMaxAttempts int   `toml:"claim_max_attempts"`
 }
 
 // StoreConfig tunes row writes: attempts on the same id, the base of the doubling backoff
@@ -82,6 +87,7 @@ type StoreConfig struct {
 	InsertBaseDelay Duration `toml:"insert_base_delay"`
 	QueryTimeout    Duration `toml:"query_timeout"`
 	ClaimTimeout    Duration `toml:"claim_timeout"`
+	WriteDeadline   Duration `toml:"write_deadline"`
 }
 
 // CassandraConfig tunes startup connection retry, matching sre-alert-core-service.
@@ -132,8 +138,8 @@ func Defaults() Config {
 		Server: ServerConfig{
 			ShutdownGrace:  Duration(25 * time.Second),
 			DrainDelay:     Duration(5 * time.Second),
-			RequestWait:    Duration(8 * time.Second),
-			AllocatorDrain: Duration(7 * time.Second),
+			RequestWait:    Duration(10 * time.Second),
+			AllocatorDrain: Duration(10 * time.Second),
 			ReadTimeout:    Duration(10 * time.Second),
 			WriteTimeout:   Duration(30 * time.Second),
 			IdleTimeout:    Duration(60 * time.Second),
@@ -142,15 +148,17 @@ func Defaults() Config {
 		Auth: AuthConfig{Mode: "none"},
 		Allocator: AllocatorConfig{
 			QueueSize:        5000,
+			QueueMaxBytes:    256 << 20,
 			MaxBatch:         200,
-			WriteConcurrency: 64,
+			WriteConcurrency: 16,
 			ClaimMaxAttempts: 20,
 		},
 		Store: StoreConfig{
-			InsertAttempts:  3,
-			InsertBaseDelay: Duration(100 * time.Millisecond),
+			InsertAttempts:  5,
+			InsertBaseDelay: Duration(250 * time.Millisecond),
 			QueryTimeout:    Duration(1500 * time.Millisecond),
 			ClaimTimeout:    Duration(5 * time.Second),
+			WriteDeadline:   Duration(5 * time.Minute),
 		},
 		Cassandra: CassandraConfig{
 			ConnectMaxAttempts: 5,
@@ -212,6 +220,10 @@ func (c Config) Validate() error {
 		return fmt.Errorf("auth.mode must be set")
 	case c.Allocator.QueueSize <= 0:
 		return fmt.Errorf("allocator.queue_size must be positive")
+	case c.Allocator.QueueMaxBytes <= 0:
+		return fmt.Errorf("allocator.queue_max_bytes must be positive")
+	case c.Allocator.QueueMaxBytes < 2*c.Server.MaxBodyBytes:
+		return fmt.Errorf("allocator.queue_max_bytes must be at least 2 x server.max_body_bytes")
 	case c.Allocator.MaxBatch <= 0:
 		return fmt.Errorf("allocator.max_batch must be positive")
 	case c.Allocator.WriteConcurrency <= 0:
@@ -226,6 +238,8 @@ func (c Config) Validate() error {
 		return fmt.Errorf("store.query_timeout must be positive")
 	case c.Store.ClaimTimeout <= 0:
 		return fmt.Errorf("store.claim_timeout must be positive")
+	case c.Store.WriteDeadline <= 0 || c.Store.WriteDeadline >= MaxWriteDeadline:
+		return fmt.Errorf("store.write_deadline must be positive and under %v (alerts-core's gap_timeout)", MaxWriteDeadline.Duration())
 	case c.Cassandra.ConnectMaxAttempts <= 0:
 		return fmt.Errorf("cassandra.connect_max_attempts must be positive")
 	case c.Cassandra.ConnectBaseDelay <= 0:

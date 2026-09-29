@@ -33,7 +33,7 @@ func testAccessConfig() AccessConfig {
 		Escalator:            []string{"test-escalator"},
 		AttachmentDownloader: []string{"test-attachment-downloader"},
 		UsageMetricsViewer:   []string{"test-usage-metrics-viewer"},
-		CsEngineer:      []string{"test-cs-engineer"},
+		CsEngineer:           []string{"test-cs-engineer"},
 		Admin:                []string{"test-admin"},
 		TimecardApprover:     []string{"test-timecard-approver"},
 		DashboardDesigner:    []string{"test-dashboard-designer"},
@@ -56,11 +56,13 @@ func serveWithRoles(g *AccessGuard, perm Permission, roles []string) (status int
 }
 
 func TestAccessGuard_PermissionMatrix(t *testing.T) {
-	// allExceptAdmin is every route permission cs_engineer also holds;
-	// PermAdmin is deliberately excluded from it and tested separately below
-	// -- it is the one permission admin does not share with cs_engineer.
-	allExceptAdmin := []Permission{PermView, PermViewOperations, PermTimeCardsAndUpdates, PermEscalate, PermDownloadAttachment, PermWrite, PermViewSecurityCenter}
-	all := append(append([]Permission{}, allExceptAdmin...), PermAdmin)
+	// csEngineerPerms is every route permission cs_engineer holds. PermAdmin,
+	// PermEscalate, and PermApproveTimeCard are deliberately excluded and
+	// tested separately below -- escalating and approving a time card are
+	// each a dedicated responsibility cs_engineer does not share, the same
+	// way PermAdmin doesn't.
+	csEngineerPerms := []Permission{PermView, PermViewOperations, PermTimeCardsAndUpdates, PermDownloadAttachment, PermWrite, PermViewSecurityCenter}
+	all := append(append([]Permission{}, csEngineerPerms...), PermAdmin, PermEscalate, PermApproveTimeCard)
 	tests := []struct {
 		name  string
 		roles []string
@@ -69,10 +71,10 @@ func TestAccessGuard_PermissionMatrix(t *testing.T) {
 		{"viewer reads only", []string{"test-viewer"}, []Permission{PermView}},
 		{"escalator can view and escalate", []string{"test-escalator"}, []Permission{PermView, PermEscalate}},
 		{"downloader can view and download", []string{"test-attachment-downloader"}, []Permission{PermView, PermDownloadAttachment}},
-		{"CS engineer can do every route permission except admin-only ones", []string{"test-cs-engineer"}, allExceptAdmin},
+		{"CS engineer can do every route permission except admin-only, escalate, and approve-time-card ones", []string{"test-cs-engineer"}, csEngineerPerms},
 		{"admin can do every route permission, including admin-only ones", []string{"test-admin"}, all},
 		{"usage metrics viewer can view only", []string{"test-usage-metrics-viewer"}, []Permission{PermView}},
-		{"timecard approver can view and use time cards and updates", []string{"test-timecard-approver"}, []Permission{PermView, PermTimeCardsAndUpdates}},
+		{"timecard approver can view, use time cards and updates, and approve", []string{"test-timecard-approver"}, []Permission{PermView, PermTimeCardsAndUpdates, PermApproveTimeCard}},
 		{"dashboard designer can view only", []string{"test-dashboard-designer"}, []Permission{PermView}},
 		{"roles combine", []string{"test-viewer", "test-escalator", "test-attachment-downloader"}, []Permission{PermView, PermEscalate, PermDownloadAttachment}},
 		{"unrelated roles grant nothing", []string{"wso2-everyone", "admin", "agent", "customer"}, nil},
@@ -254,7 +256,7 @@ func TestAccessGuard_SecurityCenterIsForCsEngineersAndAdmins(t *testing.T) {
 
 func TestAccessGuard_UnconfiguredRolesAreHeldByNobody(t *testing.T) {
 	g := NewAccessGuard(AccessConfig{})
-	for _, perm := range []Permission{PermView, PermViewOperations, PermTimeCardsAndUpdates, PermEscalate, PermDownloadAttachment, PermWrite, PermAdmin, PermViewSecurityCenter} {
+	for _, perm := range []Permission{PermView, PermViewOperations, PermTimeCardsAndUpdates, PermEscalate, PermDownloadAttachment, PermWrite, PermAdmin, PermViewSecurityCenter, PermApproveTimeCard} {
 		if status, _ := serveWithRoles(g, perm, []string{"test-admin", "test-viewer", ""}); status != http.StatusForbidden {
 			t.Errorf("permission %d with no roles configured: status = %d, want 403", perm, status)
 		}
@@ -284,5 +286,24 @@ func TestAccessGuard_TimeCardsAndUpdatesAreForCsEngineersAdminsAndApprovers(t *t
 	}
 	if status, _ := serveWithRoles(g, PermTimeCardsAndUpdates, nil); status != http.StatusForbidden {
 		t.Errorf("no roles: status = %d, want 403", status)
+	}
+}
+
+func TestAccessGuard_ApproveTimeCardIsForApproversAndAdminsOnly(t *testing.T) {
+	g := NewAccessGuard(testAccessConfig())
+	for _, role := range []string{"test-admin", "test-timecard-approver"} {
+		if status, _ := serveWithRoles(g, PermApproveTimeCard, []string{role}); status != http.StatusNoContent {
+			t.Errorf("%s: status = %d, want 204", role, status)
+		}
+	}
+	// CS engineer holds the broader PermTimeCardsAndUpdates but must NOT hold
+	// this narrower one -- approving is a dedicated responsibility.
+	for _, role := range []string{
+		"test-cs-engineer", "test-viewer", "test-escalator",
+		"test-attachment-downloader", "test-usage-metrics-viewer", "test-dashboard-designer",
+	} {
+		if status, _ := serveWithRoles(g, PermApproveTimeCard, []string{role}); status != http.StatusForbidden {
+			t.Errorf("%s: status = %d, want 403", role, status)
+		}
 	}
 }

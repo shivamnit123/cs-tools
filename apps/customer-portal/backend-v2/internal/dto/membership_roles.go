@@ -223,8 +223,20 @@ func MapEntityProjectContact(c entity.ProjectContact) Contact {
 	if c.RegistrationState != "" {
 		state := c.RegistrationState
 		out.MembershipStatus = &state
+		out.CanResendInvitation = invitationOutstanding(state)
 	}
 	return out
+}
+
+// invitationOutstanding mirrors entity-service's resend rule: only a contact
+// in INVITED or RE-INVITED can have their invitation re-sent.
+func invitationOutstanding(state string) bool {
+	switch strings.ToUpper(strings.TrimSpace(state)) {
+	case "INVITED", "RE-INVITED":
+		return true
+	default:
+		return false
+	}
 }
 
 // MapEntityProjectContacts maps a whole database contact list.

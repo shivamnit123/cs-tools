@@ -290,6 +290,43 @@ func TestDispatcher_Handle_CaseCreated_NonCaseTypesSkipChatButStillEmail(t *test
 	}
 }
 
+// TestDispatcher_Handle_CaseCreated_LowSeveritySkipsChatButStillEmail verifies
+// a LOW/S4-severity "case" sends no Google Chat alert — S4 is WSO2's own
+// best-efforts support tier and doesn't warrant one — while the email
+// reaction still fires normally, and a non-LOW severity is unaffected.
+func TestDispatcher_Handle_CaseCreated_LowSeveritySkipsChatButStillEmail(t *testing.T) {
+	testCases := []struct {
+		name     string
+		priority string
+		wantChat bool
+	}{
+		{"LOW skips chat", "LOW", false},
+		{"lowercase low still matches (case-insensitive)", "low", false},
+		{"HIGH still sends chat", "HIGH", true},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			email := &mockEmailSender{}
+			chat := &mockGoogleChatSender{}
+			d := newTestDispatcher(email, chat, &mockCallSender{})
+
+			record := eventbus.Record{Value: []byte(`{"type":"case.created","entityId":"C-1","payload":{"reporterName":"Reporter","projectName":"Proj","projectId":"PROJ-1","caseId":"C-1","caseTitle":"Something broke","caseType":"CASE","priority":"` + tc.priority + `","product":"api-manager","createdAt":"2026-01-01","description":"desc","recipients":["test-recipient@example.com"]}}`)}
+
+			if err := d.Handle(context.Background(), record); err != nil {
+				t.Fatalf("Handle() error = %v", err)
+			}
+
+			gotChat := len(chat.caseCreatedCalls) > 0
+			if gotChat != tc.wantChat {
+				t.Errorf("SendCaseCreatedAlert called = %v, want %v", gotChat, tc.wantChat)
+			}
+			if len(email.calls) != 1 {
+				t.Errorf("expected the email reaction to still fire, got %d call(s)", len(email.calls))
+			}
+		})
+	}
+}
+
 // TestDispatcher_Handle_CaseCreated_EmailShowsHumanReadableCaseType verifies
 // the "Case Type" row in the case-created email shows a reader-friendly
 // label (e.g. "Security Report Analysis"), not entity-service's raw

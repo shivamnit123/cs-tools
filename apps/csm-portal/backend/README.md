@@ -284,12 +284,12 @@ configured at all, nobody can use the portal.
 | Variable | Grants |
 |---|---|
 | `AUTH_VIEWER_ROLES` | view |
-| `AUTH_ESCALATOR_ROLES` | view, escalate |
+| `AUTH_ESCALATOR_ROLES` | view, escalate (`cs_engineer` does NOT grant this — escalation is a dedicated responsibility) |
 | `AUTH_ATTACHMENT_DOWNLOADER_ROLES` | view, download_attachment |
-| `AUTH_SUPPORT_ENGINEER_ROLES` | view, view_operations, time_cards_and_updates, escalate, download_attachment, write (which includes posting comments), security_center — everything except `admin`-only routes. Grants the `cs_engineer` portal role (renamed from `support_engineer`; the env var name was deliberately left as-is to avoid a coordinated deployment config change) |
+| `AUTH_SUPPORT_ENGINEER_ROLES` | view, view_operations, time_cards_and_updates, download_attachment, write (which includes posting comments), security_center — everything except `admin`-only routes, escalating a case, and approving a time card (each a dedicated responsibility held only by its own role plus admin). Grants the `cs_engineer` portal role (renamed from `support_engineer`; the env var name was deliberately left as-is to avoid a coordinated deployment config change) |
 | `AUTH_ADMIN_ROLES` | everything, including `admin`-only routes no other role holds |
 | `AUTH_USAGE_METRICS_VIEWER_ROLES` | view |
-| `AUTH_TIMECARD_APPROVER_ROLES` | view, time_cards_and_updates |
+| `AUTH_TIMECARD_APPROVER_ROLES` | view, time_cards_and_updates, and approving/rejecting a time card (`PATCH /time-cards/{id}` with `state` set — `cs_engineer` does NOT grant this) |
 | `AUTH_DASHBOARD_DESIGNER_ROLES` | view |
 
 ```bash
@@ -302,8 +302,9 @@ AUTH_ESCALATOR_ROLES=example-escalators-role,example-leads-role
 | authenticated | `GET`/`PATCH /users/me` — any valid token, no role needed, so a user holding no portal role can still load their profile and be shown a "no access" screen |
 | `view` | every other `GET`, `*/search` and `*/aggregate` |
 | `view_operations` | the same reads under `/incidents`, `/change-requests`, `/problems`, `/incident-tasks`, `/outages`, `/alerts` and `/smart-alerts` — CS engineer and admin only, so a view-only role sees cases and customers but not Operations |
-| `time_cards_and_updates` | every time-card route (`POST /time-cards/search`, `POST /time-cards`, `PATCH`/`DELETE /time-cards/{id}`) and the update-level lookups (`GET /updates/product-update-levels`, `POST /updates/levels/search`) — CS engineer, admin and time-card approver only, so a view-only role sees neither area, and an approver can approve without being a CS engineer |
-| `escalate` | `POST /cases/{id}/escalations` |
+| `time_cards_and_updates` | every time-card route (`POST /time-cards/search`, `POST /time-cards`, `PATCH`/`DELETE /time-cards/{id}`) and the update-level lookups (`GET /updates/product-update-levels`, `POST /updates/levels/search`) — CS engineer, admin and time-card approver only, so a view-only role sees neither area. Approving/rejecting a time card (a `state`-carrying `PATCH /time-cards/{id}`) additionally requires the separate `approve_time_card` permission below, held only by time-card approver and admin |
+| `approve_time_card` | `PATCH /time-cards/{id}` when the body sets `state` (approve/reject) — time-card approver and admin only, checked by inspecting the body inside the shared handler, not a route permission of its own |
+| `escalate` | `POST /cases/{id}/escalations` — escalator and admin only |
 | `download_attachment` | `GET /attachments/{id}/content`, `POST /attachments/{id}/share` |
 | `write` | every other `POST`/`PATCH`/`DELETE`, including case, incident and change-request comments — except the `admin`-only routes below |
 | `admin` | `POST /users` (create a new platform user) — held by the `admin` role alone; `cs_engineer` does not grant it |

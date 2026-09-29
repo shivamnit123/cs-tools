@@ -351,6 +351,16 @@ export default function ProblemDetailPage(): JSX.Element {
             <Typography variant="body2">{formatDateTime(problem.closedOn)}</Typography>
           </MetaCell>
         </Box>
+        {problem.description && (
+          <Box sx={{ display: "flex", flexDirection: "column", gap: 0.5 }}>
+            <Typography variant="body2" color="text.secondary">
+              Description
+            </Typography>
+            <Typography variant="body2" sx={{ whiteSpace: "pre-wrap" }}>
+              {problem.description}
+            </Typography>
+          </Box>
+        )}
       </Card>
 
       {hasLinks && (
