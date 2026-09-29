@@ -167,6 +167,7 @@ func (e *Engine) generateDrafts(ctx context.Context, caseID string) error {
 			Title:           d.Title,
 			Body:            d.Body,
 			AuthorID:        e.authorID,
+			SourceCaseID:    &caseID,
 		}
 		if err := e.kb.CreateKBArticle(ctx, req); err != nil {
 			return fmt.Errorf("kbdraftengine: save draft for case %s: %w", caseID, err)

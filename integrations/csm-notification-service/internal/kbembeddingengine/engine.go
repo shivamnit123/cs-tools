@@ -54,6 +54,9 @@ func (e *Engine) Handle(ctx context.Context, record eventbus.Record) error {
 	if env.Type != events.TypeKBArticlePublished {
 		return nil
 	}
+	if err := events.Validate(env.EntityID, env.Type, env.Payload); err != nil {
+		return fmt.Errorf("kbembeddingengine: invalid payload: %w", err)
+	}
 
 	var p events.KBArticlePublishedPayload
 	if err := json.Unmarshal(env.Payload, &p); err != nil {

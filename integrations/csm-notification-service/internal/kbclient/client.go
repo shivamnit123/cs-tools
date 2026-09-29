@@ -136,6 +136,7 @@ type CreateKBArticleRequest struct {
 	Body            string  `json:"body"`
 	AuthorID        string  `json:"authorId"`
 	TeamKey         *string `json:"teamKey,omitempty"`
+	SourceCaseID    *string `json:"sourceCaseId,omitempty"`
 }
 
 // KBArticle is the minimal subset of entity-service's domain.KBArticle
