@@ -47,6 +47,7 @@ import (
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/eventbus"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/events"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/kbclient"
+	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/piifilter"
 )
 
 // DraftArticle is one LLM-generated draft, before it's saved.
@@ -142,6 +143,11 @@ func (e *Engine) generateDrafts(ctx context.Context, caseID string) error {
 		return fmt.Errorf("kbdraftengine: fetch comments for case %s: %w", caseID, err)
 	}
 	slog.InfoContext(ctx, "kbdraftengine: fetched case comments", "caseID", caseID, "commentCount", len(texts))
+
+	// Scrub PII (emails, phones, timestamps, names) before sending to Azure OpenAI.
+	pf := piifilter.New()
+	texts = pf.FilterAll(texts)
+	slog.InfoContext(ctx, "kbdraftengine: PII-filtered comments", "caseID", caseID, "commentCount", len(texts))
 
 	drafts, err := e.generateFromComments(ctx, caseID, texts)
 	if err != nil {
