@@ -277,4 +277,21 @@ window.config = {
   //   false – reverts to the legacy behavior: a disabled dropdown with no
   //           alert or CTA, and the form is never blocked on empty options.
   CUSTOMER_PORTAL_ALLOW_DEPLOYMENT_SETUP_DURING_CASE_CREATION: true,
+
+  // ── Case-activity live stream (SSE) ─────────────────────────────────────────
+  //
+  // CUSTOMER_PORTAL_STREAM_BASE_URL  (optional)
+  //   Base URL of customer-portal-activity-stream-service — its own Choreo
+  //   component, NOT a path under CUSTOMER_PORTAL_BACKEND_BASE_URL. When the
+  //   case detail page is open, the portal holds an SSE connection here and
+  //   refreshes the case's comments/details as soon as either changes,
+  //   instead of waiting out their staleTime. Leave unset if that service
+  //   isn't deployed — the stream then simply never starts.
+  // CUSTOMER_PORTAL_STREAM_BASE_URL: "<your-stream-base-url>",
+  //
+  // CUSTOMER_PORTAL_STREAM_ENABLED  (optional — default: false)
+  //   Master on/off switch for the stream, independent of whether
+  //   CUSTOMER_PORTAL_STREAM_BASE_URL is set. Must be the literal `true` to
+  //   turn it on, so omitting this key always leaves the feature off.
+  CUSTOMER_PORTAL_STREAM_ENABLED: false,
 };

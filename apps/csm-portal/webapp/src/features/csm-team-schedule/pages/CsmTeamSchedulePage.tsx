@@ -22,6 +22,9 @@ import { useErrorBanner } from "@context/error-banner/ErrorBannerContext";
 import { useCurrentUser } from "@context/current-user/CurrentUserContext";
 import {
   useApplyAbsence,
+  useCreateAbsenceKind,
+  useDeleteAbsenceKind,
+  useDeleteAbsence,
   useScheduleEditMarkers,
   useApplyRange,
   useMyLeadTeams,
@@ -34,7 +37,8 @@ import {
   type MonthWindow,
   type RotaRead,
 } from "../api/useTeamSchedule";
-import CellPicker, { type CellPickerTarget } from "../components/CellPicker";
+import CellPicker, { type CellPickerTarget, type NewAbsenceKind } from "../components/CellPicker";
+import { BackendApiError } from "@api/backend/client";
 import DayLadder, { type LadderLane } from "../components/DayLadder";
 import MonthRoster from "../components/MonthRoster";
 import MyWeekStrip from "../components/MyWeekStrip";
@@ -45,16 +49,23 @@ import type {
   ScheduleAbsencesResponse,
   ScheduleAssignment,
   ScheduleAssignmentsResponse,
+  ScheduleTier,
 } from "../types";
 import { resolveDisplayTimeZone } from "@utils/dateTime";
 import { TeamColourProvider } from "../utils/teamColour";
 import {
   addDays,
   isRotationShift,
+  kindsOfferedOn,
+  monthPieces,
+  readerFamily,
+  rosterRange,
+  type RosterSpan,
   mondayOf,
   shiftsByCode,
   toIsoDate,
   zoneAbbreviation,
+  zoneLabelOn,
 } from "../utils/rota";
 import { zoneColour } from "../utils/rotaHues";
 import { SCHEDULE_THEME_VARS } from "../utils/useScheduleTheme";
@@ -79,15 +90,15 @@ const TITLE: Record<ViewTab, string> = {
   roster: "Month roster",
 };
 
-/** How many months the roster shows either side of the selected one. One:
- *  last month, this month and next -- the history a lead checks a swap
- *  against, and the month they are planning, without paging. */
-const ROSTER_MONTHS_EITHER_SIDE = 1;
-
-const fmtMonthRange = (first: Date, last: Date): string => {
+/** The roster's window as days, "14 Sept – 12 Oct 2026": it opens and closes
+ *  on the days either side of the selected one, not on month boundaries. */
+const fmtDayRange = (first: Date, last: Date): string => {
   const sameYear = first.getFullYear() === last.getFullYear();
-  const a = first.toLocaleDateString(undefined, sameYear ? { month: "short" } : { month: "short", year: "numeric" });
-  const b = last.toLocaleDateString(undefined, { month: "short", year: "numeric" });
+  const a = first.toLocaleDateString(
+    undefined,
+    sameYear ? { day: "numeric", month: "short" } : { day: "numeric", month: "short", year: "numeric" },
+  );
+  const b = last.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
   return `${a} – ${b}`;
 };
 
@@ -143,6 +154,10 @@ export default function CsmTeamSchedulePage(): JSX.Element {
    *  would show them three disabled tabs on arrival. */
   const [familyChoice, setFamilyChoice] = useState<Family | null>(null);
   const [teamKey, setTeamKey] = useState<string>("");
+  /** How many months the roster shows, centred on the selected day; see
+   *  rosterRange. One by default: the fortnight either side of today is what
+   *  a lead opens the roster to check. */
+  const [rosterSpan, setRosterSpan] = useState<RosterSpan>(1);
   const [anchor, setAnchor] = useState<Date>(() => new Date());
   /** Bumped by Today; a view listens to it to re-centre on the current day. */
   const [focusRequest, setFocusRequest] = useState(0);
@@ -173,6 +188,9 @@ export default function CsmTeamSchedulePage(): JSX.Element {
   const { showError } = useErrorBanner();
   const applyRange = useApplyRange();
   const applyAbsence = useApplyAbsence();
+  const deleteAbsence = useDeleteAbsence();
+  const createKind = useCreateAbsenceKind();
+  const deleteKind = useDeleteAbsenceKind();
 
   /** Edit mode, and the cell it has open.
    *
@@ -208,76 +226,74 @@ export default function CsmTeamSchedulePage(): JSX.Element {
   const canEditRota = (leadTeams.data ?? []).length > 0;
 
 
-  /** The reader's own group, from their CSM profile. Absent for anyone who
-   *  belongs to no team -- a manager -- which is why it is optional rather
-   *  than defaulting to CRE. */
+  /** The reader's own group, from their CSM profile: their team, or for a
+   *  rota admin the group their role runs (see readerFamily). Absent for
+   *  anyone who belongs to neither -- a manager -- which is why it is
+   *  optional rather than defaulting to CRE. */
   const myFamily: Family | undefined = useMemo(() => {
-    const f = user?.team?.family?.toUpperCase();
-    if (!f) return undefined;
-    return f.startsWith("SRE") ? "SRE" : "CRE";
-  }, [user?.team?.family]);
+    const familyOfTeam = new Map((catalogue.data?.teams ?? []).map((t) => [t.key, t.family]));
+    const editable = (leadTeams.data ?? [])
+      .map((k) => familyOfTeam.get(k))
+      .filter((f): f is Family => Boolean(f));
+    return readerFamily(user?.team?.family, user?.roles, editable);
+  }, [user?.team?.family, user?.roles, leadTeams.data, catalogue.data?.teams]);
 
-  /** The group on screen: the reader's own until they choose otherwise.
-   *  CRE only as a last resort, for a manager who belongs to neither. */
-  const family: Family = familyChoice ?? myFamily ?? "CRE";
-
-  /** Their own group first in the segment. An SRE engineer reads "SRE | CRE",
-   *  because the first thing in a pair reads as the default, and theirs is. */
-  const families: Family[] =
-    myFamily === "SRE" ? ["SRE", "CRE"] : ["CRE", "SRE"];
-
-  /** Nobody's group: a manager, who belongs to no team at all. */
+  /** Nobody's group: a manager, who belongs to no team and runs no rota. */
   const isManager = myFamily === undefined;
 
   /** The tab the page opens on. An engineer's first question is their own
    *  rota, so they land on My week; a manager holds none, and comes here to see
    *  who is covering, so they land on Today. Derived rather than set in an
-   *  effect, like `family` above: /users/me has settled before this page
-   *  mounts, so the first frame is already the right one. */
+   *  effect: /users/me has settled before this page mounts, so the first frame
+   *  is already the right one. */
   const tab: ViewTab = tabChoice ?? (isManager ? "today" : "mine");
 
-  /** Whether the group on screen is the reader's own. */
-  const ownGroup = !isManager && myFamily === family;
-
   /**
-   * Which views apply to this reader, on this group.
-   *
-   *   own group     all four -- their rota, their team, their month
-   *   other group   Today only. It answers "who is covering right now", which
-   *                 a CRE engineer escalating to SRE needs. This week and the
-   *                 roster are planning views for a rota they are not part of.
-   *   a manager     everything but My week, on both groups. The one thing
-   *                 that genuinely has nothing to show them is their own rota,
-   *                 because they hold none. Who is covering -- today, across
-   *                 the week, across the month -- is their question for CRE
-   *                 and SRE alike, so the roster is theirs to read too.
-   */
-  const appliesToView = (t: ViewTab): boolean => {
-    if (isManager) return t !== "mine";
-    return ownGroup || t === "today";
-  };
-
-  /**
-   * Which tabs are on the strip at all.
-   *
-   * Disabling and removing answer different situations. An engineer looking at
-   * the other group sees the tab greyed, because toggling back brings it
-   * straight back -- removing it would make the strip change shape under them.
-   * A manager has no such toggle: they hold no rota on either group, so My week
-   * can never apply to them, and a permanently dead tab is just something to
-   * wonder about. It is not offered.
+   * Which tabs are on the strip at all. A manager holds no rota on either
+   * group, so My week can never apply to them, and a permanently dead tab is
+   * just something to wonder about. It is not offered.
    */
   const visibleTabs: ViewTab[] = (["mine", "today", "week", "roster"] as ViewTab[]).filter(
     (t) => !(isManager && t === "mine"),
   );
 
-  /** The tab actually being shown.
+  /** The tab actually being shown. A manager's remembered My week (from
+   *  before the profile said they hold no rota) falls back to Today. */
+  const view: ViewTab = isManager && tab === "mine" ? "today" : tab;
+
+  /**
+   * Whether this view can show the other group.
    *
-   *  Derived, not corrected after the fact: switching group while on My week
-   *  has to land somewhere the same render, or the reader sees one frame of an
-   *  empty strip before it rights itself. Their choice of tab is remembered,
-   *  so switching back to their own group returns them to My week. */
-  const view: ViewTab = appliesToView(tab) ? tab : "today";
+   *   Today         yes. It answers "who is covering right now", which a CRE
+   *                 engineer escalating to SRE needs, and the other way round.
+   *   the rest      no, for an engineer. My week, This week and the roster are
+   *                 planning views for their own rota; the other group's is
+   *                 not theirs to check, so there is no switch to offer.
+   *   a manager     yes, everywhere. They belong to neither group, and who is
+   *                 covering -- today, across the week, across the month -- is
+   *                 their question for CRE and SRE alike.
+   */
+  const crossesGroups = isManager || view === "today";
+
+  /** The group on screen: the reader's own, unless Today (or a manager) has
+   *  picked the other. CRE only as a last resort, for a manager who belongs
+   *  to neither. The choice made on Today is kept for Today, so leaving it
+   *  for the roster and coming back does not lose it. */
+  const family: Family = crossesGroups ? (familyChoice ?? myFamily ?? "CRE") : (myFamily ?? "CRE");
+
+  /** The groups the switch offers, the reader's own first: an SRE engineer
+   *  reads "SRE | CRE", because the first thing in a pair reads as the
+   *  default, and theirs is. One group means no switch at all. */
+  const families: Family[] = !crossesGroups
+    ? [family]
+    : myFamily === "SRE"
+      ? ["SRE", "CRE"]
+      : ["CRE", "SRE"];
+
+  /** The team filter, where it belongs to the group on screen. A team picked
+   *  on Today's SRE side means nothing on the reader's CRE roster, and would
+   *  otherwise filter it to nobody. */
+  const shownTeamKey = teamKey && teamsOf(family).includes(teamKey) ? teamKey : "";
 
   const weekStart = useMemo(() => mondayOf(anchor), [anchor]);
   /** The group/team controls the cards render in their own heads. It is the
@@ -289,7 +305,7 @@ export default function CsmTeamSchedulePage(): JSX.Element {
       setFamilyChoice(f);
       setTeamKey("");
     },
-    teamKey,
+    teamKey: shownTeamKey,
     onTeamKeyChange: setTeamKey,
     teams: teamsOf(family),
     families,
@@ -297,26 +313,17 @@ export default function CsmTeamSchedulePage(): JSX.Element {
 
   const dayView = view === "today";
   const rosterView = view === "roster";
-  /** The roster's window: the selected month with one either side, as the
-   *  calendar months it is fetched in. Keyed on the month rather than the
-   *  anchor, so stepping a day inside a month does not rebuild it. */
-  const anchorMonthKey = `${anchor.getFullYear()}-${anchor.getMonth()}`;
-  const rosterMonths: MonthWindow[] = useMemo(() => {
-    const [y, m] = anchorMonthKey.split("-").map(Number);
-    const out: MonthWindow[] = [];
-    for (let o = -ROSTER_MONTHS_EITHER_SIDE; o <= ROSTER_MONTHS_EITHER_SIDE; o++) {
-      out.push({ from: toIsoDate(new Date(y, m + o, 1)), to: toIsoDate(new Date(y, m + o + 1, 0)) });
-    }
-    return out;
-  }, [anchorMonthKey]);
-  const rosterStart = useMemo(() => new Date(`${rosterMonths[0].from}T00:00:00`), [rosterMonths]);
-  const rosterEnd = useMemo(
-    () => new Date(`${rosterMonths[rosterMonths.length - 1].to}T00:00:00`),
-    [rosterMonths],
-  );
+  /** The roster's window: its span either side of the selected day, and the
+   *  calendar-month pieces it is fetched in. Keyed on the day and the span
+   *  rather than on the Date, which is a fresh object each render. */
+  const anchorIso = toIsoDate(anchor);
+  const { rosterStart, rosterEnd, rosterMonths } = useMemo(() => {
+    const { start, end } = rosterRange(new Date(`${anchorIso}T00:00:00`), rosterSpan);
+    return { rosterStart: start, rosterEnd: end, rosterMonths: monthPieces(start, end) as MonthWindow[] };
+  }, [anchorIso, rosterSpan]);
   const from = dayView ? toIsoDate(anchor) : toIsoDate(weekStart);
   const to = dayView ? toIsoDate(anchor) : toIsoDate(addDays(weekStart, 6));
-  const teamKeys = teamKey ? [teamKey] : undefined;
+  const teamKeys = shownTeamKey ? [shownTeamKey] : undefined;
 
   const singleRead = useScheduleAssignments(
     {
@@ -407,15 +414,12 @@ export default function CsmTeamSchedulePage(): JSX.Element {
 
   /** A lead picked a cell on the roster. The roster says which slot and
    *  where on screen; the picker does the rest. */
-  const editCell = (edit: {
-    userId: string;
-    name: string;
-    teamKey: string;
-    rotaDate: string;
-    shiftCode?: string;
-    anchor: { top: number; left: number; bottom: number; right: number };
-  }): void => {
-    setPicker({ ...edit, baseShiftCode: baseShiftFor(edit.userId) });
+  const editCell = (edit: Omit<CellPickerTarget, "baseShiftCode" | "otherTurns">): void => {
+    setPicker({
+      ...edit,
+      baseShiftCode: baseShiftFor(edit.userId),
+      otherTurns: holdsTurnElsewhere(edit.userId, edit.rotaDate, edit.zoneCode, edit.shiftCode),
+    });
   };
 
   /** The standing window this engineer sits in on an ordinary weekday, read
@@ -425,6 +429,22 @@ export default function CsmTeamSchedulePage(): JSX.Element {
    *  goes back to when a rotation is cleared is a fact about that engineer,
    *  not about their group, and guessing it would quietly move people onto
    *  the wrong clock. */
+  /** Is the clicked cell an escalation turn, on a day the engineer holds
+   *  something else too -- a turn in another zone, or regular hours? Then
+   *  clearing takes off that zone's turn only, rather than putting the whole
+   *  day back on regular hours. */
+  const holdsTurnElsewhere = (userId: string, rotaDate: string, zoneCode?: string, shiftCode?: string): boolean => {
+    if (!zoneCode || !shiftCode || !shifts.get(shiftCode)?.isEscalation) return false;
+    return rows.some(
+      (a) =>
+        a.engineer.userId === userId &&
+        a.rotaDate === rotaDate &&
+        a.shiftCode !== shiftCode &&
+        (!shifts.get(a.shiftCode)?.isEscalation ||
+          (a.zoneCode ?? shifts.get(a.shiftCode)?.zoneCode) !== zoneCode),
+    );
+  };
+
   const baseShiftFor = (userId: string): string | undefined => {
     const seen = new Map<string, number>();
     for (const a of rows) {
@@ -443,13 +463,6 @@ export default function CsmTeamSchedulePage(): JSX.Element {
   /** The windows this group runs, which is what the picker offers. Filtered
    *  by family and nothing narrower: the catalogue's own codes are already
    *  CRE or SRE, so there is no second rule to keep in step with. */
-  /** What a lead may mark somebody away for: leave, and only leave.
-   *
-   *  An allocation -- a customer engagement, an onboarding -- is not the ABT
-   *  lead's call to make from a rota grid, so those kinds stay read-only here
-   *  even though the grid shows them. Read off the catalogue's own bucket
-   *  rather than a list of codes, so a leave kind added later appears without
-   *  a change here. */
   /** Who changed which cell, over exactly the months the roster is showing.
    *
    *  Only asked for while the roster is open -- no other view marks a cell --
@@ -465,30 +478,31 @@ export default function CsmTeamSchedulePage(): JSX.Element {
     return out;
   }, [editMarkers.markers]);
 
-  const leaveKinds = useMemo(
-    () => (catalogue.data?.absenceKinds ?? []).filter((k) => k.bucket === "LEAVE"),
-    [catalogue.data?.absenceKinds],
+  /** What a lead can mark somebody away for from the roster: leave, and time
+   *  allocated elsewhere -- on this rota. CRE and SRE allocate time to
+   *  different things (RnD is SRE's, Migration is CRE's), so each is offered
+   *  only its own. EXCLUDED -- off the rota entirely -- is not a lead's to set
+   *  from a cell, and a retired kind is served only so old days keep their
+   *  label. */
+  const awayKinds = useMemo(
+    () =>
+      kindsOfferedOn(catalogue.data?.absenceKinds ?? [], family),
+    [catalogue.data?.absenceKinds, family],
   );
 
-  /** The windows the picker offers for the cell that is open.
-   *
-   *  Always the group's own, and on an SRE day split across zone columns also
-   *  only that zone's: the column a lead clicked is the zone they mean, and
-   *  offering TZ1's windows from the TZ2 column invites a mis-click that is
-   *  invisible afterwards -- the cell fills in, just in the wrong lane.
-   *
-   *  Windows belonging to no zone stay on offer either way. SRE regular hours
-   *  is not a zone's to own, and a lead putting somebody back on ordinary
-   *  hours should not have to leave the column to do it. */
-  const pickerShifts = useMemo(() => {
-    const zone = picker?.zoneCode;
-    return [...shifts.values()].filter(
-      (sh) => sh.family === family && (!zone || !sh.zoneCode || sh.zoneCode === zone),
-    );
-  }, [shifts, family, picker?.zoneCode]);
+  /** The windows the picker offers for the cell that is open: every window
+   *  the group works, in every zone. The zone column a lead clicked is marked
+   *  in the picker rather than used to hide the others -- rostering L3 for
+   *  TZ2 from a TZ1 cell is an ordinary thing to want, and having to find the
+   *  TZ2 column first made it a hunt. */
+  const pickerShifts = useMemo(
+    () => [...shifts.values()].filter((sh) => sh.family === family),
+    [shifts, family],
+  );
 
-  const applyToCell = (shiftCode: string, from: string, to: string): void => {
+  const applyToCell = (shiftCode: string, from: string, to: string, tier?: ScheduleTier): void => {
     if (!picker) return;
+    const label = shifts.get(shiftCode)?.label ?? shiftCode;
     applyRange.mutate(
       {
         userId: picker.userId,
@@ -497,10 +511,10 @@ export default function CsmTeamSchedulePage(): JSX.Element {
         from,
         to,
         note: "set from the month roster",
+        ...(tier ? { tier } : {}),
       },
       {
-        onSuccess: () =>
-          recordChange(picker, from, to, shifts.get(shiftCode)?.label ?? shiftCode),
+        onSuccess: () => recordChange(picker, from, to, tier ? `${tier} · ${label}` : label),
         onError: (err) =>
           showError("That change to the rota was not saved. Nothing has moved.", err),
         onSettled: () => setPicker(null),
@@ -511,7 +525,7 @@ export default function CsmTeamSchedulePage(): JSX.Element {
   const recordChange = (target: CellPickerTarget, from: string, to: string, what: string): void =>
     setChanges((cs) => [...cs, { userId: target.userId, name: target.name, from, to, what }]);
 
-  const markAway = (kindCode: string, from: string, to: string): void => {
+  const markAway = (kindCode: string, from: string, to: string, allocatedTo?: string): void => {
     if (!picker) return;
     applyAbsence.mutate(
       {
@@ -521,6 +535,7 @@ export default function CsmTeamSchedulePage(): JSX.Element {
         from,
         to,
         note: "marked from the month roster",
+        ...(allocatedTo ? { allocatedTo } : {}),
       },
       {
         onSuccess: () =>
@@ -529,7 +544,9 @@ export default function CsmTeamSchedulePage(): JSX.Element {
             from,
             to,
             kindCode
-              ? (leaveKinds.find((k) => k.code === kindCode)?.label ?? kindCode)
+              ? `${awayKinds.find((k) => k.code === kindCode)?.label ?? kindCode}${
+                  allocatedTo ? ` (${allocatedTo})` : ""
+                }`
               : "back on the rota",
           ),
         onError: (err) =>
@@ -538,6 +555,56 @@ export default function CsmTeamSchedulePage(): JSX.Element {
       },
     );
   };
+
+  /** Remove the whole leave or allocation the clicked cell is part of. */
+  const removeAbsence = (absenceId: string): void => {
+    if (!picker?.absence) return;
+    const ab = picker.absence;
+    const label =
+      (catalogue.data?.absenceKinds ?? []).find((k) => k.code === ab.kindCode)?.label ?? ab.kindCode;
+    deleteAbsence.mutate(
+      { id: absenceId, note: "removed from the month roster" },
+      {
+        onSuccess: () =>
+          recordChange(picker, ab.startsOn, ab.endsOn ?? ab.startsOn, `${label} removed`),
+        onError: (err) =>
+          showError("That leave or allocation was not removed. Nothing has changed.", err),
+        onSettled: () => setPicker(null),
+      },
+    );
+  };
+
+  /** Add a tag to the shared catalogue. The picker stays open so the lead can
+   *  use it straight away; the form shows why when it is refused. */
+  const addKind = (kind: NewAbsenceKind): Promise<void> =>
+    createKind.mutateAsync(kind).then(
+      () => undefined,
+      (err: unknown) => {
+        throw new Error(
+          err instanceof BackendApiError && err.status === 409
+            ? "A tag with that name or short code already exists."
+            : err instanceof BackendApiError && err.status === 403
+              ? "Only a team lead can add a tag."
+              : "The tag was not added. Try again.",
+        );
+      },
+    );
+
+  /** Delete a tag a lead added. The picker stays open and shows why when the
+   *  server refuses -- most often because the tag is still in use. */
+  const removeKind = (code: string): Promise<void> =>
+    deleteKind.mutateAsync(code).then(
+      () => undefined,
+      (err: unknown) => {
+        throw new Error(
+          err instanceof BackendApiError && err.status === 409
+            ? "That tag is still used on the rota. Remove those entries first."
+            : err instanceof BackendApiError && err.status === 403
+              ? "Only a team lead can delete a tag, and never a built-in one."
+              : "The tag was not deleted. Try again.",
+        );
+      },
+    );
 
   /** Clearing a cell means two different writes depending on what is on it.
    *
@@ -548,8 +615,32 @@ export default function CsmTeamSchedulePage(): JSX.Element {
    *  back to the standing window the way it always did. */
   const clearCell = (shiftCode: string, from: string, to: string): void => {
     if (!picker) return;
-    if (picker.absenceKindCode) {
+    // A cell holding a turn and an allocation beside it clears the turn;
+    // the allocation has its own Remove.
+    if (picker.absenceKindCode && !picker.shiftCode) {
       markAway("", from, to);
+      return;
+    }
+    // One zone's turn, on a day with turns in other zones too: take off this
+    // one and leave the rest of the day as it is.
+    if (picker.otherTurns && picker.zoneCode) {
+      applyRange.mutate(
+        {
+          userId: picker.userId,
+          teamKey: picker.teamKey,
+          shiftCode: "",
+          zoneCode: picker.zoneCode,
+          from,
+          to,
+          note: "cleared from the month roster",
+        },
+        {
+          onSuccess: () =>
+            recordChange(picker, from, to, `off ${picker.zoneCode}${picker.tier ? ` ${picker.tier}` : ""}`),
+          onError: (err) => showError("That change to the rota was not saved. Nothing has moved.", err),
+          onSettled: () => setPicker(null),
+        },
+      );
       return;
     }
     applyToCell(shiftCode, from, to);
@@ -559,9 +650,9 @@ export default function CsmTeamSchedulePage(): JSX.Element {
   // clock, so it gets one lane.
   /** The zones SRE actually staffs on the day being viewed.
    *
-   *  The catalogue's weekend windows are TZ1 and TZ2 only -- there is no
-   *  weekend TZ3 for anyone to be rostered into -- so a weekend earns two
-   *  lanes and a weekday three. Read from the shifts rather than written down
+   *  At the weekend TZ1 and TZ2 are one crew, carried under TZ1, and TZ3 is
+   *  as it is on a weekday -- so a weekend earns two lanes and a weekday
+   *  three. Read from the shifts rather than written down
    *  here, which is the same rule the month roster follows and from the same
    *  place: a rota change lands in both without a code change, and a lane can
    *  never appear that nobody could be working in.
@@ -587,17 +678,22 @@ export default function CsmTeamSchedulePage(): JSX.Element {
         { name: "Rotations", sub: "on-call, the night and regular hours", colour: "var(--muted)", assignments: rows },
       ];
     }
-    return zonesOnDay.map((z) => ({
-      name: z.code,
-      sub: z.label,
-      colour: zoneColour(z.code),
-      // The same resolution the month roster uses: an assignment's own zone,
-      // else its window's, so a zoned window stored without one still lands.
-      assignments: rows.filter((a) => (a.zoneCode ?? shifts.get(a.shiftCode)?.zoneCode) === z.code),
-      // Escalation on one side, everyone else in the zone on the other.
-      layout: "zone" as const,
-    }));
-  }, [family, rows, shifts, zonesOnDay]);
+    const weekendDay = anchor.getDay() === 0 || anchor.getDay() === 6;
+    return zonesOnDay.map((z) => {
+      // At the weekend the TZ1 lane is TZ1 and TZ2 together.
+      const name = zoneLabelOn(shifts, z.code, weekendDay);
+      return {
+        name,
+        sub: name === z.code ? z.label : "Weekend crew",
+        colour: zoneColour(z.code),
+        // The same resolution the month roster uses: an assignment's own zone,
+        // else its window's, so a zoned window stored without one still lands.
+        assignments: rows.filter((a) => (a.zoneCode ?? shifts.get(a.shiftCode)?.zoneCode) === z.code),
+        // Escalation on one side, everyone else in the zone on the other.
+        layout: "zone" as const,
+      };
+    });
+  }, [anchor, family, rows, shifts, zonesOnDay]);
 
   if (catalogue.isError) {
     return <QueryErrorState message="Could not load the schedule catalogue." error={catalogue.error} />;
@@ -614,35 +710,31 @@ export default function CsmTeamSchedulePage(): JSX.Element {
         <div className="tabrow">
           <div className="tabs" role="tablist">
             {visibleTabs.map((t) => {
-              const off = !appliesToView(t);
               return (
               <button
                 key={t}
                 id={`ts-tab-${t}`}
-                className={`tab ${view === t ? "on" : ""}${off ? " off" : ""}`}
+                className={`tab ${view === t ? "on" : ""}`}
                 role="tab"
                 // The CSS class said which tab was active; nothing did for a
                 // screen reader, which read four equal buttons and a panel
                 // belonging to none of them.
                 aria-selected={view === t}
                 aria-controls="ts-panel"
-                disabled={off}
-                aria-disabled={off}
-                title={
-                  !off
-                    ? undefined
-                    : isManager
-                      ? "You hold no rota, so this view has nothing of yours to show."
-                      : `You are on ${myFamily}. Only “Who is working today” applies to ${family}.`
-                }
-                onClick={() => setTab(t)}
+                onClick={() => {
+                  setTab(t);
+                  // My week is the reader's own rota and who they work it
+                  // with, whichever team that is -- a team picked on another
+                  // view would hide those people, so it opens on All teams.
+                  if (t === "mine") setTeamKey("");
+                }}
               >
                 <span className="tl">{TITLE[t]}</span>
                 <span className="tsub">
                   {t === "today"
                     ? fmtShort(anchor)
                     : t === "roster"
-                      ? fmtMonthRange(rosterStart, rosterEnd)
+                      ? fmtDayRange(rosterStart, rosterEnd)
                       : `${fmtShort(weekStart)} – ${fmtShort(addDays(weekStart, 6))}`}
                 </span>
               </button>
@@ -688,7 +780,7 @@ export default function CsmTeamSchedulePage(): JSX.Element {
                     {dayView
                       ? fmtLong(anchor)
                       : rosterView
-                        ? fmtMonthRange(rosterStart, rosterEnd)
+                        ? fmtDayRange(rosterStart, rosterEnd)
                         : `${fmtShort(weekStart)} – ${fmtShort(addDays(weekStart, 6))}`}
                   </b>
                   {/* The day the single chevrons are moving. Without it, a day
@@ -897,7 +989,10 @@ export default function CsmTeamSchedulePage(): JSX.Element {
               onEditCell={editCell}
               changedCells={editing ? changedCells : undefined}
               month={rosterStart}
-              monthCount={rosterMonths.length}
+              from={rosterStart}
+              to={rosterEnd}
+              span={rosterSpan}
+              onSpanChange={setRosterSpan}
               assignments={rows}
               absences={absences.data?.absences ?? []}
               shifts={shifts}
@@ -913,6 +1008,12 @@ export default function CsmTeamSchedulePage(): JSX.Element {
               tz={tz}
               myAbsences={mineAbsences.data?.absences ?? []}
               absenceKinds={catalogue.data?.absenceKinds ?? []}
+              // A day card opens that day in "Who is working today".
+              onShowDay={(iso) => {
+                const [y, m, d] = iso.split("-").map(Number);
+                setAnchor(new Date(y, m - 1, d));
+                setTab("today");
+              }}
             />
           )}
         </div>
@@ -927,10 +1028,22 @@ export default function CsmTeamSchedulePage(): JSX.Element {
           key={`${picker.userId}|${picker.rotaDate}|${picker.zoneCode ?? ""}`}
           target={picker}
           shifts={pickerShifts}
-          busy={applyRange.isPending || applyAbsence.isPending}
-          leaveKinds={leaveKinds}
+          // A tag being added or deleted counts too: the shared catalogue is
+          // mid-change, so a second click would send a second request.
+          busy={
+            applyRange.isPending ||
+            applyAbsence.isPending ||
+            deleteAbsence.isPending ||
+            createKind.isPending ||
+            deleteKind.isPending
+          }
+          awayKinds={awayKinds}
+          allKinds={catalogue.data?.absenceKinds}
           onApply={applyToCell}
           onMarkAway={markAway}
+          onRemoveAbsence={removeAbsence}
+          onCreateKind={addKind}
+          onDeleteKind={removeKind}
           onClear={clearCell}
           onClose={() => setPicker(null)}
         />

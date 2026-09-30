@@ -38,7 +38,7 @@ import { useSearchIncidentsForSelect } from "@features/csm-operations/api/useSea
 import AsyncEntitySelect from "@components/AsyncEntitySelect";
 import OutagePublicationNotice from "@features/csm-operations/components/OutagePublicationNotice";
 import { outageTypeLabel } from "@features/csm-operations/utils/outages";
-import { formatDateTimeLocal, parseDateTimeLocal } from "@utils/dateTime";
+import { formatDateTimeLocal, parseDateTimeLocal, zonedInputToBackendUtc } from "@utils/dateTime";
 import type { BeConfigurationItem, BeCreateOutagePayload, BeIncident, BeOutageType } from "@api/backend/types";
 
 const UNSET = "";
@@ -50,13 +50,6 @@ function configurationItemLabel(c: BeConfigurationItem): string {
 
 function incidentSearchLabel(i: BeIncident): string {
   return [i.number, i.subject].filter(Boolean).join(" — ") || i.id || "";
-}
-
-/** `YYYY-MM-DD HH:mm:ss` UTC, the shape `CHANGES-outage-api.md` documents
- * (ISO-8601 is also accepted, but the plain form avoids any ambiguity about
- * which timezone the wall-clock value the picker shows represents). */
-function toBackendDateTime(local: string): string {
-  return `${local.replace("T", " ")}:00`;
 }
 
 const OPERATIONS_OUTAGES_PATH = "/operations?tab=outages";
@@ -100,7 +93,9 @@ export default function CreateOutagePage(): JSX.Element {
   const endBeforeBegin = !!beginDate && !!endDate && endDate.getTime() < beginDate.getTime();
 
   const isTypeValid = type !== UNSET;
-  const isBeginValid = !!beginDate;
+  // The picker shows wall-clock in the user's timezone; the contract is UTC.
+  const beginUtc = zonedInputToBackendUtc(begin);
+  const isBeginValid = !!beginDate && !!beginUtc;
   const isShortDescriptionValid = shortDescription.trim().length > 0;
   const needsAcknowledgement = !!configurationItemId && !acknowledged;
   const canSubmit =
@@ -119,10 +114,11 @@ export default function CreateOutagePage(): JSX.Element {
 
     const payload: BeCreateOutagePayload = {
       type: type as BeOutageType,
-      begin: toBackendDateTime(begin),
+      begin: beginUtc as string,
       shortDescription: shortDescription.trim(),
     };
-    if (end) payload.end = toBackendDateTime(end);
+    const endUtc = end ? zonedInputToBackendUtc(end) : null;
+    if (endUtc) payload.end = endUtc;
     if (configurationItemId) payload.configurationItemId = configurationItemId;
     if (incidentId) payload.incidentId = incidentId;
     if (externalCommunication.trim()) payload.externalCommunication = externalCommunication.trim();

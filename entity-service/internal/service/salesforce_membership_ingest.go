@@ -60,7 +60,7 @@ func (s *salesforceEventService) handleProjectContactEvent(ctx context.Context, 
 	case domain.SalesforceEventCreated, domain.SalesforceEventUpdated, domain.SalesforceEventRestored:
 		return s.ingestMembership(ctx, req.ReferenceID, req.EventType, nil)
 	case domain.SalesforceEventDeleted:
-		found, err := s.membership.Memberships.DeactivateBySfID(ctx, req.ReferenceID)
+		found, err := s.membership.Memberships.DeactivateBySfID(ctx, req.ReferenceID, s.adminRoleBasis)
 		if err != nil {
 			return err
 		}
@@ -75,12 +75,14 @@ func (s *salesforceEventService) handleProjectContactEvent(ctx context.Context, 
 	}
 }
 
-// handleContactEvent is the Contact branch of HandleEvent: an UPDATED contact
-// (name, email, isCsAdmin, isCsIntegrationUser changed) re-runs the
-// membership upsert for each of its memberships so the user row and its
-// roles follow. CREATED is a no-op (a bare contact has no membership yet,
-// the Project_Contact__c event will follow) and so is DELETED (Salesforce
-// deletes the memberships too, each with its own event).
+// handleContactEvent is the Contact branch of HandleEvent. CREATED, UPDATED
+// and RESTORED run the Contact writer (salesforce_contact_ingest.go), which
+// writes the contact's "user" and account_contact rows whether or not it has
+// a membership, and then re-run the membership upsert for each of its
+// memberships so project_contact and the groups follow. DELETED deactivates
+// the contact's rows without fetching it (Salesforce hides deleted records
+// from reads); its memberships are deleted in Salesforce too, each with its
+// own event.
 func (s *salesforceEventService) handleContactEvent(ctx context.Context, req domain.SalesforceEventRequest) error {
 	if !s.membership.enabled() {
 		slog.InfoContext(ctx, "salesforce: membership ingest disabled, ignoring contact event",
@@ -88,38 +90,30 @@ func (s *salesforceEventService) handleContactEvent(ctx context.Context, req dom
 		return nil
 	}
 	slog.InfoContext(ctx, "salesforce: contact event", "eventType", req.EventType, "entity", req.Entity, "referenceId", req.ReferenceID)
-	if req.EventType != domain.SalesforceEventUpdated {
-		return nil
-	}
 
-	contact, err := s.membership.SalesEntity.GetContact(ctx, req.ReferenceID)
-	if err != nil {
-		return err
+	switch req.EventType {
+	case domain.SalesforceEventCreated, domain.SalesforceEventUpdated, domain.SalesforceEventRestored:
+		return s.ingestContact(ctx, req.ReferenceID, req.EventType)
+	case domain.SalesforceEventDeleted:
+		return s.deactivateContact(ctx, req.ReferenceID)
+	case domain.SalesforceEventUndefined:
+		return &apierror.ValidationError{Msg: "eventType UNDEFINED is not supported"}
+	default:
+		return &apierror.ValidationError{Msg: "eventType must be CREATED, UPDATED, DELETED, RESTORED, or UNDEFINED"}
 	}
-	var firstErr error
-	for _, m := range contact.Memberships {
-		id := strings.TrimSpace(derefString(m.ID))
-		if id == "" {
-			continue
-		}
-		if err := s.ingestMembership(ctx, id, req.EventType, contact.LastModifiedDate); err != nil {
-			slog.ErrorContext(ctx, "salesforce: contact update: membership upsert failed", "contactSfId", req.ReferenceID, "membershipSfId", id, "err", err)
-			if firstErr == nil {
-				firstErr = err
-			}
-		}
-	}
-	return firstErr
 }
 
 // ingestMembership fetches one Project_Contact__c (and its Contact) from
 // sales-entity-service and writes it to Postgres. It is idempotent: the
 // repository resolves every row by natural key, and a replay whose
 // LastModifiedDate is not newer than the recorded DATABASE step is skipped.
-// contactModified is the Contact's LastModifiedDate when a Contact event
-// drives the upsert (nil otherwise): a contact edit does not touch the
-// membership's LastModifiedDate, so the guard compares the later of the two.
-func (s *salesforceEventService) ingestMembership(ctx context.Context, membershipSfID, eventType string, contactModified *string) error {
+//
+// known is the Contact when a Contact event drives the upsert (nil
+// otherwise). It is used instead of a second fetch when it is the
+// membership's own contact, and its LastModifiedDate joins the guard: a
+// contact edit does not touch the membership's LastModifiedDate, so the
+// guard compares the later of the two.
+func (s *salesforceEventService) ingestMembership(ctx context.Context, membershipSfID, eventType string, known *salesentity.Contact) error {
 	pc, err := s.membership.SalesEntity.GetProjectContact(ctx, membershipSfID)
 	if err != nil {
 		return err
@@ -131,6 +125,16 @@ func (s *salesforceEventService) ingestMembership(ctx context.Context, membershi
 		return &apierror.ServiceUnavailableError{Msg: "sales/sales-entity-service project contact " + membershipSfID + " has no linked project"}
 	}
 	contactSfID := strings.TrimSpace(derefString(pc.Contact.ID))
+	if known != nil && !strings.EqualFold(strings.TrimSpace(derefString(known.ID)), contactSfID) {
+		// Not this membership's contact as spelled here (a 15/18-character
+		// Id pair, or Salesforce moved it between the two reads): read the
+		// one the membership names rather than guess.
+		known = nil
+	}
+	var contactModified *string
+	if known != nil {
+		contactModified = known.LastModifiedDate
+	}
 
 	// Duplicate-event guard. Salesforce emits several UPDATED events per save
 	// and the portal replays the envelope after its own write, so the same
@@ -163,9 +167,14 @@ func (s *salesforceEventService) ingestMembership(ctx context.Context, membershi
 		}
 	}
 
-	contact, err := s.membership.SalesEntity.GetContact(ctx, contactSfID)
-	if err != nil {
-		return err
+	var contact salesentity.Contact
+	if known != nil {
+		contact = *known
+	} else {
+		contact, err = s.membership.SalesEntity.GetContact(ctx, contactSfID)
+		if err != nil {
+			return err
+		}
 	}
 
 	in, ignored, err := buildMembershipUpsert(pc, contact)
@@ -173,7 +182,16 @@ func (s *salesforceEventService) ingestMembership(ctx context.Context, membershi
 		return err
 	}
 	if len(ignored) > 0 {
-		slog.WarnContext(ctx, "salesforce: project contact carries roles the ingest does not map", "membershipSfId", membershipSfID, "ignoredRoles", ignored)
+		// One line per membership. The six labels with no CSM group are
+		// dropped by decision (D2); anything else is a vocabulary gap.
+		byDecision, unknown := splitIgnoredRoles(ignored)
+		if len(unknown) > 0 {
+			slog.WarnContext(ctx, "salesforce: project contact carries roles the ingest does not map",
+				"membershipSfId", membershipSfID, "unknownRoles", unknown, "ignoredRoles", byDecision)
+		} else {
+			slog.InfoContext(ctx, "salesforce: project contact carries roles CSM does not store",
+				"membershipSfId", membershipSfID, "ignoredRoles", byDecision)
+		}
 	}
 
 	step := domain.UpsertOnboardingStepRequest{
@@ -284,8 +302,9 @@ func (s *salesforceEventService) publishProjectContactInvited(ctx context.Contex
 }
 
 // buildMembershipUpsert translates the two sales-entity-service records into
-// the repository's write request, applying the §6.4 role mapping. ignored
-// lists Salesforce roles that map to nothing.
+// the repository's write request, applying the role mapping: project groups
+// from the membership's roles, global roles from the contact's account
+// classification. ignored lists Salesforce roles that map to nothing.
 func buildMembershipUpsert(pc salesentity.ProjectContact, contact salesentity.Contact) (domain.SalesforceMembershipUpsert, []string, error) {
 	state, err := normalizeMembershipState(derefString(pc.State))
 	if err != nil {
@@ -315,7 +334,10 @@ func buildMembershipUpsert(pc salesentity.ProjectContact, contact salesentity.Co
 	isIntegration := contact.IsCsIntegrationUser != nil && *contact.IsCsIntegrationUser
 	membershipType := strings.TrimSpace(derefString(pc.Type))
 
-	globalRoles, managed, adminRole := mapGlobalRoles(membershipType, isIntegration)
+	// customer/partner (and which admin role applies) follow the contact's
+	// account classification, the same basis the Contact writer uses, not
+	// the membership type.
+	globalRoles := mapGlobalRoles(contact.Account, isIntegration)
 	groups, ignored := mapProjectGroups(roles)
 
 	name := strings.TrimSpace(derefString(contact.Name))
@@ -345,11 +367,13 @@ func buildMembershipUpsert(pc salesentity.ProjectContact, contact salesentity.Co
 		ContactAccountSfID:  accountSfID,
 		IsCsAdmin:           isCsAdmin,
 		IsCsIntegrationUser: isIntegration,
+		IsPrimaryContact:    contact.IsPrimaryContact,
 		ProjectSfID:         strings.TrimSpace(derefString(pc.Subscription.ID)),
 		ProjectKey:          strings.TrimSpace(derefString(pc.Subscription.Key)),
-		GlobalRoles:         globalRoles,
-		ManagedAdminRoles:   managed,
-		AdminRoleName:       adminRole,
+		GlobalRoles:         globalRoles.Grant,
+		ManagedGlobalRoles:  globalRoles.ManagedGlobal,
+		ManagedAdminRoles:   globalRoles.ManagedAdmin,
+		AdminRoleName:       globalRoles.AdminRole,
 		ProjectGroups:       groups,
 	}, ignored, nil
 }

@@ -27,6 +27,8 @@ import {
 } from "@tanstack/react-query";
 import { useBackendApi } from "@api/backend/client";
 import type {
+  ScheduleAbsenceKind,
+  ScheduleTier,
   ScheduleAbsencesResponse,
   ScheduleActivity,
   ScheduleAssignment,
@@ -370,6 +372,11 @@ export interface ApplyRangePayload {
   from: string;
   to: string;
   note?: string;
+  /** L1, L2 or L3 on an escalation window that leaves the tier to the
+   *  person. Omitted takes the window's own. */
+  tier?: ScheduleTier;
+  /** With an empty shiftCode, clears only this zone's turn that day. */
+  zoneCode?: string;
 }
 
 export interface ApplyRangeResult {
@@ -404,6 +411,9 @@ export interface ApplyAbsencePayload {
   from: string;
   to: string;
   note?: string;
+  /** Who an allocation is for: the customer, or the product team for RnD.
+   *  The server keeps it only with an allocation kind. */
+  allocatedTo?: string;
 }
 
 export interface ApplyAbsenceResult {
@@ -428,6 +438,72 @@ export function useApplyAbsence(): UseMutationResult<ApplyAbsenceResult, Error, 
     mutationFn: (payload) =>
       api.post<ApplyAbsencePayload, ApplyAbsenceResult>("/team-schedule/absences/apply", payload),
     onSuccess: () => invalidateRota(qc),
+  });
+}
+
+/**
+ * Remove one absence whole -- every day of it, and an open-ended one too.
+ *
+ * Not the same as clearing a span with `useApplyAbsence`: that needs dates, and
+ * a standing allocation "until further notice" has no end date to name. This is
+ * what the picker's Remove does, so one click takes the whole thing away.
+ */
+export function useDeleteAbsence(): UseMutationResult<
+  unknown,
+  Error,
+  { id: string; note?: string }
+> {
+  const api = useBackendApi();
+  const qc = useQueryClient();
+  return useMutation<unknown, Error, { id: string; note?: string }>({
+    mutationFn: ({ id, note }) =>
+      api.del(
+        `/team-schedule/absences/${encodeURIComponent(id)}` +
+          (note ? `?note=${encodeURIComponent(note)}` : ""),
+      ),
+    onSuccess: () => invalidateRota(qc),
+  });
+}
+
+export interface CreateAbsenceKindPayload {
+  shortCode: string;
+  label: string;
+  bucket: "LEAVE" | "ALLOCATION";
+  colourToken: string;
+}
+
+/**
+ * Add a leave or allocation tag to the shared catalogue. Every team sees it
+ * once it exists, so the catalogue is refetched rather than patched locally.
+ */
+export function useCreateAbsenceKind(): UseMutationResult<
+  ScheduleAbsenceKind,
+  Error,
+  CreateAbsenceKindPayload
+> {
+  const api = useBackendApi();
+  const qc = useQueryClient();
+  return useMutation<ScheduleAbsenceKind, Error, CreateAbsenceKindPayload>({
+    mutationFn: (payload) =>
+      api.post<CreateAbsenceKindPayload, ScheduleAbsenceKind>("/team-schedule/absence-kinds", payload),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: QK.catalogue });
+    },
+  });
+}
+
+/**
+ * Delete a tag a lead added. The server refuses one of the catalogue's own,
+ * or one still in use, so a failure here is worth showing as it is.
+ */
+export function useDeleteAbsenceKind(): UseMutationResult<unknown, Error, string> {
+  const api = useBackendApi();
+  const qc = useQueryClient();
+  return useMutation<unknown, Error, string>({
+    mutationFn: (code) => api.del(`/team-schedule/absence-kinds/${encodeURIComponent(code)}`),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: QK.catalogue });
+    },
   });
 }
 

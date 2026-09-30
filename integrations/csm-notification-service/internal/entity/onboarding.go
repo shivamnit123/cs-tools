@@ -84,11 +84,18 @@ type OnboardingStepRequest struct {
 }
 
 // RecordedOnboardingStep is one row of GET
-// /onboarding-steps/{membershipSfId}. Only the two fields the caller acts
-// on are decoded; entity-service returns more.
+// /onboarding-steps/{membershipSfId}. Only the fields the caller acts on are
+// decoded; entity-service returns more.
 type RecordedOnboardingStep struct {
 	Step   OnboardingStep       `json:"step"`
 	Status OnboardingStepStatus `json:"status"`
+	// EventModifiedOn is the membership version (Salesforce LastModifiedDate,
+	// RFC 3339) the row's current status belongs to: entity-service only
+	// moves status together with a not-older eventModifiedOn, and keeps the
+	// greatest one it has seen. Kept as the raw string so that a missing or
+	// malformed value reaches the caller, which decides what to do about it,
+	// instead of failing the whole decode.
+	EventModifiedOn string `json:"eventModifiedOn"`
 }
 
 // getOnboardingStepsResponse is the body of GET
@@ -97,40 +104,42 @@ type getOnboardingStepsResponse struct {
 	Steps []RecordedOnboardingStep `json:"steps"`
 }
 
-// EmailAlreadySent reports whether the ledger already holds a SUCCEEDED
-// EMAIL step for the membership -- that is, whether an invitation has
-// already gone out for it, by this service on an earlier delivery or by
-// whoever onboarded the contact.
+// SucceededEmailStep returns the ledger's SUCCEEDED EMAIL step for the
+// membership, or nil when there is none -- that is, the record of an
+// invitation that has already gone out, by this service on an earlier
+// delivery or by whoever onboarded the contact, together with the
+// membership version it went out for.
 //
-// This is the one durable guard against sending a second invitation. The
-// in-process claim in dispatch only covers one process's lifetime, and the
-// ingest's own duplicate guard only covers the case where the Salesforce
-// version is unchanged; neither survives a redelivery to a different
-// replica, and neither knows about a membership that was onboarded
-// synchronously through the customer portal and only later re-ingested from
-// a Salesforce event. The ledger is a row in Postgres that both services
-// share, so it does.
+// This is the one durable guard against sending a second invitation for
+// the same membership version. The in-process claim in dispatch only covers
+// one process's lifetime, and the ingest's own duplicate guard only covers
+// the case where the Salesforce version is unchanged; neither survives a
+// redelivery to a different replica. The ledger is a row in Postgres that
+// both services share, so it does. dispatch compares the returned step's
+// EventModifiedOn with the event's to tell a duplicate (same or older
+// version) from a genuine re-invitation (newer version).
 //
-// An unknown membership yields false with no error: entity-service answers
+// An unknown membership yields nil with no error: entity-service answers
 // an empty list rather than a 404.
-func (c *CustomerEntityClient) EmailAlreadySent(ctx context.Context, membershipSfID string) (bool, error) {
+func (c *CustomerEntityClient) SucceededEmailStep(ctx context.Context, membershipSfID string) (*RecordedOnboardingStep, error) {
 	if membershipSfID == "" {
-		return false, fmt.Errorf("entity: membershipSfId is required to read onboarding steps")
+		return nil, fmt.Errorf("entity: membershipSfId is required to read onboarding steps")
 	}
 	body, err := c.do(ctx, http.MethodGet, "/onboarding-steps/"+url.PathEscape(membershipSfID), nil)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	var out getOnboardingStepsResponse
 	if err := json.Unmarshal(body, &out); err != nil {
-		return false, fmt.Errorf("entity: decode onboarding steps response: %w", err)
+		return nil, fmt.Errorf("entity: decode onboarding steps response: %w", err)
 	}
 	for _, s := range out.Steps {
 		if s.Step == OnboardingStepEmail && s.Status == OnboardingStepSucceeded {
-			return true, nil
+			step := s
+			return &step, nil
 		}
 	}
-	return false, nil
+	return nil, nil
 }
 
 // RecordOnboardingStep calls PUT /onboarding-steps/{membershipSfId}/{step}

@@ -29,6 +29,8 @@ import {
   TZ1_WE,
   TZ2,
   TZ2_WE,
+  RND,
+  TZ1_L1,
   absence,
   assignment,
   scopeControls,
@@ -134,7 +136,14 @@ describe("MonthRoster: what the grid says", () => {
   });
 
   it("marks the week the reader is in, its two ends included", () => {
-    const { container } = renderRoster({ month: new Date() });
+    // Three months around today, as the page renders it: with one month the
+    // test failed in any week that crosses a month end (a week starting on the
+    // 28th shows three of its days in that month).
+    const now = new Date();
+    const { container } = renderRoster({
+      month: new Date(now.getFullYear(), now.getMonth() - 1, 1),
+      monthCount: 3,
+    });
     const band = container.querySelectorAll("thead th.day.cw");
     expect(band).toHaveLength(7);
     expect(container.querySelectorAll("thead th.day.cwa")).toHaveLength(1);
@@ -246,5 +255,167 @@ describe("MonthRoster: who changed a cell", () => {
     // The grid renders from the rota alone; markers turn up when they turn up.
     const { container } = renderRoster({ editedCells: undefined });
     expect(container.querySelectorAll("td.touched")).toHaveLength(0);
+  });
+});
+
+describe("MonthRoster: two tags in one cell", () => {
+  it("shows a rotation turn and the allocation beside it", () => {
+    const { container } = renderRoster({
+      assignments: [assignment({ name: "Asela", rotaDate: "2026-09-21", shiftCode: EVENING.code })],
+      absences: [absence({ name: "Asela", startsOn: "2026-09-21", endsOn: "2026-09-21", kindCode: RND.code })],
+      absenceKinds: [ANNUAL_LEAVE, RND],
+    });
+    const duo = container.querySelector(".duo");
+    expect(duo).not.toBeNull();
+    expect(duo).toHaveTextContent(EVENING.shortCode);
+    expect(duo).toHaveTextContent(RND.shortCode);
+  });
+
+  it("lets leave take the whole day", () => {
+    const { container } = renderRoster({
+      assignments: [assignment({ name: "Asela", rotaDate: "2026-09-21", shiftCode: EVENING.code })],
+      absences: [absence({ name: "Asela", startsOn: "2026-09-21", endsOn: "2026-09-21" })],
+    });
+    expect(container.querySelector(".duo")).toBeNull();
+  });
+
+  it("hands both to the picker when the cell is opened", () => {
+    const onEditCell = vi.fn();
+    const { container } = renderRoster({
+      leadTeams: ["alpha"],
+      editing: true,
+      onEditCell,
+      assignments: [assignment({ name: "Asela", rotaDate: "2026-09-21", shiftCode: EVENING.code })],
+      absences: [absence({ name: "Asela", startsOn: "2026-09-21", endsOn: "2026-09-21", kindCode: RND.code })],
+      absenceKinds: [ANNUAL_LEAVE, RND],
+    });
+    fireEvent.click(container.querySelector(".duo")!.closest("td")!);
+    expect(onEditCell).toHaveBeenCalledWith(
+      expect.objectContaining({ shiftCode: EVENING.code, absenceKindCode: RND.code }),
+    );
+  });
+});
+
+describe("MonthRoster: a zone's turn on an allocation day", () => {
+  it("stacks the turn and the allocation in that zone, and shows the allocation in the rest", () => {
+    // Every zone this group works, weekday and weekend, so the day splits.
+    const { container } = renderRoster({
+      family: "SRE",
+      shifts: shiftMap(REGULAR, TZ1, TZ1_L1, TZ2, TZ1_WE, TZ2_WE),
+      assignments: [
+        { ...assignment({ name: "Asela", rotaDate: "2026-09-21", shiftCode: TZ1_L1.code, zoneCode: "TZ1" }), tier: "L1" },
+      ],
+      absences: [absence({ name: "Asela", startsOn: "2026-09-21", endsOn: "2026-09-21", kindCode: RND.code })],
+      absenceKinds: [ANNUAL_LEAVE, RND],
+    } as never);
+    const zoneCells = [...container.querySelectorAll("td.c.z")].filter((td) => td.textContent?.trim());
+    const tz1 = zoneCells.find((td) => td.querySelector(".duo"));
+    expect(tz1).toBeDefined();
+    expect(tz1).toHaveTextContent("L1");
+    expect(tz1).toHaveTextContent(RND.shortCode);
+    expect(zoneCells.some((td) => !td.querySelector(".duo") && td.textContent?.includes(RND.shortCode))).toBe(true);
+  });
+});
+
+describe("MonthRoster: a turn on a zone's regular hours", () => {
+  it("stacks the turn over the regular hours in that zone", () => {
+    const TZ1_REG = { ...REGULAR, id: "r1", code: "SRE_TZ1_REGULAR", shortCode: "SUP", family: "SRE" as const, zoneCode: "TZ1" };
+    const { container } = renderRoster({
+      family: "SRE",
+      shifts: shiftMap(TZ1_REG, TZ1, TZ1_L1, TZ2, TZ1_WE, TZ2_WE),
+      assignments: [
+        assignment({ name: "Asela", rotaDate: "2026-09-21", shiftCode: TZ1_REG.code, zoneCode: "TZ1" }),
+        { ...assignment({ name: "Asela", rotaDate: "2026-09-21", shiftCode: TZ1_L1.code, zoneCode: "TZ1" }), tier: "L1" },
+      ],
+    } as never);
+    const duo = container.querySelector("td.c.z .duo");
+    expect(duo).not.toBeNull();
+    expect(duo).toHaveTextContent("L1");
+    expect(duo).toHaveTextContent("SUP");
+  });
+});
+
+describe("MonthRoster: an unmarked weekday is a working day", () => {
+  // September 2026 has 22 weekdays; the fixture engineer holds a turn on one.
+  it("shows LK on every weekday nobody has marked, and nothing at the weekend", () => {
+    const { container } = renderRoster();
+    expect(container.querySelectorAll(".chip.dflt")).toHaveLength(21);
+    expect([...container.querySelectorAll(".chip.dflt")].every((c) => c.textContent === "LK")).toBe(true);
+    // The turn on the 21st is still the turn, not LK.
+    expect(screen.getByText("6-9p")).toBeInTheDocument();
+  });
+
+  it("gives way to leave the moment it is marked", () => {
+    const { container } = renderRoster({
+      absences: [absence({ name: "Asela", startsOn: "2026-09-22", endsOn: "2026-09-23" })],
+    });
+    expect(container.querySelectorAll(".chip.dflt")).toHaveLength(19);
+    expect(screen.getAllByText("AL")).toHaveLength(2);
+  });
+
+  it("spans an SRE day's zones as one LK, and leaves a day with a zone alone", () => {
+    const { container } = renderRoster({
+      assignments: [
+        assignment({ name: "Apollo01", rotaDate: "2026-09-21", shiftCode: TZ1.code, zoneCode: "TZ1", teamKey: "delta" }),
+      ],
+      family: "SRE",
+    });
+    expect(container.querySelectorAll("td.zwhole .chip.dflt")).toHaveLength(21);
+  });
+
+  it("opens an LK day in the picker as an empty day, not as a held window", () => {
+    const onEditCell = vi.fn();
+    const { container } = renderRoster({ leadTeams: ["alpha"], editing: true, onEditCell });
+    fireEvent.click(container.querySelector(".chip.dflt")!.closest("td")!);
+    expect(onEditCell).toHaveBeenCalledWith(
+      expect.objectContaining({ shiftCode: undefined, absenceKindCode: undefined }),
+    );
+  });
+});
+
+describe("MonthRoster: the CRE / SRE switch", () => {
+  it("offers the switch when there are two groups to look at", () => {
+    renderRoster({ families: ["CRE", "SRE"] });
+    expect(screen.getByRole("tablist", { name: "Show CRE or SRE" })).toBeInTheDocument();
+  });
+
+  it("offers no switch on an engineer's own rota, which is one group", () => {
+    renderRoster({ families: ["SRE"], family: "SRE" });
+    expect(screen.queryByRole("tablist", { name: "Show CRE or SRE" })).not.toBeInTheDocument();
+  });
+});
+
+describe("MonthRoster: how many months", () => {
+  it("offers 1, 3 and 6 months, marks the one showing, and reports a change", () => {
+    const onSpanChange = vi.fn();
+    renderRoster({ span: 3, onSpanChange });
+    const group = screen.getByRole("group", { name: "Months shown" });
+    expect(group).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "3 months" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "1 month" })).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(screen.getByRole("button", { name: "6 months" }));
+    expect(onSpanChange).toHaveBeenCalledWith(6);
+  });
+
+  it("offers no choice when the page cannot change the months", () => {
+    renderRoster();
+    expect(screen.queryByRole("group", { name: "Months shown" })).not.toBeInTheDocument();
+  });
+
+  it("draws a column for every day of six months", () => {
+    // Sept 2026 through Feb 2027: 30 + 31 + 30 + 31 + 31 + 28.
+    const { container } = renderRoster({ monthCount: 6 });
+    expect(container.querySelectorAll("thead th.day")).toHaveLength(181);
+  });
+});
+
+describe("MonthRoster: a window around a day", () => {
+  it("runs from the first day to the last, naming the month on the first column", () => {
+    const { container } = renderRoster({ from: new Date(2026, 8, 14), to: new Date(2026, 9, 12) });
+    const heads = container.querySelectorAll("thead th.day");
+    expect(heads).toHaveLength(29);
+    expect(heads[0].querySelector(".d")?.textContent).toBe("14");
+    expect(heads[0].querySelector(".mo")).not.toBeNull();
+    expect(heads[heads.length - 1].querySelector(".d")?.textContent).toBe("12");
   });
 });

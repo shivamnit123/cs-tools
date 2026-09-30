@@ -267,7 +267,20 @@ func (r *projectStatsRepo) SLAStatusInputs(ctx context.Context, projectID string
 		  ),
 		  EXISTS (SELECT 1 FROM deployed_product WHERE project_id = $1::uuid AND active IS TRUE),
 		  EXISTS (SELECT 1 FROM project WHERE id = $1::uuid AND end_date IS NOT NULL AND end_date >= CURRENT_DATE),
-		  EXISTS (
+		  `+hasCustomerAdminContactExists, projectID).
+		Scan(&in.HasOutstandingCase, &in.HasDeployedProduct, &in.HasActiveEndDate, &in.HasCustomerAdminContact)
+	if err != nil {
+		return ProjectSLAStatusInputs{}, fmt.Errorf("project stats: sla status: %w", err)
+	}
+	return in, nil
+}
+
+// hasCustomerAdminContactExists is SLAStatusInputs' customer-admin check: a
+// live contact of this project resolves to a user holding customer_admin.
+// DEACTIVATED memberships do not count -- the Salesforce ingest keeps a
+// removed contact as a DEACTIVATED row, and someone removed from this project
+// who is an admin elsewhere is not this project's admin contact.
+const hasCustomerAdminContactExists = `EXISTS (
 		    SELECT 1
 		      FROM project_contact pc
 		      JOIN account_contact ac ON ac.id = pc.account_contact_id
@@ -275,13 +288,8 @@ func (r *projectStatsRepo) SLAStatusInputs(ctx context.Context, projectID string
 		      JOIN user_role ur ON ur.user_id = u.id
 		      JOIN role rl ON rl.id = ur.role_id
 		     WHERE pc.project_id = $1::uuid AND rl.name = 'customer_admin'
-		  )`, projectID).
-		Scan(&in.HasOutstandingCase, &in.HasDeployedProduct, &in.HasActiveEndDate, &in.HasCustomerAdminContact)
-	if err != nil {
-		return ProjectSLAStatusInputs{}, fmt.Errorf("project stats: sla status: %w", err)
-	}
-	return in, nil
-}
+		       AND (pc.state IS NULL OR pc.state <> 'DEACTIVATED'::project_contact_state_enum)
+		  )`
 
 // ConversationStateCounts implements ProjectStatsRepository.
 func (r *projectStatsRepo) ConversationStateCounts(ctx context.Context, projectID, createdBy string) ([]StateCount, error) {

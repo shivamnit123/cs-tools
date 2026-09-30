@@ -184,16 +184,31 @@ type CaseCreatedPayload struct {
 	// caseIdLabel). internal/dispatch's subjectLine uses this in the
 	// subject's first slot, falling back to CaseID only when a publisher
 	// hasn't sent it yet.
-	WSO2CaseID                string   `json:"wso2CaseId,omitempty"`
-	CaseTitle                 string   `json:"caseTitle"`
-	CaseType                  string   `json:"caseType"`
-	Priority                  string   `json:"priority"`
-	Product                   string   `json:"product,omitempty"`
+	WSO2CaseID string `json:"wso2CaseId,omitempty"`
+	CaseTitle  string `json:"caseTitle"`
+	CaseType   string `json:"caseType"`
+	Priority   string `json:"priority"`
+	Product    string `json:"product,omitempty"`
+	// Team is the case's account's CRE team display name (e.g. "Castor") —
+	// displayed in Chat cards; purely a display value, no routing role
+	// (unlike Product).
 	Team                      string   `json:"team,omitempty"`
 	CreatedAt                 string   `json:"createdAt"`
 	Description               string   `json:"description"`
 	IncidentImpactDescription string   `json:"incidentImpactDescription,omitempty"`
 	Recipients                []string `json:"recipients"`
+	// ProjectOnboardingStatus/IsEvaluationAccount are deprecated and unused
+	// — a since-reverted feature briefly routed this event's Chat alert by
+	// team/audience and needed these two facts; case.created is back to
+	// product-based routing (see Product above) and no longer reads
+	// either. Kept, accepting-but-ignoring the value, purely so
+	// events.Validate's strict decode doesn't reject a payload from an
+	// entity-service deployment that hasn't yet redeployed past that
+	// revert — entity-service and csm-notification-service are separate
+	// deployables with no atomic joint-deploy guarantee. Remove once both
+	// services are known to have deployed past the revert.
+	ProjectOnboardingStatus string `json:"projectOnboardingStatus,omitempty"`
+	IsEvaluationAccount     bool   `json:"isEvaluationAccount,omitempty"`
 }
 
 // CommentAddedPayload is TypeCommentAdded's payload. See CaseCreatedPayload's
@@ -290,6 +305,11 @@ type CaseAcknowledgedPayload struct {
 	Product          string `json:"product,omitempty"`
 	Team             string `json:"team,omitempty"`
 	AcknowledgerName string `json:"acknowledgerName"`
+	// ProjectOnboardingStatus/IsEvaluationAccount are deprecated and
+	// unused — see CaseCreatedPayload's own doc comment for why this
+	// decode-compatibility pair exists.
+	ProjectOnboardingStatus string `json:"projectOnboardingStatus,omitempty"`
+	IsEvaluationAccount     bool   `json:"isEvaluationAccount,omitempty"`
 }
 
 // SeverityChangedPayload is TypeSeverityChanged's payload. Unlike
@@ -314,26 +334,30 @@ type SeverityChangedPayload struct {
 	Product     string   `json:"product,omitempty"`
 	Team        string   `json:"team,omitempty"`
 	Recipients  []string `json:"recipients"`
+	// ProjectOnboardingStatus/IsEvaluationAccount are deprecated and
+	// unused — see CaseCreatedPayload's own doc comment for why this
+	// decode-compatibility pair exists.
+	ProjectOnboardingStatus string `json:"projectOnboardingStatus,omitempty"`
+	IsEvaluationAccount     bool   `json:"isEvaluationAccount,omitempty"`
 }
 
-// IncidentCreatedPayload is TypeIncidentCreated's payload. Unlike the case.*
-// events above, this one has two reactions, not one: a Google Chat alert
-// (Product/Title/ShortDescription map onto GoogleChatClient.SendIncidentAlert's
-// params, alongside the portal link — see below) and a Twilio voice call to
-// CallTo, reading Title and ShortDescription aloud.
+// IncidentCreatedPayload is TypeIncidentCreated's payload. This event has
+// exactly one reaction now — a Twilio voice call to CallTo, reading Title
+// and ShortDescription aloud — per explicit product direction: an incident
+// pages on-call directly, and a separate Chat post was redundant with that.
 //
-// There is deliberately no IncidentLink field: unlike an earlier version of
-// this struct, the "Open in Portal" button target is built by this service
-// itself (dispatch.handleIncidentCreated calls
-// recipientlinks.Resolver.IncidentLink(entityID)), the same way case.created
-// already gets its own portal link built here rather than trusting a
-// caller-supplied one. A publisher only needs to know the fact that an
-// incident was created, not this service's portal URL configuration.
+// Product is still accepted on the wire but no longer read by
+// dispatch.handleIncidentCreated — kept purely for decode compatibility
+// (events.Validate decodes strictly, DisallowUnknownFields) during a rolling
+// deploy where a not-yet-redeployed publisher (e.g. entity-service) might
+// still send it; removing the field outright would need the same kind of
+// cross-service rollout coordination this repo has hit before (see
+// SeverityChangedPayload's own ProjectOnboardingStatus/IsEvaluationAccount
+// comment for the precedent). A future cleanup can drop it once every
+// publisher is confirmed to have stopped sending it.
 type IncidentCreatedPayload struct {
-	// Product selects which configured Google Chat space receives the alert
-	// (e.g. "api-manager"); matched case/whitespace-insensitively against
-	// GOOGLE_CHAT_SPACES.
-	Product          string `json:"product"`
+	// Product is unread — see this struct's own doc comment.
+	Product          string `json:"product,omitempty"`
 	Title            string `json:"title"`
 	ShortDescription string `json:"shortDescription"`
 	// CallTo is the on-call phone number (E.164, e.g. "+14155552671") the

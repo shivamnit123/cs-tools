@@ -11,7 +11,7 @@ notifications independently until they're actually delivered.
 
 - **Alert discovery.** A poller compares the `alert_seq` counter against its own
   persisted `alert_cursor`, so it never needs CDC or a message queue to know what's
-  new. `alert-ingestion` also posts to `POST /alert` to wake it early; a fixed
+  new. `alert-ingestion` also posts to `POST /alertz` to wake it early; a fixed
   interval is the backstop if that ping never arrives.
 - **Deduplication by fingerprint.** Every alert is normalized (severity label,
   category, defaults from `CORE_ALERT_DEFAULTS`) and folded into an incident keyed
@@ -92,11 +92,14 @@ own doc comments for the specific tradeoffs.
   decides where each incident needs to go next.
 - `internal/model`: the `Alert`/`Incident` shapes, severity/fingerprint
   normalization, and HTML work note formatting.
-- `internal/hub`: the `/alert` HTTP handler that just wakes the poller early.
+- `internal/hub`: the `/alertz` HTTP handler that just wakes the poller early.
 - `internal/cassandra`: connection setup and the CAS-based sequence counter
   helpers the poller and lease both build on.
 - `internal/config`: loads and validates `config.toml`.
+- `internal/auth`: PBKDF2 hashing/verification, the `integration_users`
+  Cassandra repository, and the `RequireAuth` middleware gating `/alertz`.
 - `cmd/server`: wires everything together and manages startup/shutdown.
+- `cmd/user`: CLI to create/rotate, list, enable, and disable `integration_users` rows.
 
 ## Running it
 
@@ -120,6 +123,9 @@ defaults this service falls back to on its own.
 ```bash
 cp config.toml.example config.toml
 ```
+
+Internal API users (`integration_users`) are documented separately in
+[`cmd/user/PROVISION.md`](cmd/user/PROVISION.md).
 
 ## Choreo Deployment
 

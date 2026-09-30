@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -68,6 +69,29 @@ type caseService struct {
 	//     is SN-first while update/comment are Postgres-first.
 	snWriteback *SNWritebackDispatcher
 	snMirror    CaseService
+	// slaEngine registers CSM-native SLA clocks for createCaseSNFirst's own
+	// dual-write path — see registerCaseSLAClocksEvent's own doc comment for
+	// why this must run here (after this service's own Postgres insert)
+	// rather than inside snMirror's automatic registration. nil in every
+	// other mode (plain caseService never creates a case of its own that
+	// needs this — see NewCaseService).
+	slaEngine SLAEngineService
+	// csEngineerRole is config.Config.CSEngineerRole (CS_ENGINEER_ROLE) --
+	// the same role name snCaseService's own csEngineerRole field uses,
+	// shared rather than duplicated: "CS engineer" and "support engineer"
+	// are the same real-world role, just checked here via a different
+	// lookup (see completeResponseSLAOnComment's own doc comment). ""
+	// (unconfigured) means this can never be confirmed, so that hook skips
+	// entirely rather than guessing.
+	csEngineerRole string
+}
+
+// caseResolutionFields carries the resolution data that accompanies a
+// closed/solution_proposed transition to the ServiceNow mirror.
+type caseResolutionFields struct {
+	Code       *domain.CaseResolutionCode
+	Cause      *domain.CaseCause
+	CloseNotes *string
 }
 
 // snFieldPatcher is implemented by *snCaseService (see patchCaseFields's own
@@ -77,7 +101,7 @@ type caseService struct {
 // named exactly for what UpdateCase's mirror needs: a bare PATCH with none of
 // snCaseService.UpdateCase's own read-before-write behavior.
 type snFieldPatcher interface {
-	patchCaseFields(ctx context.Context, caseID string, state *domain.CaseState, severity *domain.CaseSeverity, workState *domain.CaseWorkState, markFixIssued *bool) (domain.UpdatedCase, error)
+	patchCaseFields(ctx context.Context, caseID string, state *domain.CaseState, severity *domain.CaseSeverity, workState *domain.CaseWorkState, markFixIssued *bool, resolution *caseResolutionFields) (domain.UpdatedCase, error)
 }
 
 // snCommentMirror is implemented by *snCaseService (see
@@ -152,12 +176,14 @@ func NewCaseService(repo repository.CaseRepository, userRepo repository.UserRepo
 // whose CreateCase/UpdateCase perform the real ServiceNow POST/PATCH. It is
 // never made the active CaseService here — reads always stay on Postgres in
 // this mode.
-func NewCaseServiceWithSNWriteback(repo repository.CaseRepository, userRepo repository.UserRepository, publisher EventPublisherService, access AccessService, projectContactRepo repository.ProjectContactRepository, dispatcher *SNWritebackDispatcher, mirror CaseService) CaseService {
+func NewCaseServiceWithSNWriteback(repo repository.CaseRepository, userRepo repository.UserRepository, publisher EventPublisherService, access AccessService, projectContactRepo repository.ProjectContactRepository, dispatcher *SNWritebackDispatcher, mirror CaseService, slaEngine SLAEngineService, csEngineerRole string) CaseService {
 	return &caseService{
 		repo: repo, userRepo: userRepo, publisher: publisher, access: access,
 		projectContactRepo: projectContactRepo,
 		snWriteback:        dispatcher,
 		snMirror:           mirror,
+		slaEngine:          slaEngine,
+		csEngineerRole:     csEngineerRole,
 	}
 }
 
@@ -289,6 +315,7 @@ var validCaseCause = map[domain.CaseCause]bool{
 	domain.CaseCauseInfrastructureProxy:           true,
 	domain.CaseCauseInfrastructureOther:           true,
 	domain.CaseCauseUnknown:                       true,
+	domain.CaseCauseUserMistake:                   true,
 }
 
 var validCaseWorkState = map[domain.CaseWorkState]bool{
@@ -596,6 +623,22 @@ func (s *caseService) createCaseSNFirst(ctx context.Context, req domain.CreateCa
 	// incidentService.createIncidentSNFirst already established.
 	publishCaseCreatedEvent(ctx, s.publisher, s.GetCaseByID, s.ProjectContactEmailsByRole, req, c.ID)
 
+	// Same reasoning as the publish call above, for the exact same "not
+	// safe before this Postgres insert" reason: registerCaseSLAClocksEvent
+	// inserts into "sla", whose work_item_id has a hard foreign key against
+	// work_item(id) (migration 0048) — calling it any earlier (e.g. via
+	// snCaseMirrorSvc's own automatic registration right after the
+	// ServiceNow POST, which routes.go now disables by passing it a nil
+	// slaEngine) fails with a foreign-key violation every time, since this
+	// mode's own Postgres work_item row doesn't exist until the insert
+	// above succeeds. A real, live-observed bug this fixed: every dual-write
+	// case creation failed clock registration with SQLSTATE 23503, silently
+	// (best-effort, logged only) — see registerCaseSLAClocksEvent's own doc
+	// comment.
+	if req.Type == "case" {
+		registerCaseSLAClocksEvent(ctx, s.slaEngine, s.GetCaseByID, c.ID)
+	}
+
 	responseState := ""
 	if c.State != nil {
 		responseState = string(*c.State)
@@ -750,6 +793,15 @@ func (s *caseService) createCaseCommentAs(ctx context.Context, req domain.Create
 		return domain.CreateCaseCommentResponse{}, err
 	}
 
+	// Best-effort, in-process only -- deliberately not gated on s.publisher
+	// (never touches Event Hub), same reasoning
+	// snCaseService.applyResponseSLAOnComment's own doc comment gives for
+	// its own, separate ServiceNow-mode hook: a deployment without Event
+	// Hub configured must not lose SLA tracking as a side effect either.
+	if req.Type == domain.CommentTypeComment {
+		s.completeResponseSLAOnComment(ctx, req.CaseID, actorEmail)
+	}
+
 	// Event publishing follows the write, not DATA_SOURCE -- see
 	// publishCaseCreatedEvent's own doc comment for why. authorName reuses
 	// the actor already resolved above -- unlike snCaseService's own
@@ -808,6 +860,45 @@ func (s *caseService) createCaseCommentAs(ctx context.Context, req domain.Create
 			CreatedBy: actorEmail,
 		},
 	}, nil
+}
+
+// completeResponseSLAOnComment best-effort marks the case's CSM-native
+// "response" SLA clock complete (SLAEngineService.CompleteResponseClock,
+// idempotent -- see repository.SLAEngineRepository.CompleteClock's own doc
+// comment) when actorEmail holds s.csEngineerRole. This is caseService's
+// own equivalent of snCaseService.applyResponseSLAOnComment, which caseService
+// never reached before now -- a real, live-observed gap: a support
+// engineer's reply never stopped the response clock on this path, so it
+// kept running to breach regardless of how quickly the case was actually
+// answered. Shares the one CS_ENGINEER_ROLE config with that hook --
+// "CS engineer" and "support engineer" are the same real-world role, just
+// checked here via a different lookup (GetUserRoles) than snCaseService's
+// own.
+//
+// Skips entirely, rather than guessing, when: s.slaEngine or
+// s.csEngineerRole is unset (no database, or the role name isn't
+// configured); actorEmail doesn't resolve to a real user row (the M2M
+// CreateCaseCommentAs path deliberately has none -- see that method's own
+// doc comment, "no GetUserByEmail lookup happens here"); or the role lookup
+// itself fails. None of these fail the comment creation itself -- the
+// comment has already been written by the time this runs.
+func (s *caseService) completeResponseSLAOnComment(ctx context.Context, caseID, actorEmail string) {
+	if s.slaEngine == nil || s.csEngineerRole == "" {
+		return
+	}
+	user, err := s.userRepo.GetUserByEmail(ctx, actorEmail)
+	if err != nil {
+		return
+	}
+	roles, err := s.userRepo.GetUserRoles(ctx, user.ID)
+	if err != nil {
+		slog.ErrorContext(ctx, "create comment: response SLA not evaluated, user role lookup failed", "caseId", caseID)
+		return
+	}
+	if !slices.Contains(roles, s.csEngineerRole) {
+		return
+	}
+	s.slaEngine.CompleteResponseClock(ctx, caseID)
 }
 
 // SearchCaseComments implements CaseService.
@@ -938,6 +1029,16 @@ func (s *caseService) UpdateCase(ctx context.Context, req domain.UpdateCaseReque
 			return domain.UpdateCaseResponse{}, &apierror.ValidationError{Msg: "resolutionCode, cause, and closeNotes are only allowed when state is closed or solution_proposed"}
 		}
 	}
+	// Dual-write only: closed / solution_proposed require all three
+	// resolution fields. The mirrored data source enforces this too;
+	// enforcing it here keeps the stores from diverging (a Postgres-only
+	// close with no resolution data can never be mirrored). Plain Postgres
+	// mode keeps its current, looser behaviour.
+	if s.snWriteback != nil && req.State != nil && (*req.State == domain.CaseStateClosed || *req.State == domain.CaseStateSolutionProposed) {
+		if req.ResolutionCode == nil || req.Cause == nil || req.CloseNotes == nil || strings.TrimSpace(*req.CloseNotes) == "" {
+			return domain.UpdateCaseResponse{}, &apierror.ValidationError{Msg: "resolutionCode, cause, and closeNotes are required when state is closed or solution_proposed"}
+		}
+	}
 
 	if req.WatchList != nil {
 		return s.updateCaseWatchList(ctx, req)
@@ -1032,6 +1133,21 @@ func (s *caseService) UpdateCase(ctx context.Context, req domain.UpdateCaseReque
 		s.detectBillableStatusChange(ctx, req.ID, oldSeverity, c.Severity)
 	}
 
+	// Deliberately independent of s.publisher (never touches Event Hub) --
+	// same reasoning snCaseService's own applyCaseStateSLAEffects call site
+	// gives (SLAEngineService.ApplyCaseStateEffects' own doc comment): a
+	// deployment without Event Hub configured must not lose SLA
+	// pause/resume/completion as a side effect. req.State != nil alone is
+	// enough, not a genuine-change check -- every effect
+	// ApplyCaseStateEffects applies is idempotent, so a caller re-PATCHing
+	// the case's own current state just redundantly re-applies the same
+	// effect harmlessly. This is a real, live-observed gap this fixes: the
+	// Postgres/dual-write path never paused/resumed/completed workaround or
+	// resolution clocks on any state transition at all before now.
+	if s.slaEngine != nil && req.State != nil && c.State != nil {
+		s.slaEngine.ApplyCaseStateEffects(ctx, req.ID, *c.State)
+	}
+
 	// Activity-feed logging follows the write, same as event publishing
 	// below -- see CaseRepository.RecordCaseFieldChangeActivity's own doc
 	// comment for why this table needed a write path at all on this data
@@ -1063,6 +1179,36 @@ func (s *caseService) UpdateCase(ctx context.Context, req domain.UpdateCaseReque
 			slog.ErrorContext(ctx, "update case: enrich case for case.severity_changed publish failed", "caseId", req.ID)
 		} else {
 			publishSeverityChangedEvent(ctx, s.publisher, req.ID, string(derefSeverity(oldSeverity)), string(*c.Severity), cv)
+			// Deliberately independent of s.publisher -- see
+			// reviseCaseSLAClocks' own doc comment (sn_case_service.go) for
+			// why revising SLA clocks must not depend on Event Hub being
+			// configured. A real, live-observed gap this fixes: the
+			// Postgres/dual-write path never cancelled a case's old-severity
+			// clocks and registered fresh ones on a severity change at all
+			// before now, so they kept running against durations that no
+			// longer applied to the case's real severity.
+			if s.slaEngine != nil {
+				projectID := ""
+				if cv.ProjectDetails != nil {
+					projectID = cv.ProjectDetails.ID
+				}
+				s.slaEngine.ReviseCaseClocks(ctx, req.ID, c.Severity, projectID)
+				// ReviseCaseClocks' own replacement clocks always start
+				// IN_PROGRESS, with no awareness of the case's current
+				// state -- a case already paused (Awaiting Info/Solution
+				// Proposed) at the moment its severity changes would
+				// otherwise get fresh workaround/resolution clocks that
+				// immediately start counting down unpaused, producing a
+				// false breach later. Re-applying ApplyCaseStateEffects
+				// against the case's already-known current state (State is
+				// mutually exclusive with Severity on one request, so cv's
+				// State here is unaffected by this update) re-pauses them
+				// to match reality; a harmless no-op when the case isn't
+				// currently paused.
+				if cv.State != nil {
+					s.slaEngine.ApplyCaseStateEffects(ctx, req.ID, *cv.State)
+				}
+			}
 		}
 	}
 
@@ -1095,10 +1241,20 @@ func (s *caseService) UpdateCase(ctx context.Context, req domain.UpdateCaseReque
 			switch {
 			case req.State != nil:
 				state := *req.State
+				// closed/solution_proposed must carry resolutionCode, cause
+				// and closeNotes to the mirror: the downstream data source
+				// rejects the transition without all three. Postgres has
+				// already stored them above.
+				var resolution *caseResolutionFields
+				payload := map[string]any{"id": req.ID, "state": state}
+				if req.ResolutionCode != nil || req.Cause != nil || req.CloseNotes != nil {
+					resolution = &caseResolutionFields{Code: req.ResolutionCode, Cause: req.Cause, CloseNotes: req.CloseNotes}
+					payload["resolutionCode"], payload["cause"], payload["closeNotes"] = req.ResolutionCode, req.Cause, req.CloseNotes
+				}
 				s.snWriteback.Dispatch(ctx, "case", req.ID, "update",
-					map[string]any{"id": req.ID, "state": state},
+					payload,
 					func(writeCtx context.Context) error {
-						_, err := patcher.patchCaseFields(writeCtx, req.ID, &state, nil, nil, nil)
+						_, err := patcher.patchCaseFields(writeCtx, req.ID, &state, nil, nil, nil, resolution)
 						return err
 					},
 				)
@@ -1107,7 +1263,7 @@ func (s *caseService) UpdateCase(ctx context.Context, req domain.UpdateCaseReque
 				s.snWriteback.Dispatch(ctx, "case", req.ID, "update",
 					map[string]any{"id": req.ID, "severity": severity},
 					func(writeCtx context.Context) error {
-						_, err := patcher.patchCaseFields(writeCtx, req.ID, nil, &severity, nil, nil)
+						_, err := patcher.patchCaseFields(writeCtx, req.ID, nil, &severity, nil, nil, nil)
 						return err
 					},
 				)
@@ -1116,7 +1272,7 @@ func (s *caseService) UpdateCase(ctx context.Context, req domain.UpdateCaseReque
 				s.snWriteback.Dispatch(ctx, "case", req.ID, "update",
 					map[string]any{"id": req.ID, "workState": workState},
 					func(writeCtx context.Context) error {
-						_, err := patcher.patchCaseFields(writeCtx, req.ID, nil, nil, &workState, nil)
+						_, err := patcher.patchCaseFields(writeCtx, req.ID, nil, nil, &workState, nil, nil)
 						return err
 					},
 				)
@@ -1137,29 +1293,32 @@ func (s *caseService) UpdateCase(ctx context.Context, req domain.UpdateCaseReque
 }
 
 // validateWatchListProjectMembership rejects a watch-list update wholesale
-// (never partially applied) if any of userIDs is not an active project_contact
-// on the case's own project. Watchers are customer-side users
-// (project_contact models exactly that — the customer's own users scoped to
-// a project), unlike an assignee, which is normally a WSO2 support engineer
-// with no project_contact row at all; this check deliberately covers
-// updateCaseWatchList only, not updateCaseAssignee, for that reason (checked
-// live: 2856 of 2860 real assignees are not project contacts on their case's
-// project).
+// (never partially applied) if any of userIDs is neither an INTERNAL user
+// (WSO2 staff, who watch cases across every project) nor a REGISTERED
+// project_contact on the case's own project (the customer's own users, scoped
+// to a project). Unlike an assignee, which is normally an internal engineer
+// with no project_contact row at all, a watcher can be either kind; this check
+// deliberately covers updateCaseWatchList only, not updateCaseAssignee.
+//
+// The project-contact lookup runs first because it is the common case for
+// customer watchers; the user lookup (for the INTERNAL check) only runs for
+// ids that are not a registered contact. A rejection names the user by email,
+// else display name -- never by raw id -- and a user id that resolves to no
+// user at all gets a generic message.
 //
 // Takes the case's already-fetched CaseView rather than fetching it again --
 // updateCaseWatchList needs the same fetch for the mandatory-stakeholder
 // merge right after this call, and a case's project can't change between the
-// two. A case with no project linked (ProjectDetails is nil — a documented,
+// two. A case with no project linked (ProjectDetails is nil -- a documented,
 // real state, not an error) has nothing to validate watchers against, so the
 // check is skipped rather than rejecting every watch-list update on such a
 // case.
 //
 // Deliberately never applied to the account's four named stakeholders that
 // updateCaseWatchList merges in afterward: those are WSO2-internal roles
-// (customer success manager, technical owner, ...), not customer-side
-// project contacts, so validating them here would reject the very watchers
-// this system itself always adds, on most real accounts. Only userIDs -- the
-// caller's own requested subset, before that merge -- is ever checked.
+// (customer success manager, technical owner, ...), so they are exempt by
+// construction. Only userIDs -- the caller's own requested subset, before that
+// merge -- is ever checked.
 func (s *caseService) validateWatchListProjectMembership(ctx context.Context, cv domain.CaseView, userIDs []string) error {
 	if len(userIDs) == 0 {
 		return nil
@@ -1169,22 +1328,39 @@ func (s *caseService) validateWatchListProjectMembership(ctx context.Context, cv
 	}
 	for _, userID := range userIDs {
 		contact, err := s.projectContactRepo.GetProjectContactByUserID(ctx, cv.ProjectDetails.ID, userID, "")
-		if err != nil {
-			var notFound *apierror.NotFoundError
-			if errors.As(err, &notFound) {
-				return &apierror.ValidationError{Msg: fmt.Sprintf("user %s is not a contact on this case's project", userID)}
-			}
+		if err == nil && contact.RegistrationState == "REGISTERED" {
+			// A row existing isn't enough -- INVITED/RE-INVITED hasn't been
+			// accepted yet and DEACTIVATED no longer applies. Same
+			// REGISTERED-only bar AccessService.ResolveScope and
+			// user_repo.go's own GrantsCaseAccess already apply (see
+			// access_repo.go's registeredContactState).
+			continue
+		}
+		var notFound *apierror.NotFoundError
+		if err != nil && !errors.As(err, &notFound) {
 			return err
 		}
-		// A row existing isn't enough -- INVITED/RE-INVITED hasn't been
-		// accepted yet and DEACTIVATED no longer applies, so neither
-		// actually represents someone who belongs on this project today.
-		// Same REGISTERED-only bar AccessService.ResolveScope and
-		// user_repo.go's own GrantsCaseAccess already apply for the
-		// identical concept (see access_repo.go's registeredContactState).
-		if contact.RegistrationState != "REGISTERED" {
-			return &apierror.ValidationError{Msg: fmt.Sprintf("user %s is not a registered contact on this case's project", userID)}
+
+		// Not a registered contact of this project: acceptable only if the
+		// user is internal staff.
+		user, uerr := s.userRepo.GetUserDetail(ctx, userID)
+		if uerr != nil {
+			if errors.As(uerr, &notFound) {
+				return &apierror.ValidationError{Msg: "one or more watch list users do not exist"}
+			}
+			return uerr
 		}
+		if user.UserType == domain.UserTypeInternal {
+			continue
+		}
+		who := user.Email
+		if who == "" {
+			who = user.Name
+		}
+		if who == "" {
+			who = "a requested watcher"
+		}
+		return &apierror.ValidationError{Msg: fmt.Sprintf("%s is neither an internal user nor a registered contact on this case's project", who)}
 	}
 	return nil
 }
@@ -1463,7 +1639,7 @@ func (s *caseService) updateCaseMarkFixIssued(ctx context.Context, req domain.Up
 			s.snWriteback.Dispatch(ctx, "case", req.ID, "update",
 				map[string]any{"id": req.ID, "markFixIssued": true},
 				func(writeCtx context.Context) error {
-					_, err := patcher.patchCaseFields(writeCtx, req.ID, nil, nil, nil, &markFixIssued)
+					_, err := patcher.patchCaseFields(writeCtx, req.ID, nil, nil, nil, &markFixIssued, nil)
 					return err
 				},
 			)
@@ -1733,6 +1909,20 @@ func (s *caseService) updateCaseFields(ctx context.Context, req domain.UpdateCas
 		return domain.UpdateCaseResponse{}, err
 	}
 
+	// Deliberately independent of s.publisher (never touches Event Hub) --
+	// same reasoning every other SLAEngineService call site in this file
+	// gives. WorkaroundProvided is the one genuine "workaround was
+	// provided" signal anywhere in the domain model -- unlike
+	// ApplyCaseStateEffects (called from UpdateCase's own State branch),
+	// which only ever pauses/resumes this clock, never completes it.
+	// false (a recall) is deliberately not handled the opposite way here:
+	// there's no "reopen a completed clock" operation on SLAEngineRepository,
+	// and recalling a workaround is rare enough that this is a real, known
+	// gap rather than a fix worth building speculatively.
+	if s.slaEngine != nil && req.WorkaroundProvided != nil && *req.WorkaroundProvided {
+		s.slaEngine.CompleteWorkaroundClock(ctx, req.ID)
+	}
+
 	// Best-effort ServiceNow mirror write, DATA_SOURCE=postgres-servicenow-dual-write
 	// only -- same Postgres-first/async posture as every sibling branch
 	// above. The recorded payload carries the actual values patchCaseFieldsBundle
@@ -1873,34 +2063,33 @@ func validateCaseFieldValues(g domain.CaseFilterGroup) error {
 	return validateUUIDs("assignedUserId", g.AssignedUserIDs)
 }
 
-// SearchCases implements CaseService.
-func (s *caseService) SearchCases(ctx context.Context, req domain.SearchCasesRequest) (domain.SearchCasesResponse, error) {
-	if err := normalizePagination(&req.Pagination); err != nil {
-		return domain.SearchCasesResponse{}, err
-	}
+// prepareCaseSearch validates and parses req's filters and applies the sort
+// defaults, returning the request with Parsed populated. SearchCases and
+// AggregateCases share it, so an aggregate rejects exactly what a search would.
+func (s *caseService) prepareCaseSearch(ctx context.Context, req domain.SearchCasesRequest) (domain.SearchCasesRequest, error) {
 	if err := validateSearchQuery(req.Filters.SearchQuery); err != nil {
-		return domain.SearchCasesResponse{}, err
+		return domain.SearchCasesRequest{}, err
 	}
 
 	token := middleware.UserIDTokenFromContext(ctx)
 	callerEmail, callerEmailErr := resolveCaseFilterCallerEmail(token)
 	parsed, err := ParseCaseFieldFilters(req.Filters.Filters, callerEmail, callerEmailErr, time.Now().UTC())
 	if err != nil {
-		return domain.SearchCasesResponse{}, err
+		return domain.SearchCasesRequest{}, err
 	}
 
 	if err := validateUUIDs("projectId", parsed.ExcludeProjectIDs); err != nil {
-		return domain.SearchCasesResponse{}, err
+		return domain.SearchCasesRequest{}, err
 	}
 	if err := validateUUIDs("creTeam", parsed.CreTeamIDs); err != nil {
-		return domain.SearchCasesResponse{}, err
+		return domain.SearchCasesRequest{}, err
 	}
 	if err := validateUUIDs("sreTeam", parsed.SreTeamIDs); err != nil {
-		return domain.SearchCasesResponse{}, err
+		return domain.SearchCasesRequest{}, err
 	}
 	if parsed.ParentID != nil {
 		if err := validateUUIDs("parentId", []string{*parsed.ParentID}); err != nil {
-			return domain.SearchCasesResponse{}, err
+			return domain.SearchCasesRequest{}, err
 		}
 	}
 	// The same checks apply to the top-level fields and to each anyOf branch, so
@@ -1911,18 +2100,18 @@ func (s *caseService) SearchCases(ctx context.Context, req domain.SearchCasesReq
 		WorkStates: parsed.WorkStates, ProjectIDs: parsed.ProjectIDs,
 		DeploymentIDs: parsed.DeploymentIDs, AssignedUserIDs: parsed.AssignedUserIDs,
 	}); err != nil {
-		return domain.SearchCasesResponse{}, err
+		return domain.SearchCasesRequest{}, err
 	}
 
 	// anyOf branches: parse into OR groups (only the ServiceNow adapter did this
 	// before) and validate each branch's values exactly like the top level.
 	orGroups, err := ParseCaseFieldFilterGroups(req.Filters.AnyOf)
 	if err != nil {
-		return domain.SearchCasesResponse{}, err
+		return domain.SearchCasesRequest{}, err
 	}
 	for _, g := range orGroups {
 		if err := validateCaseFieldValues(g); err != nil {
-			return domain.SearchCasesResponse{}, err
+			return domain.SearchCasesRequest{}, err
 		}
 	}
 	parsed.OrGroups = orGroups
@@ -1933,74 +2122,45 @@ func (s *caseService) SearchCases(ctx context.Context, req domain.SearchCasesReq
 
 	if parsed.ClosedEndDate != nil && parsed.ClosedStartDate != nil &&
 		parsed.ClosedEndDate.Before(*parsed.ClosedStartDate) {
-		return domain.SearchCasesResponse{}, &apierror.ValidationError{Msg: "closedOn: lte value must not be before gte value"}
+		return domain.SearchCasesRequest{}, &apierror.ValidationError{Msg: "closedOn: lte value must not be before gte value"}
 	}
 	if parsed.EndCreatedDate != nil && parsed.StartCreatedDate != nil &&
 		parsed.EndCreatedDate.Before(*parsed.StartCreatedDate) {
-		return domain.SearchCasesResponse{}, &apierror.ValidationError{Msg: "createdOn: lte value must not be before gte value"}
+		return domain.SearchCasesRequest{}, &apierror.ValidationError{Msg: "createdOn: lte value must not be before gte value"}
 	}
 	if parsed.EndUpdatedDate != nil && parsed.StartUpdatedDate != nil &&
 		parsed.EndUpdatedDate.Before(*parsed.StartUpdatedDate) {
-		return domain.SearchCasesResponse{}, &apierror.ValidationError{Msg: "updatedOn: lte value must not be before gte value"}
+		return domain.SearchCasesRequest{}, &apierror.ValidationError{Msg: "updatedOn: lte value must not be before gte value"}
 	}
-	// resolvedOn has no backing column in the relational schema and
-	// caseRepo.SearchCases models no predicate for it, so accepting it here
-	// would drop the bound silently and answer 200 with every case rather
-	// than the resolved-in-range ones asked for. Reject, same as every other
-	// predicate this data source cannot express.
-	if parsed.ResolvedStartDate != nil || parsed.ResolvedEndDate != nil {
-		return domain.SearchCasesResponse{}, &apierror.ValidationError{Msg: `field "resolvedOn" is not supported by this data source`}
-	}
-
-	// projectType dot-walks into a ServiceNow-specific concept that
-	// caseRepo.SearchCases has no query for today. Reject rather than
-	// silently drop the predicate and widen the result set. (tag,
-	// projectOnboardingStatus and taskSLABusinessElapsedPercent are
-	// implemented there, so are absent here; product and creTeam/sreTeam
-	// used to be too, but the repository already joins account and "group" --
-	// see caseFieldPredicates/the SearchCases joins block.)
-	// state+in is supported here; state+notIn has no repository query support,
-	// and dropping an exclusion silently would widen the result set.
-	// parentId is also implemented (wi.parent_id, migration 0039 -- the
-	// "Linked Items" tab's child-case lookup), so it too is absent here.
-	if len(parsed.ExcludeStates) > 0 {
-		return domain.SearchCasesResponse{}, &apierror.ValidationError{Msg: `field "state" (notIn) is not supported by this data source`}
-	}
-	if len(parsed.ProjectTypeNames) > 0 {
-		return domain.SearchCasesResponse{}, &apierror.ValidationError{Msg: `field "projectType" is not supported by this data source`}
-	}
+	// Predicates the repository does not express are rejected below rather
+	// than dropped silently, which would widen the result set. resolvedOn,
+	// state (in and notIn), projectType, slaBreached and the tag,
+	// projectOnboardingStatus, taskSLABusinessElapsedPercent, parentId, product
+	// and creTeam/sreTeam predicates are implemented by caseRepo.SearchCases
+	// and are absent from these guards.
 	// accountId+in has no repository query support today either (see
 	// domain.ParsedCaseFilters.AccountIDs); accountId+notIn is rejected the
 	// same way rather than silently dropping the exclusion and widening the
 	// result set.
 	if len(parsed.ExcludeAccountIDs) > 0 {
-		return domain.SearchCasesResponse{}, &apierror.ValidationError{Msg: `field "accountId" (notIn) is not supported by this data source`}
+		return domain.SearchCasesRequest{}, &apierror.ValidationError{Msg: `field "accountId" (notIn) is not supported by this data source`}
 	}
 	if parsed.Unassigned {
-		return domain.SearchCasesResponse{}, &apierror.ValidationError{Msg: `field "assignedUserId" (isEmpty) is not supported by this data source`}
+		return domain.SearchCasesRequest{}, &apierror.ValidationError{Msg: `field "assignedUserId" (isEmpty) is not supported by this data source`}
 	}
 	if parsed.ResolutionNotesEmpty {
-		return domain.SearchCasesResponse{}, &apierror.ValidationError{Msg: `field "resolutionNotes" is not supported by this data source`}
+		return domain.SearchCasesRequest{}, &apierror.ValidationError{Msg: `field "resolutionNotes" is not supported by this data source`}
 	}
 
-	// The slaBreached and account-escalation predicates and grouped counts are
-	// implemented only in the ServiceNow case service (snCaseService.SearchCases);
-	// caseRepo.SearchCases models none of them (tag, projectOnboardingStatus,
-	// taskSLABusinessElapsedPercent, escalationLevel, escalation and anyOf, by
-	// contrast, are implemented there and so are deliberately absent from these
-	// guards). ParseCaseFieldFilters accepts them
-	// because it is shared by both data sources, so without these guards a
-	// Postgres deployment would drop the predicate and answer 200 with a wider
-	// result set than the caller asked for. These stay ServiceNow-only by design:
-	// reject loudly rather than implement them here.
-	if parsed.HasBreachedSLA != nil {
-		return domain.SearchCasesResponse{}, &apierror.ValidationError{Msg: `field "slaBreached" is not supported by this data source`}
-	}
+	// The account-escalation predicate is implemented only in the ServiceNow
+	// case service (snCaseService.SearchCases); the relational schema has no
+	// account-level escalation state. ParseCaseFieldFilters accepts it because
+	// it is shared by both data sources, so without this guard a Postgres
+	// deployment would drop the predicate and answer 200 with a wider result
+	// set than the caller asked for. It stays ServiceNow-only by design: reject
+	// loudly rather than implement it here.
 	if parsed.HasActiveAccountEscalation != nil {
-		return domain.SearchCasesResponse{}, &apierror.ValidationError{Msg: `field "accountEscalationActive" is not supported by this data source`}
-	}
-	if req.GroupBy != "" {
-		return domain.SearchCasesResponse{}, &apierror.ValidationError{Msg: "groupBy is not supported by this data source"}
+		return domain.SearchCasesRequest{}, &apierror.ValidationError{Msg: `field "accountEscalationActive" is not supported by this data source`}
 	}
 
 	req.Parsed = parsed
@@ -2008,14 +2168,33 @@ func (s *caseService) SearchCases(ctx context.Context, req domain.SearchCasesReq
 	if req.SortBy.Field == "" {
 		req.SortBy.Field = domain.CaseSortFieldCreatedOn
 	} else if !validCaseSortField[req.SortBy.Field] {
-		return domain.SearchCasesResponse{}, &apierror.ValidationError{Msg: "sortBy.field must be one of: createdOn, updatedOn, severity, state"}
+		return domain.SearchCasesRequest{}, &apierror.ValidationError{Msg: "sortBy.field must be one of: createdOn, updatedOn, severity, state"}
 	}
 	if req.SortBy.Order == "" {
 		req.SortBy.Order = domain.CaseSortOrderDesc
 	} else if !validCaseSortOrder[req.SortBy.Order] {
-		return domain.SearchCasesResponse{}, &apierror.ValidationError{Msg: "sortBy.order must be one of: asc, desc"}
+		return domain.SearchCasesRequest{}, &apierror.ValidationError{Msg: "sortBy.order must be one of: asc, desc"}
 	}
 
+	return req, nil
+}
+
+// SearchCases implements CaseService.
+func (s *caseService) SearchCases(ctx context.Context, req domain.SearchCasesRequest) (domain.SearchCasesResponse, error) {
+	if err := normalizePagination(&req.Pagination); err != nil {
+		return domain.SearchCasesResponse{}, err
+	}
+	if req.GroupBy != "" {
+		values, ok := caseGroupByFieldValuesPG[req.GroupBy]
+		if !ok {
+			return domain.SearchCasesResponse{}, &apierror.ValidationError{Msg: "groupBy must be one of: state, severity, type, engagementType, issueType, workState"}
+		}
+		return s.searchCasesGrouped(ctx, req, values)
+	}
+	req, err := s.prepareCaseSearch(ctx, req)
+	if err != nil {
+		return domain.SearchCasesResponse{}, err
+	}
 	scope, err := s.access.ResolveScope(ctx)
 	if err != nil {
 		return domain.SearchCasesResponse{}, err
@@ -2034,8 +2213,86 @@ func (s *caseService) SearchCases(ctx context.Context, req domain.SearchCasesReq
 	}, nil
 }
 
-func (s *caseService) AggregateCases(_ context.Context, _ domain.AggregateCasesRequest) (domain.AggregateResponse, error) {
-	return domain.AggregateResponse{}, &apierror.ServiceUnavailableError{Msg: "groupBy is only supported for the ServiceNow data source"}
+// caseGroupByFieldValuesPG lists the buckets a grouped search returns for each
+// groupable field, in display order, so empty buckets are reported as zero
+// exactly as the ServiceNow-backed implementation does.
+var caseGroupByFieldValuesPG = map[string][]string{
+	"state":          {"open", "work_in_progress", "waiting_on_wso2", "awaiting_info", "reopened", "solution_proposed", "closed"},
+	"severity":       {"catastrophic", "critical", "high", "medium", "low"},
+	"type":           {"case", "service_request", "security_report_analysis", "announcement", "engagement"},
+	"engagementType": {"migration", "consultancy", "new_feature_improvement", "follow_up", "onboarding"},
+	"issueType":      {"error", "partial_outage", "performance_degradation", "question", "security_or_compliance", "total_outage"},
+	"workState":      {"ongoing", "paused"},
+}
+
+// searchCasesGrouped implements SearchCases' groupBy mode on this data source.
+func (s *caseService) searchCasesGrouped(ctx context.Context, req domain.SearchCasesRequest, values []string) (domain.SearchCasesResponse, error) {
+	groupBy := req.GroupBy
+	req.GroupBy = ""
+	req, err := s.prepareCaseSearch(ctx, req)
+	if err != nil {
+		return domain.SearchCasesResponse{}, err
+	}
+	scope, err := s.access.ResolveScope(ctx)
+	if err != nil {
+		return domain.SearchCasesResponse{}, err
+	}
+	buckets, err := s.repo.AggregateCases(ctx, req, groupBy, scope)
+	if err != nil {
+		return domain.SearchCasesResponse{}, err
+	}
+	counts := make(map[string]int, len(buckets))
+	for _, b := range buckets {
+		counts[b.Key] = b.Count
+	}
+	groups := make([]domain.CaseGroup, len(values))
+	total := 0
+	for i, v := range values {
+		groups[i] = domain.CaseGroup{Key: v, Count: counts[v]}
+		total += counts[v]
+	}
+	return domain.SearchCasesResponse{Groups: groups, Total: total, Limit: req.Pagination.Limit, Offset: req.Pagination.Offset}, nil
+}
+
+// defaultCaseAggregateMaxGroups applies when AggregateCasesRequest.MaxGroups is omitted.
+const defaultCaseAggregateMaxGroups = 10
+
+// AggregateCases implements CaseService.
+func (s *caseService) AggregateCases(ctx context.Context, req domain.AggregateCasesRequest) (domain.AggregateResponse, error) {
+	if req.GroupBy == "" {
+		return domain.AggregateResponse{}, &apierror.ValidationError{Msg: "groupBy is required"}
+	}
+	if !validCaseAggregateField[req.GroupBy] {
+		return domain.AggregateResponse{}, &apierror.ValidationError{Msg: "groupBy contains invalid value: " + req.GroupBy}
+	}
+	search, err := s.prepareCaseSearch(ctx, domain.SearchCasesRequest{Filters: req.Filters})
+	if err != nil {
+		return domain.AggregateResponse{}, err
+	}
+	scope, err := s.access.ResolveScope(ctx)
+	if err != nil {
+		return domain.AggregateResponse{}, err
+	}
+	buckets, err := s.repo.AggregateCases(ctx, search, req.GroupBy, scope)
+	if err != nil {
+		return domain.AggregateResponse{}, err
+	}
+	total := 0
+	for _, b := range buckets {
+		total += b.Count
+	}
+	maxGroups := req.MaxGroups
+	if maxGroups <= 0 {
+		maxGroups = defaultCaseAggregateMaxGroups
+	}
+	if maxGroups >= len(buckets) {
+		return domain.AggregateResponse{Groups: buckets, TotalRecords: total}, nil
+	}
+	others := 0
+	for _, b := range buckets[maxGroups:] {
+		others += b.Count
+	}
+	return domain.AggregateResponse{Groups: buckets[:maxGroups], OthersCount: others, TotalRecords: total}, nil
 }
 
 // resolveActor authenticates the caller from the x-user-id-token header

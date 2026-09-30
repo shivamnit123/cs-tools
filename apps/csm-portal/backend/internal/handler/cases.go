@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
+	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/servicenow"
 )
 
 var uuidRe = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
@@ -596,6 +597,9 @@ func (h *CaseHandler) SearchCaseComments(w http.ResponseWriter, r *http.Request)
 		mapUpstreamErrorGeneric(w, err, "Failed to search case comments.")
 		return
 	}
+	if shouldRedactInlineImages(h.access, user.Roles) {
+		result = redactRawBase64Images(result)
+	}
 
 	writeJSON(w, http.StatusOK, result)
 }
@@ -637,6 +641,9 @@ func (h *CaseHandler) SearchCaseActivities(w http.ResponseWriter, r *http.Reques
 		slog.ErrorContext(r.Context(), "entity SearchCaseActivities failed", "userID", user.UserID, "caseID", caseID, "err", err)
 		mapUpstreamErrorGeneric(w, err, "Failed to search case activities.")
 		return
+	}
+	if shouldRedactInlineImages(h.access, user.Roles) {
+		result = redactRawBase64Images(result)
 	}
 
 	writeJSON(w, http.StatusOK, result)
@@ -739,6 +746,9 @@ func (h *CaseHandler) SearchCases(w http.ResponseWriter, r *http.Request) {
 		slog.ErrorContext(r.Context(), "entity SearchCases failed", "userID", user.UserID, "err", err)
 		mapUpstreamErrorGeneric(w, err, "Failed to search cases.")
 		return
+	}
+	if shouldRedactInlineImages(h.access, user.Roles) {
+		result = redactRawBase64Images(result)
 	}
 
 	writeJSON(w, http.StatusOK, result)
@@ -1564,6 +1574,9 @@ func (h *CaseHandler) GetCase(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "Failed to process case details.")
 		return
 	}
+	if shouldRedactInlineImages(h.access, user.Roles) {
+		result = redactRawBase64Images(result)
+	}
 
 	writeJSON(w, http.StatusOK, result)
 }
@@ -1898,4 +1911,66 @@ func (h *CaseHandler) CreateCaseGithubIssue(w http.ResponseWriter, r *http.Reque
 	}
 
 	writeJSON(w, http.StatusCreated, result)
+}
+
+// splCaseClient abstracts the ServiceNow operations used by SplCaseHandler.
+// GetCases/GetCaseByNumber/GetCommentsAndWorknotes used to live here too,
+// backed first by ServiceNow and later by a Postgres translation layer --
+// both removed in favor of calling CS Portal's own POST /cases/search,
+// GET /cases/{id}, and POST /cases/{id}/comments/search directly (worknote
+// creation similarly merged onto POST /cases/{id}/comments, using the same
+// entity-service CommentType distinction CS Portal's own comment handler
+// already exposes -- see splWorknotesHandler's removal). Attachments have no
+// entity-service equivalent at all yet (no Postgres storage/backfill path),
+// so that one stays here, ServiceNow-backed, unmerged.
+type splCaseClient interface {
+	GetAttachmentsInfo(ctx context.Context, caseNumber string, offset, limit int) ([]servicenow.AttachmentInfo, error)
+}
+
+// SplCaseHandler handles HTTP requests for SupportPortalLite's case-
+// attachments endpoint -- the one piece of the case domain with no
+// Postgres/entity-service equivalent to merge onto (see splCaseClient's own
+// doc comment). Reading, searching, and commenting on cases now goes
+// through CS Portal's own /cases routes directly.
+type SplCaseHandler struct {
+	sn          splCaseClient
+	accessGuard *AccessGuard
+}
+
+// NewSplCaseHandler creates a SplCaseHandler.
+func NewSplCaseHandler(sn splCaseClient, accessGuard *AccessGuard) *SplCaseHandler {
+	return &SplCaseHandler{sn: sn, accessGuard: accessGuard}
+}
+
+// GetAttachmentsInfo handles GET /cases/{caseId}/attachments-info.
+func (h *SplCaseHandler) GetAttachmentsInfo(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireSPLAccess(w, r, h.accessGuard)
+	if !ok {
+		return
+	}
+	caseID := r.PathValue("caseId")
+	if caseID == "" {
+		writeError(w, http.StatusBadRequest, ErrMsgBadRequest)
+		return
+	}
+	offset, limit, ok := parsePaginationParams(w, r)
+	if !ok {
+		return
+	}
+
+	result, err := h.sn.GetAttachmentsInfo(r.Context(), caseID, offset, limit)
+	if err != nil {
+		if errors.Is(err, servicenow.ErrCaseNotFound) {
+			writeError(w, http.StatusNotFound, ErrMsgNotFound)
+			return
+		}
+		if isUnsafeQueryValue(err) {
+			writeError(w, http.StatusBadRequest, ErrMsgBadRequest)
+			return
+		}
+		slog.ErrorContext(r.Context(), "servicenow GetAttachmentsInfo failed", "userID", user.UserID, "caseID", caseID, "err", err)
+		mapUpstreamErrorGeneric(w, err, "Failed to retrieve case attachments.")
+		return
+	}
+	writeJSONValue(w, http.StatusOK, result)
 }

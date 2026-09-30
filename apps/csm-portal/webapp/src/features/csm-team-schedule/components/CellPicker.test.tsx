@@ -20,7 +20,8 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import CellPicker, { type CellPickerTarget } from "./CellPicker";
-import { ANNUAL_LEAVE, EVENING, LIEU_LEAVE, REGULAR, WEEKEND } from "../test/fixtures";
+import type { CellAbsence } from "../types";
+import { ANNUAL_LEAVE, EVENING, LIEU_LEAVE, REGULAR, RND, TZ1, TZ1_L1, TZ2, TZ3, WEEKEND } from "../test/fixtures";
 
 const ANCHOR = { top: 100, left: 100, bottom: 130, right: 144 };
 
@@ -51,7 +52,7 @@ function renderPicker(over: {
     <CellPicker
       target={over.target ?? target()}
       shifts={[REGULAR, EVENING, WEEKEND]}
-      leaveKinds={[ANNUAL_LEAVE, LIEU_LEAVE]}
+      awayKinds={[ANNUAL_LEAVE, LIEU_LEAVE, RND]}
       {...handlers}
     />,
   );
@@ -63,7 +64,8 @@ describe("CellPicker: what it offers", () => {
     renderPicker();
     expect(screen.getByText("Rotations")).toBeInTheDocument();
     expect(screen.getByText("Standing hours")).toBeInTheDocument();
-    expect(screen.getByText("Away")).toBeInTheDocument();
+    expect(screen.getByText("Leave")).toBeInTheDocument();
+    expect(screen.getByText("Allocations")).toBeInTheDocument();
   });
 
   it("disables a weekend rotation on a weekday, and says why", () => {
@@ -85,7 +87,7 @@ describe("CellPicker: what it offers", () => {
       <CellPicker
         target={target({ shiftCode: EVENING.code })}
         shifts={[REGULAR, EVENING, WEEKEND]}
-        leaveKinds={[ANNUAL_LEAVE]}
+        awayKinds={[ANNUAL_LEAVE]}
         onApply={vi.fn()}
         onMarkAway={vi.fn()}
         onClear={vi.fn()}
@@ -146,7 +148,7 @@ describe("CellPicker: the span it applies to", () => {
     const { onMarkAway } = renderPicker();
     fireEvent.change(screen.getByLabelText("Mark until"), { target: { value: "2026-09-25" } });
     fireEvent.click(screen.getByRole("button", { name: /Annual leave/ }));
-    expect(onMarkAway).toHaveBeenCalledWith("ANNUAL_LEAVE", "2026-09-23", "2026-09-25");
+    expect(onMarkAway).toHaveBeenCalledWith("ANNUAL_LEAVE", "2026-09-23", "2026-09-25", undefined);
   });
 
   it("warns that a span will skip the days a rotation is not worked on", () => {
@@ -154,6 +156,73 @@ describe("CellPicker: the span it applies to", () => {
     expect(screen.queryByText(/are skipped/)).not.toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("Mark until"), { target: { value: "2026-09-29" } });
     expect(screen.getByText(/are skipped/)).toBeInTheDocument();
+  });
+});
+
+describe("CellPicker: choosing the start as well as the end", () => {
+  it("starts on the clicked day and lets the start move earlier", () => {
+    // Marking a fortnight of leave from its middle should not mean finding
+    // its first day on the grid first.
+    const { onMarkAway } = renderPicker();
+    fireEvent.change(screen.getByLabelText("Mark from"), { target: { value: "2026-09-21" } });
+    expect(screen.getByText("3 days")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Annual leave/ }));
+    expect(onMarkAway).toHaveBeenCalledWith("ANNUAL_LEAVE", "2026-09-21", "2026-09-23", undefined);
+  });
+
+  it("applies a rotation from the chosen start too", () => {
+    const { onApply } = renderPicker();
+    fireEvent.change(screen.getByLabelText("Mark from"), { target: { value: "2026-09-21" } });
+    fireEvent.click(screen.getByRole("button", { name: /Evening 6-9pm/ }));
+    expect(onApply).toHaveBeenCalledWith(EVENING.code, "2026-09-21", "2026-09-23");
+  });
+
+  it("keeps a start that is not a date yet on the clicked day", () => {
+    renderPicker();
+    fireEvent.change(screen.getByLabelText("Mark from"), { target: { value: "202609-02-09" } });
+    expect(screen.getByText("1 day")).toBeInTheDocument();
+    expect(screen.queryByText(/NaN/)).not.toBeInTheDocument();
+  });
+
+  it("takes the end along when the start moves past it", () => {
+    renderPicker();
+    const from = screen.getByLabelText("Mark from") as HTMLInputElement;
+    fireEvent.change(from, { target: { value: "2026-09-28" } });
+    fireEvent.blur(from);
+    expect((screen.getByLabelText("Mark until") as HTMLInputElement).value).toBe("2026-09-28");
+    expect(screen.getByText("1 day")).toBeInTheDocument();
+  });
+
+  it("blocks leave from a weekend start, but not an allocation", () => {
+    renderPicker();
+    fireEvent.change(screen.getByLabelText("Mark from"), { target: { value: "2026-09-26" } });
+    expect(screen.getByRole("button", { name: /Annual leave/ })).toBeDisabled();
+    expect(screen.getByRole("button", { name: new RegExp(RND.label) })).toBeEnabled();
+  });
+});
+
+describe("CellPicker: allocations", () => {
+  it("sends who an allocation is for", () => {
+    const { onMarkAway } = renderPicker();
+    fireEvent.change(screen.getByLabelText("Mark until"), { target: { value: "2026-09-30" } });
+    fireEvent.change(screen.getByLabelText("Allocated to"), { target: { value: "  Acme Corp " } });
+    fireEvent.click(screen.getByRole("button", { name: new RegExp(RND.label) }));
+    expect(onMarkAway).toHaveBeenCalledWith(RND.code, "2026-09-23", "2026-09-30", "Acme Corp");
+  });
+
+  it("leaves it out when nobody was named", () => {
+    const { onMarkAway } = renderPicker();
+    fireEvent.click(screen.getByRole("button", { name: new RegExp(RND.label) }));
+    expect(onMarkAway).toHaveBeenCalledWith(RND.code, "2026-09-23", "2026-09-23", undefined);
+  });
+
+  it("never sends it with leave", () => {
+    // Leave is not for anybody; a name typed for an allocation must not ride
+    // along on a leave click.
+    const { onMarkAway } = renderPicker();
+    fireEvent.change(screen.getByLabelText("Allocated to"), { target: { value: "Acme Corp" } });
+    fireEvent.click(screen.getByRole("button", { name: /Annual leave/ }));
+    expect(onMarkAway).toHaveBeenCalledWith("ANNUAL_LEAVE", "2026-09-23", "2026-09-23", undefined);
   });
 });
 
@@ -187,5 +256,194 @@ describe("CellPicker: what clearing means here", () => {
     expect(clear).toHaveTextContent("back on the rota");
     fireEvent.click(clear);
     expect(onClear).toHaveBeenCalledWith(REGULAR.code, "2026-09-23", "2026-09-23");
+  });
+});
+
+describe("CellPicker: removing a whole span", () => {
+  const leave: CellAbsence = {
+    id: "ab1",
+    kindCode: "ANNUAL_LEAVE",
+    startsOn: "2026-09-21",
+    endsOn: "2026-09-25",
+  };
+
+  function renderWithAbsence(absence: CellAbsence, onRemoveAbsence = vi.fn()) {
+    render(
+      <CellPicker
+        target={target({ absenceKindCode: absence.kindCode, absence })}
+        shifts={[REGULAR, EVENING, WEEKEND]}
+        awayKinds={[ANNUAL_LEAVE, LIEU_LEAVE, RND]}
+        onApply={vi.fn()}
+        onMarkAway={vi.fn()}
+        onClear={vi.fn()}
+        onRemoveAbsence={onRemoveAbsence}
+        onClose={vi.fn()}
+      />,
+    );
+    return onRemoveAbsence;
+  }
+
+  it("names the span and removes all of it in one click", () => {
+    const onRemoveAbsence = renderWithAbsence(leave);
+    expect(screen.getByText("21 Sept – 25 Sept")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    expect(onRemoveAbsence).toHaveBeenCalledWith("ab1");
+  });
+
+  it("says when a span has no end", () => {
+    const { endsOn: _drop, ...openEnded } = leave;
+    void _drop;
+    renderWithAbsence({ ...openEnded, kindCode: RND.code });
+    expect(screen.getByText(/until further notice/)).toBeInTheDocument();
+  });
+
+  it("offers nothing to remove on a day nobody is away", () => {
+    renderPicker({ target: target() });
+    expect(screen.queryByRole("button", { name: "Remove" })).not.toBeInTheDocument();
+  });
+});
+
+describe("CellPicker: adding a tag", () => {
+  function renderWithCreate(onCreateKind: (k: unknown) => Promise<void>) {
+    render(
+      <CellPicker
+        target={target()}
+        shifts={[REGULAR]}
+        awayKinds={[ANNUAL_LEAVE, RND]}
+        onApply={vi.fn()}
+        onMarkAway={vi.fn()}
+        onClear={vi.fn()}
+        onCreateKind={onCreateKind}
+        onClose={vi.fn()}
+      />,
+    );
+  }
+
+  it("creates a tag with what the lead typed", async () => {
+    const onCreateKind = vi.fn(() => Promise.resolve());
+    renderWithCreate(onCreateKind);
+    fireEvent.click(screen.getByRole("button", { name: "+ New tag" }));
+    fireEvent.change(screen.getByLabelText("Tag short code"), { target: { value: " Trn " } });
+    fireEvent.change(screen.getByLabelText("Tag name"), { target: { value: "External training" } });
+    fireEvent.click(screen.getByRole("radio", { name: "Colour MIG" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add tag" }));
+    expect(onCreateKind).toHaveBeenCalledWith({
+      shortCode: "Trn",
+      label: "External training",
+      bucket: "ALLOCATION",
+      colourToken: "MIG",
+    });
+    expect(await screen.findByRole("button", { name: "+ New tag" })).toBeInTheDocument();
+  });
+
+  it("refuses a short code another tag already draws, without asking the server", () => {
+    const onCreateKind = vi.fn(() => Promise.resolve());
+    renderWithCreate(onCreateKind);
+    fireEvent.click(screen.getByRole("button", { name: "+ New tag" }));
+    fireEvent.change(screen.getByLabelText("Tag short code"), { target: { value: "al" } });
+    fireEvent.change(screen.getByLabelText("Tag name"), { target: { value: "Another leave" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add tag" }));
+    expect(onCreateKind).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert")).toHaveTextContent("already a tag");
+  });
+
+  it("shows why the server refused it", async () => {
+    renderWithCreate(() => Promise.reject(new Error("A tag with that name or short code already exists.")));
+    fireEvent.click(screen.getByRole("button", { name: "+ New tag" }));
+    fireEvent.change(screen.getByLabelText("Tag short code"), { target: { value: "Xyz" } });
+    fireEvent.change(screen.getByLabelText("Tag name"), { target: { value: "Something" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add tag" }));
+    expect(await screen.findByText(/already exists/)).toBeInTheDocument();
+  });
+});
+
+describe("CellPicker: the SRE escalation grid", () => {
+  function renderSre(over: Partial<CellPickerTarget> = {}, onApply = vi.fn()) {
+    render(
+      <CellPicker
+        target={target({ zoneCode: "TZ1", ...over })}
+        shifts={[TZ1, TZ1_L1, TZ2, TZ3]}
+        awayKinds={[ANNUAL_LEAVE, RND]}
+        onApply={onApply}
+        onMarkAway={vi.fn()}
+        onClear={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+    return onApply;
+  }
+
+  it("offers L1, L2 and L3 for every zone, not just the one clicked", () => {
+    renderSre();
+    for (const zone of ["TZ1", "TZ2", "TZ3"]) {
+      for (const tier of ["L1", "L2", "L3"]) {
+        expect(screen.getByRole("button", { name: `${tier} for ${zone}` })).toBeEnabled();
+      }
+    }
+    // The escalation windows are not listed a second time as rotations.
+    expect(screen.queryByRole("button", { name: /TZ2 escalation/ })).not.toBeInTheDocument();
+  });
+
+  it("rosters L3 for another zone on that zone's open window", () => {
+    const onApply = renderSre();
+    fireEvent.click(screen.getByRole("button", { name: "L3 for TZ2" }));
+    expect(onApply).toHaveBeenCalledWith("SRE_TZ2", "2026-09-23", "2026-09-23", "L3");
+  });
+
+  it("uses the window that fixes a tier without sending one", () => {
+    const onApply = renderSre();
+    fireEvent.click(screen.getByRole("button", { name: "L1 for TZ1" }));
+    expect(onApply).toHaveBeenCalledWith("SRE_TZ1_L1", "2026-09-23", "2026-09-23", undefined);
+  });
+
+  it("marks the tier already held", () => {
+    renderSre({ shiftCode: "SRE_TZ1", tier: "L2" });
+    expect(screen.getByRole("button", { name: "L2 for TZ1" })).toHaveClass("on");
+    expect(screen.getByRole("button", { name: "L1 for TZ1" })).not.toHaveClass("on");
+  });
+
+  it("clears the turn, not the allocation beside it", () => {
+    // A cell holding L1 and RnD: the allocation has its own Remove, so Clear
+    // is about the turn.
+    renderSre({ shiftCode: "SRE_TZ1", tier: "L1", absenceKindCode: "RND", baseShiftCode: REGULAR.code });
+    const clear = screen.getByRole("button", { name: /Clear/ });
+    expect(clear).toHaveTextContent(/back to regular hours/i);
+    expect(clear).not.toHaveTextContent("back on the rota");
+  });
+});
+
+describe("CellPicker: deleting a tag a lead added", () => {
+  const CUSTOM = { ...RND, id: "k9", code: "TRAINING", shortCode: "Trn", label: "Training", custom: true };
+
+  function renderWithDelete(onDeleteKind: (code: string) => Promise<void>) {
+    render(
+      <CellPicker
+        target={target()}
+        shifts={[REGULAR]}
+        awayKinds={[ANNUAL_LEAVE, RND, CUSTOM]}
+        onApply={vi.fn()}
+        onMarkAway={vi.fn()}
+        onClear={vi.fn()}
+        onDeleteKind={onDeleteKind}
+        onClose={vi.fn()}
+      />,
+    );
+  }
+
+  it("offers delete on a custom tag only, and asks before deleting", async () => {
+    const onDeleteKind = vi.fn(() => Promise.resolve());
+    renderWithDelete(onDeleteKind);
+    expect(screen.queryByRole("button", { name: /Delete the R&D tag/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Delete the Training tag" }));
+    expect(onDeleteKind).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm deleting the Training tag" }));
+    expect(onDeleteKind).toHaveBeenCalledWith("TRAINING");
+  });
+
+  it("says why a tag was not deleted", async () => {
+    renderWithDelete(() => Promise.reject(new Error("That tag is still used on the rota.")));
+    fireEvent.click(screen.getByRole("button", { name: "Delete the Training tag" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm deleting the Training tag" }));
+    expect(await screen.findByText(/still used on the rota/)).toBeInTheDocument();
   });
 });

@@ -16,7 +16,7 @@
  * under the License.
  */
 
-import type { ScheduleAssignment, ScheduleShift } from "../types";
+import type { ScheduleAbsenceKind, ScheduleAssignment, ScheduleShift, ScheduleTier } from "../types";
 
 
 /**
@@ -294,4 +294,197 @@ export function standingWindowKey(shift: ScheduleShift | undefined, fallback: st
     shift.authoringTimeZone,
     shift.dayScope,
   ].join(":");
+}
+
+/** One zone's row of the escalation grid: which window each tier goes on. */
+export interface EscalationRow {
+  zoneCode: string;
+  /** What the zone is called on this kind of day -- "TZ1+2" at the weekend,
+   *  when TZ1 and TZ2 are one crew -- see zoneLabelOn. */
+  label: string;
+  tiers: { tier: ScheduleTier; shift?: ScheduleShift }[];
+}
+
+const ESCALATION_TIERS: ScheduleTier[] = ["L1", "L2", "L3"];
+
+/**
+ * The escalation grid a lead picks from: every zone worked on this kind of day
+ * (weekday or weekend), and L1, L2 and L3 in each.
+ *
+ * A tier goes on the zone's window that fixes that tier where there is one
+ * (TZ1's own L1 window), else on the zone's escalation window that leaves the
+ * tier to the person (SRE_TZ1, SRE_TZ3). A tier with neither is left without
+ * a window, and the picker shows it unavailable rather than guessing one.
+ */
+export function escalationGrid(shifts: ScheduleShift[], iso: string): EscalationRow[] {
+  const d = new Date(`${iso}T00:00:00`);
+  const weekend = d.getDay() === 0 || d.getDay() === 6;
+  const worked = (s: ScheduleShift) =>
+    s.dayScope === "ANY" || (s.dayScope === "WEEKEND") === weekend;
+  const esc = shifts.filter((s) => s.isEscalation && s.zoneCode && worked(s));
+  const zones = [...new Set(esc.map((s) => s.zoneCode as string))].sort();
+  return zones.map((zoneCode) => {
+    const here = esc.filter((s) => s.zoneCode === zoneCode).sort((a, b) => a.sortOrder - b.sortOrder);
+    return {
+      zoneCode,
+      label: zoneLabelOn(shifts, zoneCode, weekend),
+      tiers: ESCALATION_TIERS.map((tier) => ({
+        tier,
+        shift: here.find((s) => s.tier === tier) ?? here.find((s) => !s.tier),
+      })),
+    };
+  });
+}
+
+/** Which zone and tier an escalation turn is, where it is one. */
+export interface EscalationTurn {
+  zoneCode: string;
+  tier: ScheduleTier;
+  weekend: boolean;
+}
+
+/**
+ * The zone and tier an assignment holds, if it is an escalation turn at all.
+ *
+ * The tier is the assignment's own, else the window's (TZ1's own L1 window
+ * fixes it). A turn on a zone's shared escalation window with no tier is not
+ * a turn -- see isTierlessEscalation -- and comes back null here.
+ */
+export function escalationTurnOf(
+  a: ScheduleAssignment,
+  shifts: Map<string, ScheduleShift>,
+): EscalationTurn | null {
+  const sh = shifts.get(a.shiftCode);
+  const zoneCode = a.zoneCode ?? sh?.zoneCode;
+  const tier = a.tier ?? sh?.tier;
+  if (!sh?.isEscalation || !zoneCode || !tier) return null;
+  return { zoneCode, tier, weekend: sh.dayScope === "WEEKEND" };
+}
+
+/**
+ * No tier on a zone's shared escalation window. That is what "works this
+ * zone, is not on the escalation rota" looks like -- the zone's regular hours
+ * -- so the views read it as that rather than as a turn missing its tier.
+ * New ones cannot be written any more; this is for rows written before.
+ */
+export function isTierlessEscalation(a: ScheduleAssignment, shifts: Map<string, ScheduleShift>): boolean {
+  const sh = shifts.get(a.shiftCode);
+  return Boolean(sh?.isEscalation && (a.zoneCode ?? sh.zoneCode) && !a.tier && !sh.tier);
+}
+
+/**
+ * What a zone is called on a weekday or at the weekend.
+ *
+ * At the weekend TZ1 and TZ2 are one crew, carried under TZ1, and the
+ * catalogue's window for it says so in its short code ("TZ1+2"). So the name
+ * is read off the zone's own escalation window for that kind of day -- the
+ * one that leaves the tier open -- rather than written down here, and a
+ * weekday, or a zone with no such window, is simply its code.
+ */
+export function zoneLabelOn(
+  shifts: ScheduleShift[] | Map<string, ScheduleShift>,
+  zoneCode: string,
+  weekend: boolean,
+): string {
+  if (!weekend) return zoneCode;
+  const list = Array.isArray(shifts) ? shifts : [...shifts.values()];
+  const own = list.find(
+    (s) => s.isEscalation && !s.tier && s.zoneCode === zoneCode && s.dayScope === "WEEKEND",
+  );
+  // Only a short code that extends the zone's own ("TZ1" -> "TZ1+2") names
+  // the crew; anything else ("L1") is the chip, not a zone name.
+  return own?.shortCode && own.shortCode !== zoneCode && own.shortCode.startsWith(zoneCode)
+    ? own.shortCode
+    : zoneCode;
+}
+
+
+/** The kinds a lead may mark somebody away for on one rota: leave, and the
+ *  time allocations that rota uses.
+ *
+ *  CRE and SRE allocate time to different things -- RnD is SRE's, Migration
+ *  is CRE's -- so each is offered only its own, plus what both share (every
+ *  kind of leave, Allo-INT, Allo-EXT, the Brazil rotation). EXCLUDED, off
+ *  the rota entirely, is not a lead's to set from a cell, and a retired kind
+ *  is served only so the days already marked with it keep their label. */
+export function kindsOfferedOn(
+  kinds: readonly ScheduleAbsenceKind[],
+  family: "CRE" | "SRE",
+): ScheduleAbsenceKind[] {
+  return kinds.filter(
+    (k) =>
+      (k.bucket === "LEAVE" || k.bucket === "ALLOCATION") &&
+      !k.retired &&
+      (!k.family || k.family === family),
+  );
+}
+
+/** How many months the roster can show at once. */
+export type RosterSpan = 1 | 3 | 6;
+
+/** Days either side of the selected day for each span: a span is centred on
+ *  the day the reader is looking at (today, until they move it), not a run of
+ *  calendar months. One month is two weeks either way; three and six are a
+ *  month and a half and three months either way. */
+export const ROSTER_SPAN_HALF_DAYS: Record<RosterSpan, number> = { 1: 14, 3: 45, 6: 91 };
+
+/** The first and last day the roster shows around `anchor`. */
+export function rosterRange(anchor: Date, span: RosterSpan): { start: Date; end: Date } {
+  const day = new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate());
+  const half = ROSTER_SPAN_HALF_DAYS[span];
+  return { start: addDays(day, -half), end: addDays(day, half) };
+}
+
+/** A range cut into the calendar months it touches, each clipped to the
+ *  range: the shape the rota is fetched in. A turn belongs to one rota day, so
+ *  the pieces never overlap; the whole months in the middle keep the same
+ *  query key as the reader steps a day, so only the two ends are re-read. */
+export function monthPieces(start: Date, end: Date): { from: string; to: string }[] {
+  const out: { from: string; to: string }[] = [];
+  let y = start.getFullYear();
+  let m = start.getMonth();
+  const last = toIsoDate(end);
+  const first = toIsoDate(start);
+  for (;;) {
+    const monthFrom = toIsoDate(new Date(y, m, 1));
+    const monthTo = toIsoDate(new Date(y, m + 1, 0));
+    if (monthFrom > last) break;
+    out.push({ from: monthFrom < first ? first : monthFrom, to: monthTo > last ? last : monthTo });
+    m += 1;
+    if (m === 12) {
+      m = 0;
+      y += 1;
+    }
+  }
+  return out;
+}
+
+/** The rota a reader belongs to, for deciding what the page shows them.
+ *
+ *  Their team says it where they have one. A rota admin holds no team, but
+ *  runs one group's rota all the same, and reads that group's views as their
+ *  own and the other group's Today only. Two things can say which group:
+ *
+ *   - the cre_rota_admin / sre_rota_admin role, where the sign-in carries it
+ *     (matched on the part after any namespace, "x.cre_rota_admin");
+ *   - the teams they may edit, which the server grants a rota admin as every
+ *     team of their group -- the only signal when the sign-in carries only
+ *     its groups, not the portal's own roles.
+ *
+ *  Both roles, or editable teams spanning both groups, or none of it, is
+ *  nobody's group: a manager, who sees both groups everywhere. */
+export function readerFamily(
+  teamFamily: string | undefined | null,
+  roles: readonly string[] | undefined | null,
+  editableFamilies: readonly string[] = [],
+): "CRE" | "SRE" | undefined {
+  const f = teamFamily?.toUpperCase();
+  if (f) return f.startsWith("SRE") ? "SRE" : "CRE";
+  const held = new Set((roles ?? []).map((r) => r.toLowerCase().replace(/^.*\./, "")));
+  const cre = held.has("cre_rota_admin");
+  const sre = held.has("sre_rota_admin");
+  if (cre !== sre) return cre ? "CRE" : "SRE";
+  if (cre && sre) return undefined;
+  const edits = new Set(editableFamilies.map((x) => (x.toUpperCase().startsWith("SRE") ? "SRE" : "CRE")));
+  return edits.size === 1 ? [...edits][0] as "CRE" | "SRE" : undefined;
 }

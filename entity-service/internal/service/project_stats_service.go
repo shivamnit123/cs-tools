@@ -50,10 +50,14 @@ var caseStatsOutstandingStates = []string{
 //
 // Unlike cases, a change request's active and outstanding sets genuinely
 // differ: the three earliest states (NEW/ASSESS/AUTHORIZE) are active but
-// not yet outstanding.
+// not yet outstanding. ROLLBACK is grouped with IMPLEMENT -- both are WSO2
+// engineering work in progress, not a state awaiting the customer, so
+// ROLLBACK is active and outstanding but not action-required. CANCELED
+// (like CLOSED) is a terminal state and deliberately in none of the three
+// lists -- a cancelled change request is neither in progress nor resolved.
 var (
-	crActiveStates         = []string{"NEW", "ASSESS", "AUTHORIZE", "CUSTOMER_APPROVAL", "SCHEDULED", "IMPLEMENT", "REVIEW", "CUSTOMER_REVIEW"}
-	crOutstandingStates    = []string{"CUSTOMER_APPROVAL", "SCHEDULED", "IMPLEMENT", "REVIEW", "CUSTOMER_REVIEW"}
+	crActiveStates         = []string{"NEW", "ASSESS", "AUTHORIZE", "CUSTOMER_APPROVAL", "SCHEDULED", "IMPLEMENT", "ROLLBACK", "REVIEW", "CUSTOMER_REVIEW"}
+	crOutstandingStates    = []string{"CUSTOMER_APPROVAL", "SCHEDULED", "IMPLEMENT", "ROLLBACK", "REVIEW", "CUSTOMER_REVIEW"}
 	crActionRequiredStates = []string{"CUSTOMER_APPROVAL", "CUSTOMER_REVIEW"}
 )
 

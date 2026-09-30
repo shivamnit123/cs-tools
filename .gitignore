@@ -67,3 +67,9 @@ scripts/csm-compose/out.sql
 *ABT-Rotation*
 *sre-rotation*.sql
 *sre-rotation*.csv
+
+# Python bytecode from the roster importers. Build output, and the cached
+# names give away the module names either way -- there is already a stale
+# cpython-313 set sitting beside a 314 one.
+__pycache__/
+*.py[cod]

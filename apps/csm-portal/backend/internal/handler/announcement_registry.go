@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
 )
@@ -59,6 +60,19 @@ func NewAnnouncementRegistryHandler(entity entityAnnouncementRegistryClient) *An
 const (
 	registryPageLimit = 50
 	maxRegistryPages  = 200
+	// registryFetchConcurrency bounds how many pages fetchAllPagesConcurrently
+	// fetches from entity-service at once, once the first page reveals the
+	// real total. The announcement/announcement_requests tables this handler
+	// scans have no upper bound on their own, and paging through thousands of
+	// rows one request at a time (each waiting for the previous to finish)
+	// made this endpoint visibly slow as they grew -- fetching pages
+	// concurrently, capped at a modest width, cuts wall-clock time roughly by
+	// this factor without bursting an unbounded number of simultaneous
+	// requests at entity-service. registryPageLimit itself can't be raised to
+	// compensate instead -- entity-service's own SearchCases caps limit at 50
+	// (its shared normalizePagination), so 50 is already this loop's largest
+	// valid page size.
+	registryFetchConcurrency = 8
 )
 
 // registryCaseView is the minimal subset of entity-service's
@@ -204,6 +218,90 @@ type registrySearchRequest struct {
 	} `json:"pagination"`
 }
 
+// fetchAllPagesConcurrently pages through everything a paginated search
+// endpoint returns: fetch page 0 alone (the only way to learn the real
+// total), then fetch every remaining page concurrently, bounded by
+// registryFetchConcurrency, and reassemble them in their original page
+// order — same rows, same order a fully serial loop would produce, just far
+// less sequential wall-clock time once there's more than a couple of pages
+// (see registryFetchConcurrency's own doc comment for why that matters
+// here). tooManyPagesErr builds the caller-specific "too many X" error once
+// the real total implies more than maxPages pages — same safety-bound
+// convention (and same per-caller wording) the old serial loops already had.
+func fetchAllPagesConcurrently[T any](
+	ctx context.Context,
+	pageLimit, maxPages int,
+	fetchPage func(ctx context.Context, offset int) (items []T, total int, err error),
+	tooManyPagesErr func() error,
+) ([]T, error) {
+	first, total, err := fetchPage(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
+	if len(first) == 0 || len(first) >= total {
+		return first, nil
+	}
+
+	numPages := (total + pageLimit - 1) / pageLimit
+	if numPages > maxPages {
+		return nil, tooManyPagesErr()
+	}
+
+	pages := make([][]T, numPages)
+	pages[0] = first
+
+	// fetchCtx is cancelled the moment any page fails, so every other
+	// in-flight fetch (and anything still waiting on sem below) unwinds
+	// quickly instead of running to completion for a result that's already
+	// going to be discarded.
+	fetchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		firstErr error
+	)
+	sem := make(chan struct{}, registryFetchConcurrency)
+	for page := 1; page < numPages; page++ {
+		// Stop dispatching new pages once an earlier one has already failed:
+		// each already-cancelled fetchCtx makes a still-context-aware fetch
+		// return almost immediately anyway, but this avoids spending pages
+		// (and real upstream calls, for a fetchPage that doesn't happen to
+		// check its context) on a result the caller is about to discard.
+		if fetchCtx.Err() != nil {
+			break
+		}
+		page := page
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			items, _, err := fetchPage(fetchCtx, page*pageLimit)
+			if err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+					cancel()
+				}
+				mu.Unlock()
+				return
+			}
+			pages[page] = items
+		}()
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+
+	var all []T
+	for _, p := range pages {
+		all = append(all, p...)
+	}
+	return all, nil
+}
+
 // fetchAllMatchingCases pages through every announcement-type case matching
 // req's own search/states/projectIds filters, newest-updated first —
 // ignoring req.Pagination, which this handler applies to the *grouped*
@@ -219,9 +317,7 @@ func (h *AnnouncementRegistryHandler) fetchAllMatchingCases(ctx context.Context,
 		fieldFilters = append(fieldFilters, map[string]any{"field": "projectId", "op": "in", "values": req.ProjectIDs})
 	}
 
-	var cases []registryCaseView
-	offset := 0
-	for page := 0; page < maxRegistryPages; page++ {
+	fetchPage := func(ctx context.Context, offset int) ([]registryCaseView, int, error) {
 		payload := map[string]any{
 			"pagination": map[string]int{"offset": offset, "limit": registryPageLimit},
 			"sortBy":     map[string]string{"field": "updatedOn", "order": "desc"},
@@ -235,24 +331,23 @@ func (h *AnnouncementRegistryHandler) fetchAllMatchingCases(ctx context.Context,
 		}
 		body, err := json.Marshal(payload)
 		if err != nil {
-			return nil, fmt.Errorf("marshal case search request: %w", err)
+			return nil, 0, fmt.Errorf("marshal case search request: %w", err)
 		}
 
 		raw, err := h.entity.SearchCases(ctx, body)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		var resp registryCaseSearchResponse
 		if err := json.Unmarshal(raw, &resp); err != nil {
-			return nil, fmt.Errorf("decode case search response: %w", err)
+			return nil, 0, fmt.Errorf("decode case search response: %w", err)
 		}
-		cases = append(cases, resp.Cases...)
-		offset += len(resp.Cases)
-		if offset >= resp.Total || len(resp.Cases) == 0 {
-			return cases, nil
-		}
+		return resp.Cases, resp.Total, nil
 	}
-	return nil, fmt.Errorf("too many matching cases to build the registry safely (exceeded %d pages of %d)", maxRegistryPages, registryPageLimit)
+
+	return fetchAllPagesConcurrently(ctx, registryPageLimit, maxRegistryPages, fetchPage, func() error {
+		return fmt.Errorf("too many matching cases to build the registry safely (exceeded %d pages of %d)", maxRegistryPages, registryPageLimit)
+	})
 }
 
 // fetchAllPublishedRequests pages through every published announcement
@@ -261,31 +356,28 @@ func (h *AnnouncementRegistryHandler) fetchAllMatchingCases(ctx context.Context,
 // purely by having a published case in the matching set, decided by the
 // caller once both fetches are in hand.
 func (h *AnnouncementRegistryHandler) fetchAllPublishedRequests(ctx context.Context) ([]registryAnnouncementRequestView, error) {
-	var requests []registryAnnouncementRequestView
-	offset := 0
-	for page := 0; page < maxRegistryPages; page++ {
+	fetchPage := func(ctx context.Context, offset int) ([]registryAnnouncementRequestView, int, error) {
 		body, err := json.Marshal(map[string]any{
 			"state":      "published",
 			"pagination": map[string]int{"offset": offset, "limit": registryPageLimit},
 		})
 		if err != nil {
-			return nil, fmt.Errorf("marshal announcement request search: %w", err)
+			return nil, 0, fmt.Errorf("marshal announcement request search: %w", err)
 		}
 		raw, err := h.entity.SearchAnnouncementRequests(ctx, body)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		var resp registryAnnouncementRequestSearchResponse
 		if err := json.Unmarshal(raw, &resp); err != nil {
-			return nil, fmt.Errorf("decode announcement request search response: %w", err)
+			return nil, 0, fmt.Errorf("decode announcement request search response: %w", err)
 		}
-		requests = append(requests, resp.Requests...)
-		offset += len(resp.Requests)
-		if offset >= resp.Total || len(resp.Requests) == 0 {
-			return requests, nil
-		}
+		return resp.Requests, resp.Total, nil
 	}
-	return nil, fmt.Errorf("too many published announcement requests to build the registry safely (exceeded %d pages of %d)", maxRegistryPages, registryPageLimit)
+
+	return fetchAllPagesConcurrently(ctx, registryPageLimit, maxRegistryPages, fetchPage, func() error {
+		return fmt.Errorf("too many published announcement requests to build the registry safely (exceeded %d pages of %d)", maxRegistryPages, registryPageLimit)
+	})
 }
 
 // registryCaseLookup returns a caseId -> case map that resolves every id in

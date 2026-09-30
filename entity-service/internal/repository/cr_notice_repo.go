@@ -214,14 +214,20 @@ func (r *crNoticeRepository) ProjectContactEmails(ctx context.Context, projectID
 		// not an error: the caller treats "nobody to tell" as a silent no-op.
 		return nil, nil
 	}
-	const query = `
+	return r.emails(ctx, projectContactEmailsQuery, projectID)
+}
+
+// projectContactEmailsQuery reads a project's contact addresses, leaving out
+// DEACTIVATED memberships: the Salesforce ingest keeps a removed contact as a
+// DEACTIVATED row (ServiceNow hard-deleted it), and a person removed from the
+// project must not keep receiving its change-request notices.
+const projectContactEmailsQuery = `
 		SELECT pc.email
 		FROM project_contact pc
 		WHERE pc.project_id = $1::uuid
 		  AND COALESCE(pc.email, '') <> ''
+		  AND (pc.state IS NULL OR pc.state <> 'DEACTIVATED'::project_contact_state_enum)
 		ORDER BY pc.email`
-	return r.emails(ctx, query, projectID)
-}
 
 func (r *crNoticeRepository) emails(ctx context.Context, query string, arg any) ([]string, error) {
 	rows, err := r.db.Query(ctx, query, arg)

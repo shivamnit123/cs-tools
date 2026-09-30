@@ -35,6 +35,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/chataudience"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/entity"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/eventbus"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/events"
@@ -57,12 +58,17 @@ type emailSender interface {
 }
 
 // googleChatSender abstracts notifications.GoogleChatClient for testability.
+// Every method's first parameter is a Chat audience key (see
+// internal/chataudience) — case.created/case.acknowledged/
+// case.severity_changed all resolve it to the fixed
+// chataudience.IncidentMonitor audience below; there is no product-based
+// routing left in this service (incident.created has no Chat reaction at
+// all — see handleIncidentCreated's own doc comment).
 type googleChatSender interface {
-	SendIncidentAlert(ctx context.Context, product, title, shortDescription, portalURL string) error
-	SendCaseCreatedAlert(ctx context.Context, product, severityLabel, severityColor, caseNumber, wso2CaseID, productName, title, team, caseLink string) error
-	SendSecurityReportAnalysisAlert(ctx context.Context, product, caseNumber, wso2CaseID, productName, title, team, caseLink string) error
-	SendCaseAcknowledgedAlert(ctx context.Context, product, severityLabel, severityColor, caseNumber, wso2CaseID, caseLink, acknowledgerName string) error
-	SendSeverityChangedAlert(ctx context.Context, product, oldSeverityLabel, oldSeverityColor, newSeverityLabel, newSeverityColor, caseNumber, wso2CaseID, title, team, caseLink string) error
+	SendCaseCreatedAlert(ctx context.Context, audience, severityLabel, severityColor, caseNumber, wso2CaseID, productName, title, team, caseLink string) error
+	SendSecurityReportAnalysisAlert(ctx context.Context, audience, caseNumber, wso2CaseID, productName, title, team, caseLink string) error
+	SendCaseAcknowledgedAlert(ctx context.Context, audience, severityLabel, severityColor, caseNumber, wso2CaseID, caseLink, acknowledgerName string) error
+	SendSeverityChangedAlert(ctx context.Context, audience, oldSeverityLabel, oldSeverityColor, newSeverityLabel, newSeverityColor, caseNumber, wso2CaseID, title, team, caseLink string) error
 }
 
 // callSender abstracts notifications.TwilioClient's MakeCall for testability.
@@ -74,7 +80,6 @@ type callSender interface {
 type linkResolver interface {
 	ResolveLinks(ctx context.Context, emails []string, projectID, caseID string) ([]recipientlinks.RecipientLink, error)
 	CSMLink(caseID string) string
-	IncidentLink(incidentID string) string
 	ChangeRequestLink(audience, changeRequestID, projectID string) string
 }
 
@@ -89,10 +94,11 @@ type identityProvisioner interface {
 // makes back to entity-service.
 type onboardingStepRecorder interface {
 	RecordOnboardingStep(ctx context.Context, req entity.OnboardingStepRequest) error
-	// EmailAlreadySent reports whether a SUCCEEDED EMAIL step is already on
-	// the ledger for the membership -- the durable "this invitation has
-	// already gone out" check.
-	EmailAlreadySent(ctx context.Context, membershipSfID string) (bool, error)
+	// SucceededEmailStep returns the SUCCEEDED EMAIL step on the ledger for
+	// the membership, or nil when there is none -- the durable "an
+	// invitation has already gone out, for this membership version" check
+	// (see Dispatcher.invitationAlreadySent).
+	SucceededEmailStep(ctx context.Context, membershipSfID string) (*entity.RecordedOnboardingStep, error)
 }
 
 // OnboardingConfig is everything handleProjectContactInvited needs beyond
@@ -134,9 +140,9 @@ type OnboardingConfig struct {
 // groupByLink), not who to notify: there's no entity-service lookup here for
 // watchers/assignee/reporter, so the caller (e.g. csm-portal-backend)
 // supplies the audience directly at publish time. incident.created carries
-// no recipients field; its Google Chat/call reactions already have their
-// own real destination, a space and a phone number, in the event payload
-// itself, and don't go through links at all.
+// no recipients field; its call reaction already has its own real
+// destination, a phone number, in the event payload itself, and doesn't go
+// through links at all.
 type Dispatcher struct {
 	email      emailSender
 	googleChat googleChatSender
@@ -172,18 +178,13 @@ type Dispatcher struct {
 
 	// callSendingEnabled is the same kind of killswitch (CALL_SENDING_ENABLED)
 	// for incident.created's Twilio call specifically — see
-	// handleIncidentCreated's own doc comment. Doesn't affect the Google
-	// Chat alert.
+	// handleIncidentCreated's own doc comment.
 	callSendingEnabled bool
 
-	// defaultChatProduct/defaultOnCallNumber are handleCaseCreated's and
-	// handleIncidentCreated's fallback values for their payload's own
-	// Product/CallTo when a publisher omits them — see handleIncidentCreated's
+	// defaultOnCallNumber is handleIncidentCreated's fallback value for its
+	// payload's own CallTo when a publisher omits it — see that function's
 	// doc comment for why a publisher (e.g. entity-service) might not know
-	// either value itself. defaultChatProduct applies to both event types'
-	// Google Chat alert (case.created has no call reaction, hence no
-	// case.created-specific default for defaultOnCallNumber).
-	defaultChatProduct  string
+	// it itself.
 	defaultOnCallNumber string
 
 	// doneMu/done track which (record, channel) pairs have already
@@ -238,9 +239,8 @@ type recordState struct {
 // NewDispatcher constructs a Dispatcher. See Dispatcher.emailSendingEnabled's,
 // Dispatcher.emailDebugMode's, and Dispatcher.callSendingEnabled's doc
 // comments for what those three controls do, and
-// Dispatcher.defaultChatProduct/defaultOnCallNumber's doc comment for the
-// Google Chat/call fallback values.
-func NewDispatcher(email emailSender, googleChat googleChatSender, call callSender, links linkResolver, emailSendingEnabled bool, emailDebugMode bool, emailDebugRecipients []string, callSendingEnabled bool, defaultChatProduct, defaultOnCallNumber string) *Dispatcher {
+// Dispatcher.defaultOnCallNumber's doc comment for the call fallback value.
+func NewDispatcher(email emailSender, googleChat googleChatSender, call callSender, links linkResolver, emailSendingEnabled bool, emailDebugMode bool, emailDebugRecipients []string, callSendingEnabled bool, defaultOnCallNumber string) *Dispatcher {
 	return &Dispatcher{
 		email:                email,
 		googleChat:           googleChat,
@@ -250,7 +250,6 @@ func NewDispatcher(email emailSender, googleChat googleChatSender, call callSend
 		emailDebugMode:       emailDebugMode,
 		emailDebugRecipients: emailDebugRecipients,
 		callSendingEnabled:   callSendingEnabled,
-		defaultChatProduct:   defaultChatProduct,
 		defaultOnCallNumber:  defaultOnCallNumber,
 		done:                 make(map[string]bool),
 		records:              make(map[string]*recordState),
@@ -408,7 +407,7 @@ func (d *Dispatcher) Handle(ctx context.Context, record eventbus.Record) error {
 	case events.TypeSeverityChanged:
 		return d.handleSeverityChanged(ctx, record, env.Payload)
 	case events.TypeIncidentCreated:
-		return d.handleIncidentCreated(ctx, record, env.EntityID, env.Payload)
+		return d.handleIncidentCreated(ctx, record, env.Payload)
 	case events.TypeCRApprovalRequested:
 		return d.handleCRApprovalRequested(ctx, record, env.Payload)
 	case events.TypeCRPlanDateNotice:
@@ -443,44 +442,32 @@ func (d *Dispatcher) Handle(ctx context.Context, record eventbus.Record) error {
 	}
 }
 
-// handleCaseCreated has two independent reactions, like handleIncidentCreated
-// below: the case-created email (per resolved recipient link) and a Google
-// Chat alert to the shared internal Chat space, via the same
-// GoogleChatClient.SendIncidentAlert incident.created uses — its doc comment
-// already covers "a newly created incident/case" for exactly this reuse. The
-// Chat alert always targets the CSM portal's case link (links.CSMLink), not
-// a per-recipient link, since there's no per-recipient audience for a Chat
-// post the way there is for email. Product falls back to
-// Dispatcher.defaultChatProduct when the payload omits it, the same as
-// handleIncidentCreated's Product fallback — see that function's doc
-// comment. If the resolved product is still empty (payload and
-// DEFAULT_CHAT_PRODUCT both unset), the Chat alert is skipped (logged) the
-// same way handleIncidentCreated skips its own Chat alert in that case,
-// rather than calling SendIncidentAlert with an empty product — that would
-// return a real "no space configured" error and, without the idempotency
-// tracking described below, retry every already-succeeded email group
-// alongside the Chat attempt every time.
+// handleCaseCreated has two independent reactions: the case-created email
+// (per resolved recipient link) and a Google Chat alert, always to the
+// fixed chataudience.IncidentMonitor audience (no team detection, no
+// per-product routing — this service has no real per-product Chat space
+// need). The Chat alert always targets the CSM portal's case link
+// (links.CSMLink), not a per-recipient link, since there's no per-recipient
+// audience for a Chat post the way there is for email.
 //
 // Every reaction here — each email group and the Chat alert — has
-// per-record idempotency tracking, the same mechanism handleIncidentCreated
-// uses: a real-world failure mode this was missing until it actually
-// happened — a persistently-failing step (e.g. a misconfigured email OAuth2
-// client) means every one of eventbus.Consumer's 3 retries, and then the
-// DLQ consumer's own 3 retries, re-runs this whole function, so an
-// unguarded already-succeeded channel would repost/resend up to 6 times for
-// one event before the failing one is ever fixed. Email groups are tracked
-// inside sendPerGroup itself (see its own doc comment); chatKey is tracked
-// here directly, mirroring handleIncidentCreated's shape. Both kinds are
-// forgotten together, once the whole call succeeds (len(errs) == 0, so
-// Handle is about to return nil — no more retries coming) or
-// record.NoMoreRetries is true (no further retry coming at all, on this
-// topic or the dead-letter one — see its doc comment) — never on an
-// individual channel's own success alone, which would release it while
-// other channels in this same call are still failing and
-// eventbus.Consumer keeps retrying, immediately re-arming that channel to
-// resend on the very next attempt. Releasing is also ownership-gated for
-// both kinds — see forgetEmailGroups' doc comment for the live duplicate-
-// email bug that closed.
+// per-record idempotency tracking: a real-world failure mode this was
+// missing until it actually happened — a persistently-failing step (e.g. a
+// misconfigured email OAuth2 client) means every one of eventbus.Consumer's
+// 3 retries, and then the DLQ consumer's own 3 retries, re-runs this whole
+// function, so an unguarded already-succeeded channel would repost/resend
+// up to 6 times for one event before the failing one is ever fixed. Email
+// groups are tracked inside sendPerGroup itself (see its own doc comment);
+// chatKey is tracked here directly. Both kinds are forgotten together,
+// once the whole call succeeds (len(errs) == 0, so Handle is about to
+// return nil — no more retries coming) or record.NoMoreRetries is true (no
+// further retry coming at all, on this topic or the dead-letter one — see
+// its doc comment) — never on an individual channel's own success alone,
+// which would release it while other channels in this same call are still
+// failing and eventbus.Consumer keeps retrying, immediately re-arming that
+// channel to resend on the very next attempt. Releasing is also
+// ownership-gated for both kinds — see forgetEmailGroups' doc comment for
+// the live duplicate-email bug that closed.
 func (d *Dispatcher) handleCaseCreated(ctx context.Context, record eventbus.Record, raw json.RawMessage) error {
 	var p events.CaseCreatedPayload
 	if err := json.Unmarshal(raw, &p); err != nil {
@@ -540,25 +527,22 @@ func (d *Dispatcher) handleCaseCreated(ctx context.Context, record eventbus.Reco
 	//
 	// chatKey is simply never claimed when skipped; forgetting an unclaimed
 	// key below is a harmless no-op (see Dispatcher.forget), so nothing
-	// else in this function needs to change.
+	// else in this function needs to change. Always resolves to the fixed
+	// chataudience.IncidentMonitor audience (no team detection, no
+	// per-product routing — see googleChatSender's own doc comment); an
+	// unconfigured audience is a no-op inside SendCaseCreatedAlert itself,
+	// not distinguishable here from a genuine send, so there's no "empty
+	// product, skip" branch left the way there used to be.
 	if !isNonCaseCaseType(p.CaseType) && !isLowSeverity(p.Priority) {
 		chatOwned := d.claim(chatKey)
 		if chatOwned {
-			product := p.Product
-			if product == "" {
-				product = d.defaultChatProduct
-			}
-			if product == "" {
-				slog.WarnContext(ctx, "dispatch: no product for case.created (payload and DEFAULT_CHAT_PRODUCT both empty); skipping Google Chat alert")
-			} else {
-				caseLink := d.links.CSMLink(p.CaseID)
-				title := truncateTitle(p.CaseTitle, maxChatTitleLength)
-				severityLabel, severityColor := severityLabelAndColor(p.Priority)
-				chatErr := d.googleChat.SendCaseCreatedAlert(ctx, product, severityLabel, severityColor, displayCaseRef(p.CaseNumber, p.CaseID), p.WSO2CaseID, p.Product, title, p.Team, caseLink)
-				if chatErr != nil {
-					errs = append(errs, chatErr)
-					d.forget(chatKey)
-				}
+			caseLink := d.links.CSMLink(p.CaseID)
+			title := truncateTitle(p.CaseTitle, maxChatTitleLength)
+			severityLabel, severityColor := severityLabelAndColor(p.Priority)
+			chatErr := d.googleChat.SendCaseCreatedAlert(ctx, chataudience.IncidentMonitor, severityLabel, severityColor, displayCaseRef(p.CaseNumber, p.CaseID), p.WSO2CaseID, p.Product, title, p.Team, caseLink)
+			if chatErr != nil {
+				errs = append(errs, chatErr)
+				d.forget(chatKey)
 			}
 		}
 	}
@@ -788,14 +772,16 @@ func (d *Dispatcher) handleCaseAssigned(ctx context.Context, record eventbus.Rec
 // handleCaseAcknowledged has exactly one reaction, unlike every other
 // case.* handler above: a Google Chat alert only — see
 // events.CaseAcknowledgedPayload's own doc comment for why there's no
-// email/Recipients concept here at all. With only one channel, there's no
-// cross-channel release race to guard against the way beginRecord/endRecord
-// does for handleCaseCreated/handleIncidentCreated — this call's own
-// chatOwned already fully determines whether it's safe to release: true
-// means this call either just sent successfully or found nothing to do
-// (no configured product), either way a real, complete outcome; false
-// means it lost the claim race entirely and touched nothing, so it must
-// never release a key a different, still in-flight call might rely on.
+// email/Recipients concept here at all. Always resolves to the fixed
+// chataudience.IncidentMonitor audience (see handleCaseCreated's own doc
+// comment). With only one channel, there's no cross-channel release race
+// to guard against the way beginRecord/endRecord does for
+// handleCaseCreated/handleIncidentCreated — this call's own chatOwned
+// already fully determines whether it's safe to release: true means this
+// call either just sent successfully or found nothing to do, either way a
+// real, complete outcome; false means it lost the claim race entirely and
+// touched nothing, so it must never release a key a different, still
+// in-flight call might rely on.
 func (d *Dispatcher) handleCaseAcknowledged(ctx context.Context, record eventbus.Record, raw json.RawMessage) error {
 	var p events.CaseAcknowledgedPayload
 	if err := json.Unmarshal(raw, &p); err != nil {
@@ -806,20 +792,12 @@ func (d *Dispatcher) handleCaseAcknowledged(ctx context.Context, record eventbus
 	chatOwned := d.claim(chatKey)
 	var chatErr error
 	if chatOwned {
-		product := p.Product
-		if product == "" {
-			product = d.defaultChatProduct
-		}
-		if product == "" {
-			slog.WarnContext(ctx, "dispatch: no product for case.acknowledged (payload and DEFAULT_CHAT_PRODUCT both empty); skipping Google Chat alert")
-		} else {
-			severityLabel, severityColor := severityLabelAndColor(p.Severity)
-			caseLink := d.links.CSMLink(p.CaseID)
-			chatErr = d.googleChat.SendCaseAcknowledgedAlert(ctx, product, severityLabel, severityColor, displayCaseRef(p.CaseNumber, p.CaseID), p.WSO2CaseID, caseLink, p.AcknowledgerName)
-			if chatErr != nil {
-				d.forget(chatKey)
-				chatOwned = false
-			}
+		severityLabel, severityColor := severityLabelAndColor(p.Severity)
+		caseLink := d.links.CSMLink(p.CaseID)
+		chatErr = d.googleChat.SendCaseAcknowledgedAlert(ctx, chataudience.IncidentMonitor, severityLabel, severityColor, displayCaseRef(p.CaseNumber, p.CaseID), p.WSO2CaseID, caseLink, p.AcknowledgerName)
+		if chatErr != nil {
+			d.forget(chatKey)
+			chatOwned = false
 		}
 	}
 
@@ -845,17 +823,14 @@ func (d *Dispatcher) handleCaseAcknowledged(ctx context.Context, record eventbus
 
 // handleSeverityChanged has two independent reactions, like handleCaseCreated
 // above: the severity-changed email (per resolved recipient link,
-// RenderSeverityChangedEmail) and a Google Chat alert to the same space as
-// the case's own case.created/case.acknowledged alerts
-// (SendSeverityChangedAlert). Unlike handleCaseAcknowledged (Chat-only, one
-// channel, no cross-channel release race — see its own doc comment), this
-// needs the same beginRecord/endRecord refcounting handleCaseCreated uses,
-// for the exact same reason: two channels means a losing call for one
-// channel must not release the other while a different, still in-flight
-// call genuinely owns it. Product falls back to Dispatcher.defaultChatProduct
-// when the payload omits it, and the Chat alert is skipped (logged) rather
-// than erroring when the resolved product is still empty — same reasoning
-// as handleCaseCreated's own Chat block.
+// RenderSeverityChangedEmail) and a Google Chat alert, always to the fixed
+// chataudience.IncidentMonitor audience (SendSeverityChangedAlert — see
+// handleCaseCreated's own doc comment). Unlike handleCaseAcknowledged
+// (Chat-only, one channel, no cross-channel release race — see its own doc
+// comment), this needs the same beginRecord/endRecord refcounting
+// handleCaseCreated uses, for the exact same reason: two channels means a
+// losing call for one channel must not release the other while a
+// different, still in-flight call genuinely owns it.
 func (d *Dispatcher) handleSeverityChanged(ctx context.Context, record eventbus.Record, raw json.RawMessage) error {
 	var p events.SeverityChangedPayload
 	if err := json.Unmarshal(raw, &p); err != nil {
@@ -903,19 +878,11 @@ func (d *Dispatcher) handleSeverityChanged(ctx context.Context, record eventbus.
 	// if/else, not nested inside the success branch).
 	chatOwned := d.claim(chatKey)
 	if chatOwned {
-		product := p.Product
-		if product == "" {
-			product = d.defaultChatProduct
-		}
-		if product == "" {
-			slog.WarnContext(ctx, "dispatch: no product for case.severity_changed (payload and DEFAULT_CHAT_PRODUCT both empty); skipping Google Chat alert")
-		} else {
-			caseLink := d.links.CSMLink(p.CaseID)
-			title := truncateTitle(p.CaseTitle, maxChatTitleLength)
-			if chatErr := d.googleChat.SendSeverityChangedAlert(ctx, product, oldLabel, oldColor, newLabel, newColor, caseRef, p.WSO2CaseID, title, p.Team, caseLink); chatErr != nil {
-				errs = append(errs, chatErr)
-				d.forget(chatKey)
-			}
+		caseLink := d.links.CSMLink(p.CaseID)
+		title := truncateTitle(p.CaseTitle, maxChatTitleLength)
+		if chatErr := d.googleChat.SendSeverityChangedAlert(ctx, chataudience.IncidentMonitor, oldLabel, oldColor, newLabel, newColor, caseRef, p.WSO2CaseID, title, p.Team, caseLink); chatErr != nil {
+			errs = append(errs, chatErr)
+			d.forget(chatKey)
 		}
 	}
 
@@ -1306,90 +1273,57 @@ func (d *Dispatcher) forgetEmailGroups(baseKey string, caseLinks []string) {
 	}
 }
 
-// handleIncidentCreated has two independent reactions, unlike every other
-// event type here except handleCaseCreated: a Google Chat alert and a voice
-// call. Both are attempted even if one fails, and their errors are combined
-// — a Chat outage shouldn't suppress the call, or vice versa.
+// handleIncidentCreated has exactly one reaction — a voice call — unlike
+// this file's other two-reaction handlers: incident.created no longer has
+// a Google Chat alert at all, per explicit product direction (an incident
+// pages on-call directly; a separate Chat post was redundant with that).
+// entity-service's own IncidentCreatedPayload.Product field is still
+// accepted on the wire (decode-compatibility, unused) but no longer read
+// here — see that field's own doc comment.
 //
-// Product/CallTo fall back to Dispatcher's configured defaults
-// (defaultChatProduct/defaultOnCallNumber) when the payload's own value
-// is empty — a publisher that has no way to determine either (e.g.
-// entity-service, which knows nothing about Chat-space routing or on-call
-// rotations) can omit them entirely; events.Validate allows this. A
-// publisher that does know the right values per incident can still supply
-// them and takes precedence over the defaults. If a resolved value is still
-// empty (payload and default both unset), that one channel is skipped
-// (logged, treated as succeeded) instead of calling SendIncidentAlert/
-// MakeCall with an empty product/destination — both would just return a
-// real error (an unmapped product, an empty call destination), which would
+// CallTo falls back to Dispatcher.defaultOnCallNumber when the payload's
+// own value is empty — a publisher that has no way to determine on-call
+// rotations itself (e.g. entity-service) can omit it entirely; events.Validate
+// allows this. A publisher that does know the right number per incident can
+// still supply it and takes precedence over the default. If the resolved
+// number is still empty (payload and default both unset), the call is
+// skipped (logged, treated as succeeded) instead of calling MakeCall with
+// an empty destination — that would just return a real error, which would
 // otherwise burn all of eventbus.Consumer's retries and dead-letter an
 // incident whose only problem is a missing operator default, not a
 // transient failure.
 //
-// callSendingEnabled gates only the MakeCall step (CALL_SENDING_ENABLED):
-// when false, this logs what would have been called instead of calling, and
-// still marks the call "done" so a disabled call doesn't retry forever —
-// the same log-only shape sendPerGroup's email sending used to have before
+// callSendingEnabled gates the whole call step (CALL_SENDING_ENABLED): when
+// false, this logs what would have been called instead of calling, and
+// still marks it "done" so a disabled call doesn't retry forever — the same
+// log-only shape sendPerGroup's email sending used to have before
 // EMAIL_DEBUG_MODE replaced it with a redirect-to-a-test-list behavior (see
 // sendPerGroup's doc comment); calls have no equivalent debug-recipient
-// concept, so this keeps the simpler disable-entirely shape. The Google
-// Chat alert is unaffected either way.
+// concept, so this keeps the simpler disable-entirely shape.
 //
-// This is also the one handler that needs its own idempotency tracking:
-// eventbus.Consumer retries this whole function on any error, and without
-// tracking which side already succeeded, a Twilio failure alone would cause
-// the (already-successful) Chat alert to be resent on every retry too —
-// paging on-call once but posting 3 duplicate Chat cards, or vice versa.
-// claim/forget key on this specific record (recordBaseKey, unique per event
-// content, not per Kafka delivery — see its doc comment) plus which
-// channel, so a retry only re-attempts the channel that's still actually
-// failing. Both keys are released once either
-// both channels have succeeded, or record.NoMoreRetries is true — the
-// latter matters because a channel that never succeeds (e.g. Twilio stays
-// down for all 3 attempts, on the main topic AND the DLQ topic) would
-// otherwise never hit the "both succeeded" branch, and its key would sit in
-// d.done forever: NoMoreRetries tells us there is truly no future retry
-// left to protect against — on this topic or the dead-letter one — so it's
-// safe to stop tracking. This is deliberately record.NoMoreRetries and not
-// record.IsFinalAttempt: the main topic's own final attempt still has a DLQ
-// tier of retries coming for the identical content (same recordBaseKey),
-// so forgetting there would let an already-succeeded channel be reclaimed
-// and resent once the dead-lettered record's first DLQ attempt arrives.
-func (d *Dispatcher) handleIncidentCreated(ctx context.Context, record eventbus.Record, entityID string, raw json.RawMessage) error {
+// With only one channel left, there's no cross-channel release race to
+// guard against the way beginRecord/endRecord exists for elsewhere in this
+// file — this call's own callOwned already fully determines whether it's
+// safe to release, the same reasoning handleCaseAcknowledged's own doc
+// comment gives for its own single-channel shape. claim/forget keys on this
+// specific record (recordBaseKey, unique per event content, not per Kafka
+// delivery — see its doc comment): eventbus.Consumer retries this whole
+// function on any error, and without tracking, a transient failure would
+// resend an already-succeeded call on every retry too.
+func (d *Dispatcher) handleIncidentCreated(ctx context.Context, record eventbus.Record, raw json.RawMessage) error {
 	var p events.IncidentCreatedPayload
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return fmt.Errorf("dispatch: decode incident.created payload: %w", err)
 	}
 
-	base := recordBaseKey(record)
-	chatKey, callKey := base+"/chat", base+"/call"
-	endRecord := d.beginRecord(base)
-
-	product := p.Product
-	if product == "" {
-		product = d.defaultChatProduct
-	}
 	callTo := p.CallTo
 	if callTo == "" {
 		callTo = d.defaultOnCallNumber
 	}
 
-	var chatErr error
-	chatOwned := d.claim(chatKey)
-	if chatOwned {
-		if product == "" {
-			slog.WarnContext(ctx, "dispatch: no product for incident.created (payload and DEFAULT_CHAT_PRODUCT both empty); skipping Google Chat alert")
-		} else {
-			chatErr = d.googleChat.SendIncidentAlert(ctx, product, p.Title, p.ShortDescription, d.links.IncidentLink(entityID))
-			if chatErr != nil {
-				d.forget(chatKey)
-				chatOwned = false
-			}
-		}
-	}
-
-	var callErr error
+	callKey := recordBaseKey(record) + "/call"
 	callOwned := d.claim(callKey)
+	var callErr error
 	if callOwned {
 		switch {
 		case !d.callSendingEnabled:
@@ -1406,38 +1340,14 @@ func (d *Dispatcher) handleIncidentCreated(ctx context.Context, record eventbus.
 		}
 	}
 
-	// record.NoMoreRetries always forgets both, regardless of ownership or
-	// concurrent siblings — there is truly no future retry left for this
-	// event's content either way (see NoMoreRetries' own doc comment for
-	// why this must not be record.IsFinalAttempt), so nothing forgets these
-	// keys later if we don't do it now.
-	//
-	// Otherwise, release only once endRecord confirms it's safe to — this
-	// is the last call still in flight for this record, and neither it nor
-	// any sibling that ran concurrently with it ever hit an error. An
-	// earlier version of this gated on chatOwned && callOwned instead
-	// (requiring this same call to have won both claims) — safer than
-	// gating on chatErr/callErr being nil alone (a call that loses a claim
-	// never touches that channel, so its own error variable stays nil,
-	// indistinguishable from "I actually succeeded"), but still had a real
-	// gap: two concurrent calls can legitimately split ownership (one wins
-	// chat, the other wins call), in which case *neither* call ever
-	// satisfies "I own both," even though both channels genuinely
-	// succeeded — that combination would never release until
-	// NoMoreRetries, for every future retry of a record that has already
-	// fully succeeded. beginRecord/endRecord (see its own doc comment)
-	// tracks completion across every concurrent call for this record
-	// directly, instead of inferring it from what any single call happened
-	// to own.
-	// endRecord must run exactly once per call — it decrements beginRecord's
-	// refcount — so it's called unconditionally here rather than only
-	// inside the branch that uses its result.
-	safeToRelease := endRecord(chatErr != nil || callErr != nil)
-	if record.NoMoreRetries || safeToRelease {
-		d.forget(chatKey)
+	// Deliberately just callOwned, not "|| record.NoMoreRetries" — see
+	// handleCaseAcknowledged's own doc comment for why that would be wrong
+	// with only one channel/claim total: whichever call actually owns it
+	// is the only call that will ever release it.
+	if callOwned {
 		d.forget(callKey)
 	}
-	return errors.Join(chatErr, callErr)
+	return callErr
 }
 
 // handleCRPlanDateNotice emails one turn of the plan-start-date conversation:
@@ -1674,8 +1584,11 @@ func (d *Dispatcher) handleProjectContactInvited(ctx context.Context, record eve
 			return err
 		}
 
-		// Last check before sending: has an invitation for this membership
-		// already gone out? The other two guards cannot answer that. The
+		// Last check before sending: has an invitation for this version of
+		// the membership already gone out? (A re-invitation -- the
+		// membership moved back into INVITED or RE-INVITED, say after a
+		// deactivation -- is a newer version and must send again; see
+		// invitationAlreadySent.) The other two guards cannot answer that. The
 		// in-process claim above lives for one process, and the ingest's
 		// duplicate check only recognises an unchanged Salesforce version,
 		// so neither covers a redelivery after a restart, a replay from the
@@ -1712,10 +1625,9 @@ func (d *Dispatcher) handleProjectContactInvited(ctx context.Context, record eve
 		// keeps showing how many invitations actually went out.
 		if p.IsResend {
 			slog.InfoContext(ctx, "dispatch: resend requested; not checking the invitation ledger", logAttrs...)
-		} else if sent, err := d.onboarding.Steps.EmailAlreadySent(ctx, p.MembershipSfID); err != nil {
+		} else if sent, err := d.invitationAlreadySent(ctx, p, logAttrs); err != nil {
 			return fmt.Errorf("dispatch: check invitation already sent for membership %s: %w", p.MembershipSfID, err)
 		} else if sent {
-			slog.InfoContext(ctx, "dispatch: invitation already recorded as sent for this membership; not sending again", logAttrs...)
 			break
 		}
 
@@ -1766,6 +1678,69 @@ func (d *Dispatcher) handleProjectContactInvited(ctx context.Context, record eve
 	}
 
 	return nil
+}
+
+// invitationAlreadySent reports whether the ledger already records an
+// invitation sent for this version of the membership, logging why when it
+// does. It is the durable duplicate-invitation guard of
+// handleProjectContactInvited.
+//
+// The ledger keeps one EMAIL row per membership, so "is there a SUCCEEDED
+// EMAIL row" alone cannot tell a duplicate from a re-invitation: the first
+// invitation would block every later one forever. What tells them apart is
+// the membership version. Salesforce emits several UPDATED events per save
+// and events are redelivered, but all of those carry the same (or, for a
+// delayed delivery, an older) LastModifiedDate; a genuine re-invitation is a
+// new save and carries a newer one. So the invitation counts as already
+// sent only when the SUCCEEDED row's eventModifiedOn is not before the
+// event's -- the same "not older" rule entity-service's step upsert applies.
+//
+// When either timestamp is missing or unparseable the versions cannot be
+// compared, and this falls back to the conservative answer: any SUCCEEDED
+// row means sent. A lost re-invitation can be recovered with a resend; a
+// duplicate e-mail cannot be taken back.
+func (d *Dispatcher) invitationAlreadySent(ctx context.Context, p events.ProjectContactInvitedPayload, logAttrs []any) (bool, error) {
+	step, err := d.onboarding.Steps.SucceededEmailStep(ctx, p.MembershipSfID)
+	if err != nil {
+		return false, err
+	}
+	if step == nil {
+		return false, nil
+	}
+	recordedOn, recordedOK := parseLedgerTime(step.EventModifiedOn)
+	eventOn, eventOK := parseLedgerTime(p.EventModifiedOn)
+	if !recordedOK || !eventOK {
+		slog.WarnContext(ctx, "dispatch: cannot compare invitation versions (missing or unparseable eventModifiedOn); an invitation is already recorded as sent, so not sending again",
+			append(logAttrs, "eventModifiedOn", p.EventModifiedOn, "recordedEventModifiedOn", step.EventModifiedOn)...)
+		return true, nil
+	}
+	// Postgres keeps microseconds, so a timestamp with finer precision (only
+	// the processing-time fallback has one) comes back rounded; compare at
+	// the precision the ledger can actually hold, or a redelivery of that
+	// same event could look newer than its own record.
+	eventOn = eventOn.Truncate(time.Microsecond)
+	if recordedOn.Before(eventOn) {
+		slog.InfoContext(ctx, "dispatch: invitation recorded as sent for an older membership version; this is a re-invitation, sending",
+			append(logAttrs, "eventModifiedOn", eventOn, "recordedEventModifiedOn", recordedOn)...)
+		return false, nil
+	}
+	slog.InfoContext(ctx, "dispatch: invitation already recorded as sent for this membership version; not sending again",
+		append(logAttrs, "eventModifiedOn", eventOn, "recordedEventModifiedOn", recordedOn)...)
+	return true, nil
+}
+
+// parseLedgerTime parses an RFC 3339 eventModifiedOn. An empty, malformed or
+// zero value (entity-service marshals an unset time.Time as
+// 0001-01-01T00:00:00Z) is reported as absent.
+func parseLedgerTime(s string) (time.Time, bool) {
+	if s == "" {
+		return time.Time{}, false
+	}
+	ts, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil || ts.IsZero() {
+		return time.Time{}, false
+	}
+	return ts.UTC(), true
 }
 
 // recordOnboardingStep writes one step's outcome to entity-service's

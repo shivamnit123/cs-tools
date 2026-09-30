@@ -27,25 +27,27 @@ Two remotes exist and they are not interchangeable: `upstream` is
 whose `dev-app-csm-portal` may be thousands of commits stale. Check against
 `upstream`.
 
-## Duplicate migration numbers are normal here — don't "fix" them
+## Migrations are keyed by filename — renaming one makes it new
 
-`entity-service/migrations/` has ~20 numbers used by two unrelated migrations
-each (`000014` is both `create_alert_incident_mapping` and `deployed_product_table`;
-so are `000067`, `000085`, and all of `000068`–`000081`). This is not corruption
-and it does not need renumbering.
+`entity-service/migrations/` is `NNNN_<description>.sql`, forward-only, one file
+per migration (see `entity-service/CLAUDE.md`, "Database migrations"). `make
+migrate` records each applied file in `csm_migration_applied_migration` by its
+**full filename**, and applies every `migrations/*.sql` it has not recorded, in
+name order. Three consequences:
 
-It works because the applier keys `schema_migrations` on each file's **full
-basename**, not its number — see `scripts/csm-compose/migrate-and-seed.sh`, which
-iterates `ls *.up.sql | sort` and records `000088_sn_id_mapping_columns` and
-`000088_team_schedule_tables` as two separate, independently-applied rows. Two
-branches adding the same number therefore merge and apply without conflict.
+- **A number used twice is not a conflict.** Two files that share a number
+  both apply, each under its own name (`0026_account_contact_table` and
+  `0026_tag_tables` both exist). Git will not warn about it either, so if the
+  order between two same-numbered files matters, check which one sorts first.
+  Do not rely on the number.
+- **A renamed file looks new.** Against a database that already applied the old
+  name, it runs again from scratch. It must be safe to re-run, or the rename
+  needs a stated reason and a plan for the servers that already have it.
+- **Only `NNNN_*.sql` belongs in that folder.** The runner globs `*.sql`, so an
+  old-style `000NNN_x.up.sql`/`.down.sql` pair would run both halves, and
+  would run them ahead of `0001`. That is how the Team Schedule's original
+  files broke `make migrate` until they were rewritten as 0152–0155.
 
-Two consequences worth knowing before touching anything here:
-
-- **Git will not warn you about a number collision**, because the filenames differ.
-  If ordering between two same-numbered migrations actually matters, basename sort
-  decides it — so verify the dependency rather than trusting the number.
-- **Renaming a migration makes it look new.** Since the recorded version is the
-  basename, a renumbered file is re-applied from scratch on the next run against
-  an existing database, which fails on `CREATE TABLE` and needs a volume reset.
-  Renumber only with a specific reason, never for tidiness.
+`scripts/csm-compose/migrate-and-seed.sh` (the local compose stack) still
+iterates the old `*.up.sql` names and keeps its own `schema_migrations` table.
+It has not been moved to the new convention yet.

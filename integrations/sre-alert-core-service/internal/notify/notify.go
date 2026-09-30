@@ -51,6 +51,7 @@ type Notifier struct {
 	fallbackChatWebhookURLs []string
 	maxAttempts             int
 	retryBaseDelay          time.Duration
+	sendEnvironmentField    bool
 }
 
 // Config groups New's dependencies to avoid a growing positional-argument list.
@@ -63,6 +64,8 @@ type Config struct {
 	MaxAttempts     int
 	RetryBaseDelay  time.Duration
 	HTTPTimeout     time.Duration
+	// Gates whether NotifyCSM populates CreateIncidentRequest.Environment.
+	SendEnvironmentField bool
 }
 
 func New(logger *slog.Logger, csm *csm.Client, cfg Config) *Notifier {
@@ -76,6 +79,7 @@ func New(logger *slog.Logger, csm *csm.Client, cfg Config) *Notifier {
 		fallbackChatWebhookURLs: splitURLs(os.Getenv("FALLBACK_CHAT_WEBHOOK_URLS")),
 		maxAttempts:             cfg.MaxAttempts,
 		retryBaseDelay:          cfg.RetryBaseDelay,
+		sendEnvironmentField:    cfg.SendEnvironmentField,
 	}
 	if len(n.fallbackChatWebhookURLs) == 0 {
 		logger.Warn("FALLBACK_CHAT_WEBHOOK_URLS not set; incidents will not reach Chat if CSM fails")
@@ -99,7 +103,7 @@ func DedupTag(fingerprint string, firstSeen time.Time) string {
 	return fmt.Sprintf("[fp:%s:%d]", fingerprint[:12], firstSeen.UnixMilli())
 }
 
-// NotifyCSM returns permanent=true for non-retryable rejections (non-429 4xx). CSMAttempts >= 1 already counts current attempt; only first attempts fail open on search errors.
+// NotifyCSM returns permanent=true only for a 400 (invalid payload, will never succeed). CSMAttempts >= 1 already counts current attempt; only first attempts fail open on search errors.
 func (n *Notifier) NotifyCSM(ctx context.Context, inc model.Incident) (incidentID, incidentNumber string, ok bool, permanent bool) {
 	tag := DedupTag(inc.Fingerprint, inc.FirstSeen)
 	if id, number, found, err := n.csm.SearchIncidentByCorrelationID(ctx, tag); err != nil {
@@ -132,15 +136,18 @@ func (n *Notifier) NotifyCSM(ctx context.Context, inc model.Incident) (incidentI
 	if inc.Description != "" {
 		req.WorkNotes = &inc.Description
 	}
-	if inc.Environment != "" {
+	if n.sendEnvironmentField && inc.Environment != "" {
 		env := truncateRunes(inc.Environment, maxEnvironmentLen)
 		req.Environment = &env
 	}
 
 	res, err := n.createIncidentWithRetry(ctx, tag, req)
 	if err != nil {
+		// Only 400 means the payload itself is invalid and will never succeed; everything else
+		// (401/403/404/409/429/5xx) is the kind of transient CSM-side condition maxCSMAttempts'
+		// 6h retry budget exists to survive, and must not be given up on after a single attempt.
 		var apiErr *apierror.Error
-		perm := errors.As(err, &apiErr) && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 && apiErr.StatusCode != http.StatusTooManyRequests
+		perm := errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusBadRequest
 		n.logger.Error("csm create incident failed", "incident_number", inc.IncidentNumber, "permanent", perm, "error", err)
 		return "", "", false, perm
 	}

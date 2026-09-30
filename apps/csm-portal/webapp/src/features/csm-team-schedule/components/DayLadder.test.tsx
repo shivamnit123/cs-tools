@@ -26,6 +26,8 @@ import {
   REGULAR,
   REGULAR_IND,
   TZ,
+  TZ1,
+  TZ3,
   ZONES,
   absence,
   assignment,
@@ -166,5 +168,85 @@ describe("DayLadder: who is not on the rota", () => {
     );
     expect(screen.getByText("Annual leave")).toBeInTheDocument();
     expect(screen.getByText("Nuwan")).toBeInTheDocument();
+  });
+});
+
+describe("DayLadder: the escalation ladder", () => {
+  function tiered(name: string, tier: "L1" | "L2" | "L3") {
+    return { ...assignment({ name, rotaDate: ISO, shiftCode: TZ1.code, zoneCode: "TZ1" }), tier };
+  }
+
+  function renderZone(assignments: LadderLane["assignments"]) {
+    return render(
+      <DayLadder
+        day={WEDNESDAY}
+        tz={TZ}
+        zoneLabel="IST"
+        lanes={[{ name: "TZ1", assignments, layout: "zone" }]}
+        shifts={shiftMap(TZ1)}
+        zones={ZONES}
+        absences={[]}
+        absenceKinds={[ANNUAL_LEAVE]}
+        {...scopeControls()}
+      />,
+    );
+  }
+
+  it("shows L1, L2 and L3 in order, saying when a tier has nobody", () => {
+    const { container } = renderZone([tiered("Jane", "L1"), tiered("John", "L2")]);
+    const labels = [...container.querySelectorAll(".zbp.tiers .zsl")].map((el) => el.firstChild?.textContent);
+    expect(labels).toEqual(["L1 escalation", "L2 escalation", "L3 escalation"]);
+    expect(screen.getByText("Nobody rostered")).toBeInTheDocument();
+  });
+
+  it("names whoever holds L3 like any other tier", () => {
+    renderZone([tiered("Jane", "L1"), tiered("Ada", "L3")]);
+    expect(screen.getByText("Ada")).toBeInTheDocument();
+    // L2 is the empty one now.
+    expect(screen.getAllByText("Nobody rostered")).toHaveLength(1);
+  });
+});
+
+describe("DayLadder: TZ3 is one card", () => {
+  it("folds regular hours that match the escalation window into its card", () => {
+    // TZ3's regular hours and its escalation are the same 21:00-06:00: two
+    // cards side by side would say the same hours twice.
+    const TZ3_REGULAR = shift({
+      code: "SRE_TZ3_REGULAR",
+      label: "TZ3 regular hours",
+      family: "SRE",
+      zoneCode: "TZ3",
+      isRotation: false,
+      startMinute: 1260,
+      endMinute: 1800,
+    });
+    const night = (name: string, shiftCode: string) =>
+      assignment({
+        name,
+        rotaDate: ISO,
+        shiftCode,
+        zoneCode: "TZ3",
+        startsAt: `${ISO}T15:30:00.000Z`, // 21:00 in the fixture clock
+        endsAt: "2026-09-24T00:30:00.000Z", // 06:00 next morning
+      });
+    const { container } = render(
+      <DayLadder
+        day={WEDNESDAY}
+        tz={TZ}
+        zoneLabel="IST"
+        lanes={[{ name: "TZ3", assignments: [{ ...night("Isuri", TZ3.code), tier: "L1" }, night("Nimal", TZ3_REGULAR.code)], layout: "zone" }]}
+        shifts={shiftMap(TZ3, TZ3_REGULAR)}
+        zones={ZONES}
+        absences={[]}
+        absenceKinds={[ANNUAL_LEAVE]}
+        {...scopeControls()}
+      />,
+    );
+    const lane = container.querySelector(".ladder .lane:not(.offlane)");
+    expect(lane?.querySelectorAll(".lncol")).toHaveLength(1);
+    const labels = [...container.querySelectorAll(".zbp.tiers .zsl")].map((el) => el.firstChild?.textContent);
+    expect(labels).toEqual(["L1 escalation", "L2 escalation", "L3 escalation", "Regular hours"]);
+    expect(screen.getByText("Nimal")).toBeInTheDocument();
+    expect(container.textContent).not.toContain("Others in TZ3");
   });
 });

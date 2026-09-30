@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strconv"
 	"testing"
 
@@ -126,18 +127,29 @@ func (f *fakePublisher) Publish(_ context.Context, key, value []byte) error {
 }
 
 type chatCall struct {
-	product, clockType, tier, caseNumber string
+	audience, clockType, tier, caseNumber string
 }
 
-// fakeChatSender is a hand-written fake for chatSender.
+// fakeChatSender is a hand-written fake for chatSender. hasAudienceSpace,
+// when set, backs HasAudienceSpace; nil means every audience is
+// "unconfigured" (false) — same convention as internal/dispatch's own
+// mockGoogleChatSender.
 type fakeChatSender struct {
-	calls []chatCall
-	err   error
+	calls            []chatCall
+	err              error
+	hasAudienceSpace func(string) bool
 }
 
-func (f *fakeChatSender) SendSLABreachAlert(_ context.Context, product, clockType, tier, caseNumber, _, _, _, _, _, _, _, _, _ string) error {
-	f.calls = append(f.calls, chatCall{product, clockType, tier, caseNumber})
+func (f *fakeChatSender) SendSLABreachAlert(_ context.Context, audience, clockType, tier, caseNumber, _, _, _, _, _, _, _, _, _ string) error {
+	f.calls = append(f.calls, chatCall{audience, clockType, tier, caseNumber})
 	return f.err
+}
+
+func (f *fakeChatSender) HasAudienceSpace(audience string) bool {
+	if f.hasAudienceSpace != nil {
+		return f.hasAudienceSpace(audience)
+	}
+	return false
 }
 
 // fakeLinkResolver is a hand-written fake for linkResolver.
@@ -146,7 +158,7 @@ type fakeLinkResolver struct{}
 func (fakeLinkResolver) CSMLink(caseID string) string { return "https://example.test/cases/" + caseID }
 
 func newTestEngine(entity statusLister, store tierStore, pub eventPublisher) *Engine {
-	return &Engine{entity: entity, store: store, pub: pub, chat: &fakeChatSender{}, links: fakeLinkResolver{}, defaultChatProduct: "Test Product"}
+	return &Engine{entity: entity, store: store, pub: pub, chat: &fakeChatSender{}, links: fakeLinkResolver{}}
 }
 
 func TestTierForStatus(t *testing.T) {
@@ -236,7 +248,7 @@ func TestEngine_Tick_AlertsOnlyNewlyCrossedTier(t *testing.T) {
 	}
 
 	chat := e.chat.(*fakeChatSender)
-	if len(chat.calls) != 1 || chat.calls[0] != (chatCall{"Test Product", "response", "75", "CS0001"}) {
+	if len(chat.calls) != 1 || chat.calls[0] != (chatCall{"Incident Monitor", "response", "75", "CS0001"}) {
 		t.Errorf("chat.calls = %+v, want one alert for CASE-1/response/75", chat.calls)
 	}
 	if store.tiers["CASE-1|response"] != 75 {
@@ -573,6 +585,96 @@ func TestEngine_Tick_PropagatesEachTierStoreError(t *testing.T) {
 // result (no error, just no cursor yet). Conflating the two would silently
 // reseed the baseline on every transient Redis error and swallow whatever
 // genuine crossing that poll should have caught.
+// TestEngine_SendBreachAlert_RoutesByTeamOrIncidentMonitor verifies the SLA
+// breach alert routes by Chat audience (chataudience.Resolve), not
+// product: a case with a configured team's own space gets its own alert,
+// and a case with no team (or an unrecognized/unconfigured one) still gets
+// exactly one alert, to the "Incident Monitor" fallback — never skipped
+// the way a product-routed alert with no product configured would be.
+func TestEngine_SendBreachAlert_RoutesByTeamOrIncidentMonitor(t *testing.T) {
+	t.Run("configured team gets its own alert", func(t *testing.T) {
+		entity := &fakeStatusLister{statuses: []SLAStatus{{CaseID: "CASE-1", ClockType: "response", BusinessElapsedPercent: 80, Team: "Castor"}}}
+		store := newFakeTierStore()
+		store.tiers["CASE-1|response"] = 50
+		e := newTestEngine(entity, store, &fakePublisher{})
+		e.chat = &fakeChatSender{hasAudienceSpace: func(a string) bool { return a == "Castor" }}
+
+		if err := e.Tick(context.Background()); err != nil {
+			t.Fatalf("Tick() error = %v, want nil", err)
+		}
+		chat := e.chat.(*fakeChatSender)
+		if len(chat.calls) != 1 || chat.calls[0].audience != "Castor" {
+			t.Fatalf("expected exactly 1 chat alert routed to audience %q, got %+v", "Castor", chat.calls)
+		}
+	})
+
+	t.Run("no team falls back to Incident Monitor, not skipped", func(t *testing.T) {
+		entity := &fakeStatusLister{statuses: []SLAStatus{{CaseID: "CASE-1", ClockType: "response", BusinessElapsedPercent: 80}}}
+		store := newFakeTierStore()
+		store.tiers["CASE-1|response"] = 50
+		e := newTestEngine(entity, store, &fakePublisher{})
+
+		if err := e.Tick(context.Background()); err != nil {
+			t.Fatalf("Tick() error = %v, want nil", err)
+		}
+		chat := e.chat.(*fakeChatSender)
+		if len(chat.calls) != 1 || chat.calls[0].audience != "Incident Monitor" {
+			t.Fatalf("expected exactly 1 chat alert routed to Incident Monitor, got %+v", chat.calls)
+		}
+	})
+}
+
+// TestEngine_SendBreachAlert_MultipleAudiencesEachGetTheirOwnAlert verifies
+// a clock whose facts resolve to more than one Chat audience (its own
+// team, plus Onboarding) sends one alert per resolved audience.
+func TestEngine_SendBreachAlert_MultipleAudiencesEachGetTheirOwnAlert(t *testing.T) {
+	entity := &fakeStatusLister{statuses: []SLAStatus{{
+		CaseID: "CASE-1", ClockType: "response", BusinessElapsedPercent: 80,
+		Team: "Castor", ProjectOnboardingStatus: "IN_PROGRESS",
+	}}}
+	store := newFakeTierStore()
+	store.tiers["CASE-1|response"] = 50
+	e := newTestEngine(entity, store, &fakePublisher{})
+	e.chat = &fakeChatSender{hasAudienceSpace: func(a string) bool { return a == "Castor" }}
+
+	if err := e.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick() error = %v, want nil", err)
+	}
+	chat := e.chat.(*fakeChatSender)
+	if len(chat.calls) != 2 {
+		t.Fatalf("expected 2 chat alerts (Castor + Onboarding), got %d: %+v", len(chat.calls), chat.calls)
+	}
+	var gotAudiences []string
+	for _, c := range chat.calls {
+		gotAudiences = append(gotAudiences, c.audience)
+	}
+	if !slices.Contains(gotAudiences, "Castor") || !slices.Contains(gotAudiences, "Onboarding") {
+		t.Errorf("audiences = %v, want both Castor and Onboarding", gotAudiences)
+	}
+}
+
+// TestEngine_SendBreachAlert_EvaluationOverridesEverything verifies an
+// Evaluation Subscription case's breach alert routes exclusively to the
+// "Evaluation" audience, regardless of team.
+func TestEngine_SendBreachAlert_EvaluationOverridesEverything(t *testing.T) {
+	entity := &fakeStatusLister{statuses: []SLAStatus{{
+		CaseID: "CASE-1", ClockType: "response", BusinessElapsedPercent: 80,
+		Team: "Castor", IsEvaluationAccount: true,
+	}}}
+	store := newFakeTierStore()
+	store.tiers["CASE-1|response"] = 50
+	e := newTestEngine(entity, store, &fakePublisher{})
+	e.chat = &fakeChatSender{hasAudienceSpace: func(a string) bool { return true }}
+
+	if err := e.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick() error = %v, want nil", err)
+	}
+	chat := e.chat.(*fakeChatSender)
+	if len(chat.calls) != 1 || chat.calls[0].audience != "Evaluation" {
+		t.Fatalf("expected exactly 1 chat alert routed to Evaluation, got %+v", chat.calls)
+	}
+}
+
 func TestEngine_Tick_GetTierFailureSkipsRatherThanReseeding(t *testing.T) {
 	entity := &fakeStatusLister{statuses: []SLAStatus{{CaseID: "CASE-1", ClockType: "response", BusinessElapsedPercent: 80}}}
 	store := newFakeTierStore()

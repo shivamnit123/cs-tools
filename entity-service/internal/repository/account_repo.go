@@ -87,9 +87,19 @@ type AccountRepository interface {
 	// ValidationError if either non-nil id does not reference an existing
 	// team row, or a NotFoundError if the account does not exist.
 	UpdateAccountTeams(ctx context.Context, accountID string, creTeamID, sreTeamID *string) (AccountRow, error)
-	UpsertFromSalesforce(ctx context.Context, row domain.SalesforceAccountUpsert) error
-	SoftDeleteBySfID(ctx context.Context, sfID string) error
+	// UpsertFromSalesforce writes one Salesforce Account and records state
+	// in salesforce_ingest_state within the same transaction.
+	UpsertFromSalesforce(ctx context.Context, row domain.SalesforceAccountUpsert, state domain.UpsertSalesforceIngestStateRequest) error
+	// SoftDeleteBySfID sets deleted_on on the accounts carrying this
+	// Salesforce id and records state (a DELETED ledger row) within the same
+	// transaction. found is false when no account carries the id.
+	SoftDeleteBySfID(ctx context.Context, sfID string, state domain.UpsertSalesforceIngestStateRequest) (found bool, err error)
 	LookupUserIDByEmail(ctx context.Context, email string) (*string, error)
+	// LookupAccountIDBySfID returns the id of the account carrying this
+	// Salesforce id, or nil (no error) when there is none. sf_id is not
+	// unique (migration 0095); should more than one row carry it, the
+	// oldest wins, which is the row every earlier ingest already wrote to.
+	LookupAccountIDBySfID(ctx context.Context, sfID string) (*string, error)
 }
 
 type accountRepo struct {
@@ -158,7 +168,10 @@ func (r *accountRepo) SearchAccounts(ctx context.Context, req domain.SearchAccou
 	filterArgs := []any{}
 	argIdx := 1
 
-	where := "WHERE 1=1"
+	// An account deleted in Salesforce (deleted_on, migration 0171) is not a
+	// live account and is left out of every list; GetAccountByID still
+	// resolves it, so the projects and cases that reference it keep working.
+	where := "WHERE a.deleted_on IS NULL"
 
 	if req.Filters.SearchQuery != "" {
 		escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(req.Filters.SearchQuery)
@@ -288,53 +301,32 @@ func (r *accountRepo) UpdateAccountTeams(ctx context.Context, accountID string, 
 
 const salesforceSyncActor = domain.SalesforceSyncActor
 
-// UpsertFromSalesforce writes one Salesforce Account. account.sf_id is not
+// UpsertFromSalesforce writes one Salesforce Account and its
+// salesforce_ingest_state row in one transaction. account.sf_id is not
 // unique (migration 0095 dropped the constraint, so ON CONFLICT (sf_id) has
-// nothing to arbitrate on), so the row is resolved by hand inside one
-// transaction, serialised per sf_id by an advisory lock so two concurrent
-// events for a new account cannot both insert:
+// nothing to arbitrate on), so the row is resolved by hand, serialised per
+// sf_id by an advisory lock so two concurrent events for a new account
+// cannot both insert:
 //
 //  1. update every row already carrying this sf_id;
 //  2. else link the row with the same account number that has no sf_id yet
 //     (a ServiceNow-synced row), rather than tripping account_number_key;
 //  3. else insert.
 //
-// Salesforce does not supply account_vertical or
-// secondary_technical_owner_id, so an update keeps the stored value when the
-// incoming one is NULL instead of blanking it.
-func (r *accountRepo) UpsertFromSalesforce(ctx context.Context, row domain.SalesforceAccountUpsert) error {
+// The UPDATE lists only the columns Salesforce owns (see
+// updateAccountFromSalesforceQuery); the CSM-only columns are absent from it,
+// so a Salesforce event can never blank them. The upsert also clears
+// deleted_on, which is how a RESTORED event (or any later CREATED/UPDATED)
+// brings a soft-deleted account back.
+func (r *accountRepo) UpsertFromSalesforce(ctx context.Context, row domain.SalesforceAccountUpsert, state domain.UpsertSalesforceIngestStateRequest) error {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("upsert account from salesforce: begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0::bigint))`, "account-sf:"+row.SfID); err != nil {
-		return fmt.Errorf("upsert account from salesforce: lock: %w", err)
-	}
-
-	args := []any{
-		salesforceSyncActor,
-		row.Name, row.Number, row.SfID,
-		row.Industry, row.Region, row.GlobalPod, row.Phone, row.SalesRegion, row.SubRegion,
-		row.AccountVertical, row.LifeCycle, row.NAICSIndustry, row.SubIndustry,
-		row.Classification, row.TechnicalOwnerID, row.SecondaryTechnicalOwnerID,
-		row.KeepExistingPhone,
-	}
-	tag, err := tx.Exec(ctx, updateAccountFromSalesforceQuery+` WHERE sf_id = $4`, args...)
-	if err != nil {
-		return fmt.Errorf("upsert account from salesforce: update by sf_id: %w", err)
-	}
-	if tag.RowsAffected() == 0 && row.Number != "" {
-		tag, err = tx.Exec(ctx, updateAccountFromSalesforceQuery+` WHERE number = $3 AND sf_id IS NULL`, args...)
-		if err != nil {
-			return fmt.Errorf("upsert account from salesforce: link by number: %w", err)
-		}
-	}
-	if tag.RowsAffected() == 0 {
-		if _, err := tx.Exec(ctx, insertAccountFromSalesforceQuery, args[:17]...); err != nil {
-			return fmt.Errorf("upsert account from salesforce: insert: %w", err)
-		}
+	if err := upsertAccountFromSalesforce(ctx, tx, row, state); err != nil {
+		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("upsert account from salesforce: commit: %w", err)
@@ -342,9 +334,71 @@ func (r *accountRepo) UpsertFromSalesforce(ctx context.Context, row domain.Sales
 	return nil
 }
 
+// upsertAccountFromSalesforce is UpsertFromSalesforce's body, run on q (the
+// transaction).
+func upsertAccountFromSalesforce(ctx context.Context, q querier, row domain.SalesforceAccountUpsert, state domain.UpsertSalesforceIngestStateRequest) error {
+	if err := lockAccountSfID(ctx, q, row.SfID); err != nil {
+		return fmt.Errorf("upsert account from salesforce: %w", err)
+	}
+
+	args := []any{
+		salesforceSyncActor,
+		row.Name, row.Number, row.SfID,
+		row.Industry, row.Region, row.GlobalPod, row.Phone, row.SalesRegion, row.SubRegion,
+		row.LifeCycle, row.NAICSIndustry, row.SubIndustry, row.Classification, row.TechnicalOwnerID,
+		row.Street, row.City, row.StateProvince, row.PostalCode, row.Country,
+		row.AccountManagerID, row.ActivationDate, row.LostDate, row.LostReason,
+		row.CustomerSuccessManagerID, row.SecondaryTechnicalOwnerID, row.RenewalAccountManagerID,
+		row.AccountVertical, row.LostReasonCategory, row.DeactivationDate,
+		row.KeepExistingPhone,
+	}
+	tag, err := q.Exec(ctx, updateAccountFromSalesforceQuery+` WHERE sf_id = $4`, args...)
+	if err != nil {
+		return fmt.Errorf("upsert account from salesforce: update by sf_id: %w", err)
+	}
+	if tag.RowsAffected() == 0 && row.Number != "" {
+		tag, err = q.Exec(ctx, updateAccountFromSalesforceQuery+` WHERE number = $3 AND sf_id IS NULL`, args...)
+		if err != nil {
+			return fmt.Errorf("upsert account from salesforce: link by number: %w", err)
+		}
+	}
+	if tag.RowsAffected() == 0 {
+		if _, err := q.Exec(ctx, insertAccountFromSalesforceQuery, args[:30]...); err != nil {
+			return fmt.Errorf("upsert account from salesforce: insert: %w", err)
+		}
+	}
+	if _, err := upsertSalesforceIngestState(ctx, q, state); err != nil {
+		return fmt.Errorf("upsert account from salesforce: %w", err)
+	}
+	return nil
+}
+
+// lockAccountSfID takes the per-sf_id transaction lock the upsert and the
+// soft delete share, so a DELETED and an UPDATED for the same account apply
+// one after the other.
+func lockAccountSfID(ctx context.Context, q querier, sfID string) error {
+	if _, err := q.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0::bigint))`, "account-sf:"+sfID); err != nil {
+		return fmt.Errorf("lock: %w", err)
+	}
+	return nil
+}
+
 // updateAccountFromSalesforceQuery is completed with a WHERE clause by
-// UpsertFromSalesforce; its parameters match insertAccountFromSalesforceQuery
-// plus $18 (keep the existing phone).
+// upsertAccountFromSalesforce; its parameters match
+// insertAccountFromSalesforceQuery plus $31 (keep the existing phone).
+//
+// $25-$30 are the SE-1 columns (customer success manager, secondary
+// technical owner, renewal manager, account vertical, lost reason category,
+// deactivation date). Sales Entity does not send them yet, so they are
+// COALESCEd with the stored value rather than assigned: a NULL keeps what the
+// ServiceNow sync loaded. Switch them to plain assignment once SE-1 is
+// deployed, so a value cleared in Salesforce clears here too.
+//
+// number keeps its stored value: it is NOT NULL, so the COALESCE always
+// picks account.number (ServiceNow's "ACC" auto-number, or the Salesforce Id
+// an earlier insert wrote). It stays in the list only so $3 is referenced
+// in the WHERE sf_id = $4 variant, where Postgres would otherwise fail to
+// infer its type.
 const updateAccountFromSalesforceQuery = `
 	UPDATE account SET
 		name = $2,
@@ -353,50 +407,105 @@ const updateAccountFromSalesforceQuery = `
 		industry = $5,
 		region = $6,
 		global_pod = $7,
-		phone = CASE WHEN $18 THEN account.phone ELSE $8 END,
+		phone = CASE WHEN $31 THEN account.phone ELSE $8 END,
 		sales_region = $9,
 		sub_region = $10,
-		account_vertical = COALESCE($11, account.account_vertical),
-		life_cycle = $12,
-		naics_industry = $13,
-		sub_industry = $14,
-		classification = $15,
-		technical_owner_id = $16,
-		secondary_technical_owner_id = COALESCE($17, account.secondary_technical_owner_id),
-		deactivation_date = NULL,
+		life_cycle = $11,
+		naics_industry = $12,
+		sub_industry = $13,
+		classification = $14,
+		technical_owner_id = $15,
+		street = $16,
+		city = $17,
+		state_province = $18,
+		postal_code = $19,
+		country = $20,
+		account_manager_id = $21,
+		activation_date = $22,
+		lost_date = $23,
+		lost_reason = $24,
+		customer_success_manager_id = COALESCE($25, account.customer_success_manager_id),
+		secondary_technical_owner_id = COALESCE($26, account.secondary_technical_owner_id),
+		renewal_account_manager_id = COALESCE($27, account.renewal_account_manager_id),
+		account_vertical = COALESCE($28, account.account_vertical),
+		lost_reason_category = COALESCE($29, account.lost_reason_category),
+		deactivation_date = COALESCE($30, account.deactivation_date),
+		deleted_on = NULL,
 		updated_on = now(),
 		updated_by = $1,
 		sync_time_stamp = now()`
 
+// insertAccountFromSalesforceQuery creates an account Salesforce knows and
+// CSM does not. number is the Salesforce Id: nobody issues "ACC" numbers
+// once ServiceNow is gone (decision D9 in SALESFORCE_SYNC_PLAN.md).
 const insertAccountFromSalesforceQuery = `
 	INSERT INTO account (
 		id, created_on, updated_on, created_by, updated_by,
 		name, number, sf_id,
 		industry, region, global_pod, phone, sales_region, sub_region,
-		account_vertical, life_cycle, naics_industry, sub_industry,
-		classification, technical_owner_id, secondary_technical_owner_id,
-		deactivation_date, sync_time_stamp
+		life_cycle, naics_industry, sub_industry, classification, technical_owner_id,
+		street, city, state_province, postal_code, country,
+		account_manager_id, activation_date, lost_date, lost_reason,
+		customer_success_manager_id, secondary_technical_owner_id, renewal_account_manager_id,
+		account_vertical, lost_reason_category, deactivation_date,
+		sync_time_stamp
 	) VALUES (
 		gen_random_uuid(), now(), now(), $1, $1,
 		$2, $3, $4,
 		$5, $6, $7, $8, $9, $10,
-		$11, $12, $13, $14,
-		$15, $16, $17,
-		NULL, now()
+		$11, $12, $13, $14, $15,
+		$16, $17, $18, $19, $20,
+		$21, $22, $23, $24,
+		$25, $26, $27,
+		$28, $29, $30,
+		now()
 	)`
 
-func (r *accountRepo) SoftDeleteBySfID(ctx context.Context, sfID string) error {
-	_, err := r.db.Exec(ctx, `
+// SoftDeleteBySfID marks every account carrying this Salesforce id as deleted
+// in Salesforce (deleted_on, migration 0171) and records the DELETED ledger
+// row, in one transaction. The account row stays: its projects, cases and
+// contacts still reference it, and a Salesforce merge deletes the losing
+// account while its children move to the winner. deactivation_date (the
+// contract end date Salesforce owns) is not touched. found is false when no
+// account carries the id; the ledger row is written regardless, so a later
+// RESTORED is never mistaken for a duplicate.
+func (r *accountRepo) SoftDeleteBySfID(ctx context.Context, sfID string, state domain.UpsertSalesforceIngestStateRequest) (bool, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("soft-delete account by sf_id: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	found, err := softDeleteAccountBySfID(ctx, tx, sfID, state)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("soft-delete account by sf_id: commit: %w", err)
+	}
+	return found, nil
+}
+
+// softDeleteAccountBySfID is SoftDeleteBySfID's body, run on q (the
+// transaction). A repeated DELETED keeps the first deleted_on.
+func softDeleteAccountBySfID(ctx context.Context, q querier, sfID string, state domain.UpsertSalesforceIngestStateRequest) (bool, error) {
+	if err := lockAccountSfID(ctx, q, sfID); err != nil {
+		return false, fmt.Errorf("soft-delete account by sf_id: %w", err)
+	}
+	tag, err := q.Exec(ctx, `
 		UPDATE account
-		SET deactivation_date = COALESCE(deactivation_date, CURRENT_DATE),
+		SET deleted_on = COALESCE(deleted_on, now()),
 		    updated_on = now(),
 		    updated_by = $2,
 		    sync_time_stamp = now()
 		WHERE sf_id = $1`, sfID, salesforceSyncActor)
 	if err != nil {
-		return fmt.Errorf("soft-delete account by sf_id: %w", err)
+		return false, fmt.Errorf("soft-delete account by sf_id: %w", err)
 	}
-	return nil
+	if _, err := upsertSalesforceIngestState(ctx, q, state); err != nil {
+		return false, fmt.Errorf("soft-delete account by sf_id: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 func (r *accountRepo) LookupUserIDByEmail(ctx context.Context, email string) (*string, error) {
@@ -407,6 +516,18 @@ func (r *accountRepo) LookupUserIDByEmail(ctx context.Context, email string) (*s
 	}
 	if err != nil {
 		return nil, fmt.Errorf("lookup user id by email: %w", err)
+	}
+	return &id, nil
+}
+
+func (r *accountRepo) LookupAccountIDBySfID(ctx context.Context, sfID string) (*string, error) {
+	var id string
+	err := r.db.QueryRow(ctx, `SELECT id::text FROM account WHERE sf_id = $1 ORDER BY created_on, id LIMIT 1`, sfID).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lookup account id by sf_id: %w", err)
 	}
 	return &id, nil
 }

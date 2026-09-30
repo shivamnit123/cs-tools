@@ -38,11 +38,21 @@ BEGIN;
 ALTER TABLE announcement_requests
     ADD COLUMN IF NOT EXISTS announcement_type announcement_type_enum NOT NULL DEFAULT 'GENERAL';
 
-UPDATE announcement_requests
-SET announcement_type = CASE
-    WHEN is_security_announcement THEN 'SECURITY'::announcement_type_enum
-    ELSE 'GENERAL'::announcement_type_enum
-END;
+-- Guarded on the old column still existing: re-running this file after
+-- is_security_announcement has already been migrated and dropped must not
+-- fail referencing a column that is gone by design, not by accident.
+DO $$ BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'announcement_requests' AND column_name = 'is_security_announcement'
+    ) THEN
+        UPDATE announcement_requests
+        SET announcement_type = CASE
+            WHEN is_security_announcement THEN 'SECURITY'::announcement_type_enum
+            ELSE 'GENERAL'::announcement_type_enum
+        END;
+    END IF;
+END $$;
 
 ALTER TABLE announcement_requests DROP COLUMN IF EXISTS is_security_announcement;
 

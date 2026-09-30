@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/chataudience"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/eventbus"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/events"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/notifications"
@@ -49,12 +50,17 @@ type eventPublisher interface {
 	Publish(ctx context.Context, key, value []byte) error
 }
 
-// chatSender abstracts notifications.GoogleChatClient's SendSLABreachAlert
-// for testability. Signature unchanged from the previous design — the
-// bulk /sla-status response carries every field this alert needs directly,
-// so there's no second per-clock lookup to build it from anymore.
+// chatSender abstracts notifications.GoogleChatClient's SendSLABreachAlert/
+// HasAudienceSpace for testability. SendSLABreachAlert's first parameter is
+// a Chat audience key (see chataudience.Resolve), not a product — SLA
+// breach alerts route by team/standing-audience, per explicit product
+// direction (see that function's own doc comment for why, and which other
+// event types don't). The bulk /sla-status response carries every field
+// this alert needs directly, so there's no second per-clock lookup to
+// build it from.
 type chatSender interface {
-	SendSLABreachAlert(ctx context.Context, product, clockType, tier, caseNumber, wso2CaseID, caseTitle, caseType, productName, team, severity, state, openedAt, caseLink string) error
+	SendSLABreachAlert(ctx context.Context, audience, clockType, tier, caseNumber, wso2CaseID, caseTitle, caseType, productName, team, severity, state, openedAt, caseLink string) error
+	HasAudienceSpace(audience string) bool
 }
 
 // linkResolver abstracts recipientlinks.Resolver's CSMLink for testability
@@ -104,17 +110,11 @@ type Engine struct {
 	pub    eventPublisher
 	chat   chatSender
 	links  linkResolver
-	// defaultChatProduct is sendBreachAlert's fallback when a clock's own
-	// Product (as returned by /sla-status) is empty — same "publisher
-	// didn't say" fallback reasoning as dispatch.Dispatcher.
-	// defaultChatProduct, reusing the same configured DEFAULT_CHAT_PRODUCT
-	// value (see cmd/server/main.go).
-	defaultChatProduct string
 }
 
 // NewEngine constructs an Engine.
-func NewEngine(entity *EntityClient, store *TierStore, pub *eventbus.Producer, chat *notifications.GoogleChatClient, links *recipientlinks.Resolver, defaultChatProduct string) *Engine {
-	return &Engine{entity: entity, store: store, pub: pub, chat: chat, links: links, defaultChatProduct: defaultChatProduct}
+func NewEngine(entity *EntityClient, store *TierStore, pub *eventbus.Producer, chat *notifications.GoogleChatClient, links *recipientlinks.Resolver) *Engine {
+	return &Engine{entity: entity, store: store, pub: pub, chat: chat, links: links}
 }
 
 // Tick polls every currently-active SLA clock and processes each — a failed
@@ -280,20 +280,21 @@ func (e *Engine) alertTier(ctx context.Context, s SLAStatus, tier int) error {
 }
 
 // sendBreachAlert builds and sends the Google Chat breach card for one tier
-// crossing, using s's own display fields — the bulk /sla-status response
-// already carries all eight, so no second lookup is needed here (unlike the
-// old per-clock GetClock design). product falls back to
-// e.defaultChatProduct when s's own Product is empty, same reasoning as
-// dispatch.Dispatcher's own Product fallback.
+// crossing, once per resolved Chat audience — team/standing-audience
+// routing (see chataudience.Resolve and chatSender's own doc comment for
+// why, and which other event types don't route this way), not
+// product-based: unlike the case.*/incident.* cards, there is no "no
+// audience configured" skip here — Resolve always returns at least the
+// "Incident Monitor" fallback, so this alert is never silently dropped for
+// lack of a routing value. s's own display fields (the bulk /sla-status
+// response already carries all of them, so no second lookup is needed
+// here, unlike the old per-clock GetClock design) are shared unchanged
+// across every audience's own card. A failure on any one audience fails
+// the whole call (errors.Join) — alertTier's own caller already retries
+// the entire tier (including the Kafka publish) on any sendBreachAlert
+// error, so this doesn't weaken that existing retry contract, just applies
+// it across however many audiences resolved instead of one.
 func (e *Engine) sendBreachAlert(ctx context.Context, s SLAStatus, tier int) error {
-	product := s.Product
-	if product == "" {
-		product = e.defaultChatProduct
-	}
-	if product == "" {
-		slog.WarnContext(ctx, "slaengine: sla breach alert not sent, no Google Chat product configured", "caseId", s.CaseID, "clockType", s.ClockType)
-		return nil
-	}
 	caseNumber := s.CaseNumber
 	if caseNumber == "" {
 		// s.CaseNumber can be empty for a work item entity-service's own
@@ -306,7 +307,16 @@ func (e *Engine) sendBreachAlert(ctx context.Context, s SLAStatus, tier int) err
 	if s.StartedOn != nil && !s.StartedOn.IsZero() {
 		openedAt = s.StartedOn.UTC().Format("2006-01-02 15:04:05") + " (UTC)"
 	}
-	return e.chat.SendSLABreachAlert(ctx, product, s.ClockType, tierLabel(tier), caseNumber, s.WSO2CaseID, s.CaseTitle, s.CaseType, s.Product, s.Team, s.Priority, s.State, openedAt, e.links.CSMLink(s.CaseID))
+
+	audiences := chataudience.Resolve(s.Team, s.IsEvaluationAccount, s.ProjectOnboardingStatus, time.Now(), e.chat.HasAudienceSpace)
+	caseLink := e.links.CSMLink(s.CaseID)
+	var errs []error
+	for _, audience := range audiences {
+		if err := e.chat.SendSLABreachAlert(ctx, audience, s.ClockType, tierLabel(tier), caseNumber, s.WSO2CaseID, s.CaseTitle, s.CaseType, s.Product, s.Team, s.Priority, s.State, openedAt, caseLink); err != nil {
+			errs = append(errs, fmt.Errorf("audience %q: %w", audience, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // RunTicker calls Tick every interval until ctx is done. Run from its own

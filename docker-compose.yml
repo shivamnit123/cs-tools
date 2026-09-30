@@ -283,6 +283,10 @@ services:
       AUTH_ADMIN_ROLES: cs_admin
       AUTH_TIMECARD_APPROVER_ROLES: cs_timecard_approver
       AUTH_DASHBOARD_DESIGNER_ROLES: cs_dashboard_designer
+      # Marker role, not a capability tier like the ones above -- picks the
+      # Sales/Solutions-Architecture (SPL) nav over CS Portal's own (see
+      # usePortalView.ts and internal/handler/access.go's AccessConfig.SalesSolutions).
+      AUTH_SALES_SOLUTIONS_ROLES: cs_sales_solutions
       CORS_ALLOWED_ORIGINS: http://localhost:3001
       PORT: "8080"
       DASHBOARDS_DIR: ./dashboards.example

@@ -65,7 +65,8 @@ type ServerConfig struct {
 	MaxBodyBytes   int64    `toml:"max_body_bytes"`
 }
 
-// AuthConfig selects the auth hook implementation. Only "none" exists today.
+// AuthConfig selects the auth hook implementation. "integration_users" is the only mode: it
+// verifies vendor webhooks against alerts-core's alertintegration.integration_users table.
 type AuthConfig struct {
 	Mode string `toml:"mode"`
 }
@@ -97,7 +98,7 @@ type CassandraConfig struct {
 	ConnectTimeout     Duration `toml:"connect_timeout"`
 }
 
-// WakeConfig bounds the fire-and-forget POST /alert to alerts-core.
+// WakeConfig bounds the fire-and-forget POST /alertz to alerts-core.
 type WakeConfig struct {
 	Timeout Duration `toml:"timeout"`
 }
@@ -145,7 +146,7 @@ func Defaults() Config {
 			IdleTimeout:    Duration(60 * time.Second),
 			MaxBodyBytes:   1 << 20,
 		},
-		Auth: AuthConfig{Mode: "none"},
+		Auth: AuthConfig{Mode: "integration_users"},
 		Allocator: AllocatorConfig{
 			QueueSize:        5000,
 			QueueMaxBytes:    256 << 20,
@@ -262,9 +263,14 @@ func (c Config) Validate() error {
 // per-vendor <VENDOR>_ALERT_CONFIG variables are read by their own packages.
 type Env struct {
 	Port string `env:"PORT" envDefault:"8080"`
-	// WakeURL is alerts-core's POST /alert. Empty disables the wake-up (local dev); the
+	// WakeURL is alerts-core's POST /alertz. Empty disables the wake-up (local dev); the
 	// 10-second poll on alerts-core still picks the alerts up.
 	WakeURL string `env:"ALERT_CORE_WAKE_URL"`
+	// WakeUsername/WakeSecret authenticate the WakeURL call as an alerts-core integration_users
+	// account. Empty disables auth on the call (still attempted; alerts-core will 401 it since
+	// /alertz requires auth, but the 10-second backstop poll picks the alert up anyway).
+	WakeUsername string `env:"ALERT_CORE_WAKE_USERNAME"`
+	WakeSecret   string `env:"ALERT_CORE_WAKE_SECRET"`
 	// ChatWebhookURLs are Google Chat incoming webhooks for rejected-webhook and DB-failure
 	// cards. Empty disables the cards (local dev); rejections and failures are still logged.
 	ChatWebhookURLs []string `env:"FALLBACK_CHAT_WEBHOOK_URLS" envSeparator:","`

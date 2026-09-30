@@ -872,11 +872,15 @@ export default function CsmIncidentDetailPage(): JSX.Element {
             onDownloadAttachment={
               canDownloadAttachment ? onDownloadAttachment : undefined
             }
-            preview={{
-              onGetPreviewContent: getAttachmentPreviewContent,
-              previewTarget,
-              onPreviewTargetChange: setPreviewTarget,
-            }}
+            preview={
+              canDownloadAttachment
+                ? {
+                    onGetPreviewContent: getAttachmentPreviewContent,
+                    previewTarget,
+                    onPreviewTargetChange: setPreviewTarget,
+                  }
+                : undefined
+            }
             onEditComment={onEditComment}
             onDeleteComment={onDeleteComment}
           />
@@ -1026,11 +1030,15 @@ export default function CsmIncidentDetailPage(): JSX.Element {
             onDownload={
               canDownloadAttachment ? onDownloadAttachment : undefined
             }
-            preview={{
-              onGetPreviewContent: getAttachmentPreviewContent,
-              previewTarget,
-              onPreviewTargetChange: setPreviewTarget,
-            }}
+            preview={
+              canDownloadAttachment
+                ? {
+                    onGetPreviewContent: getAttachmentPreviewContent,
+                    previewTarget,
+                    onPreviewTargetChange: setPreviewTarget,
+                  }
+                : undefined
+            }
           />
         </Card>
       )}

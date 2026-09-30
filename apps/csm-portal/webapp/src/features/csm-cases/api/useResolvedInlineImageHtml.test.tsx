@@ -145,4 +145,37 @@ describe("useResolvedInlineImageHtml", () => {
     expect(getBlobMock).toHaveBeenCalledTimes(1);
     expect(result.current.resolvedHtml).toContain("data:image/png;base64,");
   });
+
+  // A raw base64-embedded image (content authored before/without SFTPGo
+  // attachment storage) has no .iix reference at all -- nothing to fetch,
+  // since there's no separate attachment record. See
+  // useResolvedInlineImageHtml's own doc comment for why this still needs
+  // hiding, even though the underlying content already reached the browser.
+  const RAW_BASE64_HTML =
+    '<p>see <img src="data:image/png;base64,AAAA"></p>';
+
+  it("without the attachment-download role, a raw base64 image is hidden behind the permission placeholder", () => {
+    userRoles.value = ["viewer"];
+
+    const { result } = renderHook(
+      () => useResolvedInlineImageHtml(RAW_BASE64_HTML),
+      { wrapper },
+    );
+
+    expect(postMock).not.toHaveBeenCalled();
+    expect(getBlobMock).not.toHaveBeenCalled();
+    expect(result.current.resolvedHtml).not.toContain("<img");
+    expect(result.current.resolvedHtml).toContain(
+      'data-unresolved-reason="permission"',
+    );
+  });
+
+  it("with the attachment-download role, a raw base64 image renders as-is", () => {
+    const { result } = renderHook(
+      () => useResolvedInlineImageHtml(RAW_BASE64_HTML),
+      { wrapper },
+    );
+
+    expect(result.current.resolvedHtml).toBe(RAW_BASE64_HTML);
+  });
 });

@@ -111,13 +111,10 @@ type ProblemRepository interface {
 	// precisely rather than as an opaque infrastructure error if it ever
 	// does.
 	//
-	// Only fields with an unambiguous, already-established column mapping
-	// are written: req.Category/req.Subcategory are deliberately NOT
-	// resolved to problem.category/problem.subcategory_id here, for the
-	// same reason IncidentRepository.CreateIncidentFromServiceNow's own doc
-	// comment already gives for incident's Subcategory -- ServiceNow's own
-	// free-text choice-list spelling has no established mapping back to
-	// problem_category_enum or problem_subcategory's lookup rows.
+	// req.Category is normalized to uppercase and written to
+	// problem.category. req.Subcategory is matched case-insensitively against
+	// problem_subcategory.value within that category; unmatched values remain
+	// NULL.
 	CreateProblemFromServiceNow(ctx context.Context, req domain.CreateProblemRequest, id, number, createdBy string, state *string) (domain.ProblemDetail, error)
 
 	// UpdateProblemFields writes any subset of the PATCH /problems/{id}
@@ -457,38 +454,48 @@ const createProblemFromServiceNowQuery = `
 	WITH inserted_work_item AS (
 		INSERT INTO work_item (
 			id, created_on, updated_on, created_by, updated_by,
-			number, subject, type, parent_id
+			number, subject, description, type, parent_id
 		)
 		VALUES (
 			$1, NOW(), NOW(), $2, $2,
-			$3, $4, 'PROBLEM'::work_item_type_enum, $5::uuid
+			$3, $4, $8, 'PROBLEM'::work_item_type_enum, $5::uuid
 		)
-		RETURNING id, number, subject, created_on, updated_on, created_by
+		RETURNING id, number, subject, description, created_on, updated_on, created_by
 	),
 	inserted_problem AS (
 		INSERT INTO problem (
-			id, state, incident_id, opened_on
+			id, state, incident_id, opened_on, category, subcategory_id
 		)
 		VALUES (
-			$1, $6::problem_state_enum, $7::uuid, NOW()
+			$1, $6::problem_state_enum, $7::uuid, NOW(), $9::problem_category_enum,
+			-- subcategory is matched on problem_subcategory.value (lower-case
+			-- free text) within the chosen category; an unmatched value stays NULL.
+			(SELECT id FROM problem_subcategory WHERE category = $9::problem_category_enum AND value = LOWER($10::text))
 		)
 		RETURNING id
 	)
-	SELECT iwi.id, iwi.number, iwi.subject, iwi.created_on, iwi.updated_on, iwi.created_by
+	SELECT iwi.id, iwi.number, iwi.subject, iwi.description, iwi.created_on, iwi.updated_on, iwi.created_by
 	FROM inserted_work_item iwi
 	JOIN inserted_problem ip ON ip.id = iwi.id`
 
 // CreateProblemFromServiceNow implements ProblemRepository.
 func (r *problemRepo) CreateProblemFromServiceNow(ctx context.Context, req domain.CreateProblemRequest, id, number, createdBy string, state *string) (domain.ProblemDetail, error) {
+	var category *string
+	if req.Category != nil && strings.TrimSpace(*req.Category) != "" {
+		v := strings.ToUpper(strings.TrimSpace(*req.Category))
+		category = &v
+	}
 	var (
 		outID, outNumber, outSubject, outCreatedBy string
+		outDescription                             *string
 		outCreatedOn, outUpdatedOn                 time.Time
 	)
 	err := r.db.QueryRow(ctx, createProblemFromServiceNowQuery,
 		id, createdBy,
 		number, req.Subject, req.OriginCaseID,
-		state, req.PrimaryIncidentID,
-	).Scan(&outID, &outNumber, &outSubject, &outCreatedOn, &outUpdatedOn, &outCreatedBy)
+		state, req.PrimaryIncidentID, req.Description,
+		category, req.Subcategory,
+	).Scan(&outID, &outNumber, &outSubject, &outDescription, &outCreatedOn, &outUpdatedOn, &outCreatedBy)
 	if err != nil {
 		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) {
 			switch pgErr.Code {
@@ -496,6 +503,8 @@ func (r *problemRepo) CreateProblemFromServiceNow(ctx context.Context, req domai
 				return domain.ProblemDetail{}, &apierror.ConflictError{Msg: "a problem already exists for this ServiceNow id/number: " + pgErr.Detail}
 			case "22P02": // invalid_text_representation -- id (or state) was not a valid UUID/enum label
 				return domain.ProblemDetail{}, &apierror.ValidationError{Msg: "id is not a valid UUID, or state is not a valid problem state: " + id}
+			case "22001": // string_data_right_truncation -- e.g. subject over work_item.subject's VARCHAR(512)
+				return domain.ProblemDetail{}, &apierror.ValidationError{Msg: "a field value is too long: " + pgErr.Message}
 			case "23503": // foreign_key_violation -- one of the referenced IDs does not exist
 				return domain.ProblemDetail{}, &apierror.ValidationError{Msg: "one or more referenced IDs do not exist: " + pgErr.Detail}
 			case "P0001": // raise_exception from integrity triggers
@@ -506,10 +515,11 @@ func (r *problemRepo) CreateProblemFromServiceNow(ctx context.Context, req domai
 	}
 
 	return domain.ProblemDetail{
-		ID:      &outID,
-		Number:  &outNumber,
-		Subject: &outSubject,
-		State:   state,
+		ID:          &outID,
+		Number:      &outNumber,
+		Subject:     &outSubject,
+		Description: outDescription,
+		State:       state,
 	}, nil
 }
 

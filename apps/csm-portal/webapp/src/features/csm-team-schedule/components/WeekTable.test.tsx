@@ -26,7 +26,12 @@ import {
   MONDAY,
   REGULAR,
   REGULAR_IND,
+  TZ1,
+  TZ1_L1,
+  TZ2,
+  TZ3,
   absence,
+  shift,
   assignment,
   scopeControls,
   shiftMap,
@@ -95,5 +100,66 @@ describe("WeekTable", () => {
     });
     // Once per day of the span, which is the point of a week grid.
     expect(screen.getAllByText("Nuwan").length).toBeGreaterThan(0);
+  });
+});
+
+describe("WeekTable: SRE escalation, a row per zone and tier", () => {
+  const SRE = shiftMap(TZ1, TZ1_L1, TZ2, TZ3);
+  const tiered = (name: string, shiftCode: string, zoneCode: string, tier: "L1" | "L2" | "L3") => ({
+    ...assignment({ name, rotaDate: "2026-09-21", shiftCode, zoneCode }),
+    tier,
+  });
+
+  it("gives every zone an L1, L2 and L3 row, in that order", () => {
+    const { container } = renderWeek({
+      family: "SRE",
+      shifts: SRE,
+      assignments: [tiered("Jane", TZ1_L1.code, "TZ1", "L1"), tiered("John", TZ1.code, "TZ1", "L2")],
+    } as never);
+    const labels = [...container.querySelectorAll("tbody th.lab small")].map((el) => el.textContent);
+    expect(labels).toEqual([
+      "TZ1 L1 support", "TZ1 L2 support", "TZ1 L3 support",
+      "TZ2 L1 support", "TZ2 L2 support", "TZ2 L3 support",
+      "TZ3 L1 support", "TZ3 L2 support", "TZ3 L3 support",
+    ]);
+  });
+
+  it("files each engineer under their own tier, whichever window holds it", () => {
+    const { container } = renderWeek({
+      family: "SRE",
+      shifts: SRE,
+      assignments: [tiered("Jane", TZ1_L1.code, "TZ1", "L1"), tiered("John", TZ1.code, "TZ1", "L2"), tiered("Ada", TZ2.code, "TZ2", "L3")],
+    } as never);
+    const rowOf = (label: string) =>
+      [...container.querySelectorAll("tbody tr")].find((tr) => tr.querySelector("th.lab small")?.textContent === label);
+    expect(rowOf("TZ1 L1 support")).toHaveTextContent("Jane");
+    expect(rowOf("TZ1 L2 support")).toHaveTextContent("John");
+    expect(rowOf("TZ2 L3 support")).toHaveTextContent("Ada");
+    // The row already says the tier, so no badge repeats it.
+    expect(rowOf("TZ1 L2 support")?.querySelector(".tier-t")).toBeNull();
+  });
+});
+
+describe("WeekTable: no tier on a zone's escalation window", () => {
+  it("reads as the zone's regular hours, not as a turn missing its tier", () => {
+    const TZ3_REGULAR = shift({
+      code: "SRE_TZ3_REGULAR",
+      label: "TZ3 regular hours",
+      family: "SRE",
+      zoneCode: "TZ3",
+      isRotation: false,
+      startMinute: 1260,
+      endMinute: 1800,
+      sortOrder: 103,
+    });
+    const { container } = renderWeek({
+      family: "SRE",
+      shifts: shiftMap(TZ1, TZ1_L1, TZ2, TZ3, TZ3_REGULAR),
+      assignments: [assignment({ name: "Isuri", rotaDate: "2026-09-21", shiftCode: TZ3.code, zoneCode: "TZ3" })],
+    } as never);
+    const rowOf = (label: string) =>
+      [...container.querySelectorAll("tbody tr")].find((tr) => tr.querySelector("th.lab small")?.textContent === label);
+    expect(rowOf("TZ3 regular hours")).toHaveTextContent("Isuri");
+    expect(container.textContent).not.toContain("tier not set");
   });
 });

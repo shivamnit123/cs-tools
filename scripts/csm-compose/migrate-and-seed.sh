@@ -40,16 +40,20 @@ echo "[migrate] ensuring database exists"
 $PSQL -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = '${ENTITY_DB_NAME}'" | grep -q 1 || \
   $PSQL -d postgres -c "CREATE DATABASE \"${ENTITY_DB_NAME}\""
 
-# entity-service ships no migration tool and its raw .up.sql files are not
-# all safely re-runnable (most guard with IF NOT EXISTS, but at least one
-# ADD CONSTRAINT does not -- a real gap in those files, not something to
-# patch here). So this script tracks which migrations have actually been
-# applied in a per-database schema_migrations table, applying only the ones
-# missing from it on every `docker compose up`, rather than gating on a
-# single application table's presence (e.g. entity-service's "work_item",
-# created partway through the set by migration 000016 -- a later migration
-# failing after that point would leave the schema incomplete but still look
-# "migrated" forever after, since work_item already exists).
+# entity-service's own migrations/*.sql files (4-digit, single-file, no
+# .up/.down split -- matching operations/csm-sync-service's own convention,
+# see entity-service/CLAUDE.md's "Database migrations" section) are its
+# source of truth, but ship with no migration tool of their own: `make
+# migrate` there tracks against csm_migration_applied_migration on a real
+# shared database, which this local compose stack has no equivalent
+# connection to. So this script tracks which migrations have actually been
+# applied in a per-database schema_migrations table of its own, applying
+# only the ones missing from it on every `docker compose up`, rather than
+# gating on a single application table's presence (e.g. entity-service's
+# "work_item", created partway through the set by an early migration -- a
+# later migration failing after that point would leave the schema
+# incomplete but still look "migrated" forever after, since work_item
+# already exists).
 #
 # Each migration file is applied and recorded in one transaction (`psql -1`):
 # if the file's SQL fails partway through, nothing from it is recorded, so
@@ -64,8 +68,8 @@ ensure_migrations_table() {
 apply_pending_migrations() {
   db="$1"; dir="$2"
   ensure_migrations_table "$db"
-  for f in $(ls "${dir}"/*.up.sql | sort); do
-    version="$(basename "$f" .up.sql)"
+  for f in $(ls "${dir}"/*.sql | sort -t_ -k1 -V); do
+    version="$(basename "$f" .sql)"
     already="$($PSQL -d "$db" -tAc "SELECT 1 FROM schema_migrations WHERE version = '${version}'")"
     if [ "$already" != "1" ]; then
       echo "[migrate]   applying $f"

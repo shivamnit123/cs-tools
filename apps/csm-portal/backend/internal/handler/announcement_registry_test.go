@@ -19,10 +19,13 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // mockEntityAnnouncementRegistryClient stubs the two upstream searches this
@@ -422,6 +425,119 @@ func TestSearchAnnouncementRegistry_PaginatesTheGroupedResult(t *testing.T) {
 	if got.Total != 3 || !got.HasMore {
 		t.Fatalf("expected total=3, hasMore=true, got total=%d hasMore=%v", got.Total, got.HasMore)
 	}
+}
+
+// fetchAllPagesConcurrently fetches page 0 alone, then every remaining page
+// concurrently, and must reassemble them in their original page order. Every
+// other test in this file fits on a single page (registryPageLimit=50), so
+// none of them ever exercise that concurrent path at all -- this one uses a
+// backing set large enough to span 3 pages and asserts the final order
+// matches entity-service's own descending-updatedOn order exactly, not
+// whatever order the concurrent fetches happened to complete in.
+func TestSearchAnnouncementRegistry_FetchesMultiplePagesConcurrentlyAndPreservesOrder(t *testing.T) {
+	const totalCases = 120 // ceil(120/50) = 3 pages
+	full := make([]registryCaseView, totalCases)
+	base := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	for i := range full {
+		ts := base.Add(-time.Duration(i) * time.Minute).UTC().Format(time.RFC3339)
+		full[i] = registryCaseView{
+			ID:        fmt.Sprintf("case-%03d", i),
+			Number:    fmt.Sprintf("CS%03d", i),
+			UpdatedOn: ts,
+			CreatedOn: ts,
+		}
+	}
+
+	client := &mockEntityAnnouncementRegistryClient{
+		searchCasesFn: func(_ context.Context, body []byte) ([]byte, error) {
+			var req struct {
+				Pagination struct {
+					Offset int `json:"offset"`
+					Limit  int `json:"limit"`
+				} `json:"pagination"`
+			}
+			if err := json.Unmarshal(body, &req); err != nil {
+				return nil, err
+			}
+			offset, limit := req.Pagination.Offset, req.Pagination.Limit
+			page := []registryCaseView{}
+			if offset < len(full) {
+				end := offset + limit
+				if end > len(full) {
+					end = len(full)
+				}
+				page = full[offset:end]
+			}
+			return json.Marshal(registryCaseSearchResponse{Cases: page, Total: len(full), Offset: offset, Limit: limit})
+		},
+	}
+
+	h := NewAnnouncementRegistryHandler(client)
+	r := withUser(httptest.NewRequest(http.MethodPost, "/announcements/registry/search", strings.NewReader(`{"pagination":{"limit":200}}`)))
+	w := httptest.NewRecorder()
+	h.SearchAnnouncementRegistry(w, r)
+	assertStatus(t, w, http.StatusOK)
+
+	var got registrySearchResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got.Total != totalCases {
+		t.Fatalf("total = %d, want %d", got.Total, totalCases)
+	}
+	if len(got.Rows) != totalCases {
+		t.Fatalf("expected every case as its own row (none share a request), got %d", len(got.Rows))
+	}
+	for i, row := range got.Rows {
+		if row.CaseNumber != full[i].Number {
+			t.Fatalf("row %d = %s, want %s (page order not preserved)", i, row.CaseNumber, full[i].Number)
+		}
+	}
+}
+
+// A failure on any page other than the first must still fail the request
+// promptly, not hang -- fetchAllPagesConcurrently cancels every other
+// in-flight (and not-yet-dispatched) page fetch as soon as one fails.
+func TestSearchAnnouncementRegistry_ErrorOnALaterPageFailsPromptlyWithoutHanging(t *testing.T) {
+	const totalCases = 120 // ceil(120/50) = 3 pages, so pages 1 and 2 exist to fail
+	client := &mockEntityAnnouncementRegistryClient{
+		searchCasesFn: func(_ context.Context, body []byte) ([]byte, error) {
+			var req struct {
+				Pagination struct {
+					Offset int `json:"offset"`
+					Limit  int `json:"limit"`
+				} `json:"pagination"`
+			}
+			if err := json.Unmarshal(body, &req); err != nil {
+				return nil, err
+			}
+			if req.Pagination.Offset == 0 {
+				return json.Marshal(registryCaseSearchResponse{
+					Cases:  []registryCaseView{{ID: "case-0", Number: "CS000", UpdatedOn: "2026-07-01T00:00:00Z", CreatedOn: "2026-07-01T00:00:00Z"}},
+					Total:  totalCases,
+					Offset: 0,
+					Limit:  req.Pagination.Limit,
+				})
+			}
+			return nil, errors.New("upstream exploded")
+		},
+	}
+
+	h := NewAnnouncementRegistryHandler(client)
+	r := withUser(httptest.NewRequest(http.MethodPost, "/announcements/registry/search", strings.NewReader(`{"pagination":{"limit":200}}`)))
+	w := httptest.NewRecorder()
+
+	done := make(chan struct{})
+	go func() {
+		h.SearchAnnouncementRegistry(w, r)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not return -- a later-page failure must not hang the request")
+	}
+	assertStatus(t, w, http.StatusInternalServerError)
 }
 
 func TestSearchAnnouncementRegistry_FailsLoudlyRatherThanSilentlyTruncating(t *testing.T) {

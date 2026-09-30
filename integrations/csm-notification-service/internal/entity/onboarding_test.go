@@ -162,20 +162,26 @@ func TestRecordOnboardingStep_RequiresPathValues(t *testing.T) {
 	}
 }
 
-// TestEmailAlreadySent pins the read side of the ledger: the path it calls,
-// and that only a SUCCEEDED EMAIL row counts as "already invited". A
+// TestSucceededEmailStep pins the read side of the ledger: the path it
+// calls, that only a SUCCEEDED EMAIL row counts as "already invited" (a
 // FAILED or SKIPPED email, or a succeeded step of another kind, must not
-// suppress an invitation.
-func TestEmailAlreadySent(t *testing.T) {
+// suppress an invitation), and that the row's eventModifiedOn comes back
+// verbatim for dispatch to compare -- including when it is missing.
+func TestSucceededEmailStep(t *testing.T) {
 	cases := map[string]struct {
-		steps []map[string]any
-		want  bool
+		steps  []map[string]any
+		wantOK bool
+		wantOn string
 	}{
-		"no steps at all":       {steps: []map[string]any{}, want: false},
-		"email succeeded":       {steps: []map[string]any{{"step": "IDENTITY", "status": "SUCCEEDED"}, {"step": "EMAIL", "status": "SUCCEEDED"}}, want: true},
-		"email failed":          {steps: []map[string]any{{"step": "EMAIL", "status": "FAILED"}}, want: false},
-		"email skipped":         {steps: []map[string]any{{"step": "EMAIL", "status": "SKIPPED"}}, want: false},
-		"another step succeeds": {steps: []map[string]any{{"step": "IDENTITY", "status": "SUCCEEDED"}}, want: false},
+		"no steps at all": {steps: []map[string]any{}},
+		"email succeeded": {
+			steps:  []map[string]any{{"step": "IDENTITY", "status": "SUCCEEDED", "eventModifiedOn": "2026-09-01T08:00:00Z"}, {"step": "EMAIL", "status": "SUCCEEDED", "eventModifiedOn": "2026-09-01T08:00:00.123Z"}},
+			wantOK: true, wantOn: "2026-09-01T08:00:00.123Z",
+		},
+		"email succeeded without a timestamp": {steps: []map[string]any{{"step": "EMAIL", "status": "SUCCEEDED"}}, wantOK: true},
+		"email failed":                        {steps: []map[string]any{{"step": "EMAIL", "status": "FAILED", "eventModifiedOn": "2026-09-01T08:00:00Z"}}},
+		"email skipped":                       {steps: []map[string]any{{"step": "EMAIL", "status": "SKIPPED"}}},
+		"another step succeeds":               {steps: []map[string]any{{"step": "IDENTITY", "status": "SUCCEEDED"}}},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -189,12 +195,15 @@ func TestEmailAlreadySent(t *testing.T) {
 			tokenSrv := newCustomerTokenServer(t)
 			defer tokenSrv.Close()
 
-			got, err := newTestCustomerClient(t, tokenSrv, apiSrv).EmailAlreadySent(context.Background(), "a0e000000000001AAA")
+			got, err := newTestCustomerClient(t, tokenSrv, apiSrv).SucceededEmailStep(context.Background(), "a0e000000000001AAA")
 			if err != nil {
-				t.Fatalf("EmailAlreadySent() error = %v", err)
+				t.Fatalf("SucceededEmailStep() error = %v", err)
 			}
-			if got != tc.want {
-				t.Errorf("EmailAlreadySent() = %v, want %v", got, tc.want)
+			if (got != nil) != tc.wantOK {
+				t.Fatalf("SucceededEmailStep() = %+v, want found=%v", got, tc.wantOK)
+			}
+			if got != nil && (got.Step != OnboardingStepEmail || got.Status != OnboardingStepSucceeded || got.EventModifiedOn != tc.wantOn) {
+				t.Errorf("SucceededEmailStep() = %+v, want EMAIL/SUCCEEDED at %q", got, tc.wantOn)
 			}
 			if gotMethod != http.MethodGet || gotPath != "/onboarding-steps/a0e000000000001AAA" {
 				t.Errorf("request = %s %s, want GET /onboarding-steps/a0e000000000001AAA", gotMethod, gotPath)
@@ -203,9 +212,9 @@ func TestEmailAlreadySent(t *testing.T) {
 	}
 }
 
-// TestEmailAlreadySent_UpstreamErrorIsReturned: a ledger we cannot read is
-// an error, never a quiet "no invitation has been sent".
-func TestEmailAlreadySent_UpstreamErrorIsReturned(t *testing.T) {
+// TestSucceededEmailStep_UpstreamErrorIsReturned: a ledger we cannot read
+// is an error, never a quiet "no invitation has been sent".
+func TestSucceededEmailStep_UpstreamErrorIsReturned(t *testing.T) {
 	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
@@ -213,12 +222,12 @@ func TestEmailAlreadySent_UpstreamErrorIsReturned(t *testing.T) {
 	tokenSrv := newCustomerTokenServer(t)
 	defer tokenSrv.Close()
 
-	got, err := newTestCustomerClient(t, tokenSrv, apiSrv).EmailAlreadySent(context.Background(), "a0e000000000001AAA")
+	got, err := newTestCustomerClient(t, tokenSrv, apiSrv).SucceededEmailStep(context.Background(), "a0e000000000001AAA")
 	if err == nil {
-		t.Fatal("EmailAlreadySent() error = nil, want the upstream failure surfaced")
+		t.Fatal("SucceededEmailStep() error = nil, want the upstream failure surfaced")
 	}
-	if got {
-		t.Error("EmailAlreadySent() = true on an error; a failed read must never look like a sent invitation")
+	if got != nil {
+		t.Error("SucceededEmailStep() returned a step on an error; a failed read must never look like a sent invitation")
 	}
 	var apiErr *apierror.Error
 	if !errors.As(err, &apiErr) {

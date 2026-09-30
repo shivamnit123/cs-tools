@@ -441,8 +441,10 @@ func (r *incidentRepo) GetIncidentByID(ctx context.Context, id string) (domain.I
 		       inc.resolution_code::TEXT, inc.close_notes,
 		       rb.id, COALESCE(rb.name, NULLIF(TRIM(CONCAT_WS(' ', rb.first_name, rb.last_name)), '')),
 		       inc.resolved_on, inc.incident_report, wi.description,
-		       wi.created_on, wi.created_by, wi.updated_on, wi.updated_by
+		       wi.created_on, wi.created_by, wi.updated_on, wi.updated_by,
+		       ag.id, ag.name
 		` + incidentFromJoins + `
+		LEFT JOIN "group" ag ON ag.id = wi.assignment_group_id
 		WHERE wi.id = $1 AND wi.type = 'INCIDENT'`
 
 	var (
@@ -465,6 +467,7 @@ func (r *incidentRepo) GetIncidentByID(ctx context.Context, id string) (domain.I
 		description                        *string
 		createdOn, updatedOn               time.Time
 		createdBy, updatedBy               string
+		agID, agName                       *string
 	)
 	err := r.db.QueryRow(ctx, query, id).Scan(
 		&id2, &number, &subject, &openedOn,
@@ -482,6 +485,7 @@ func (r *incidentRepo) GetIncidentByID(ctx context.Context, id string) (domain.I
 		&rbID, &rbName,
 		&resolvedOn, &incidentReport, &description,
 		&createdOn, &createdBy, &updatedOn, &updatedBy,
+		&agID, &agName,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.IncidentView{}, &apierror.NotFoundError{Msg: "incident not found"}
@@ -520,6 +524,9 @@ func (r *incidentRepo) GetIncidentByID(ctx context.Context, id string) (domain.I
 	}
 	if aeID != nil {
 		v.AssignedTo = &domain.EntityRef{ID: *aeID, Name: stringOrEmpty(aeName)}
+	}
+	if agID != nil {
+		v.AssignmentGroup = &domain.EntityRef{ID: *agID, Name: stringOrEmpty(agName)}
 	}
 	if svcID != nil {
 		v.Service = &domain.EntityRef{ID: *svcID, Name: stringOrEmpty(svcName)}

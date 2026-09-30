@@ -67,6 +67,10 @@ const activeSLAStatusCTE = `
 // activeSLAStatusFromJoins resolves each row's case-like display data --
 // mirrors caseRepo.GetCaseByID's own product/severity joins exactly (see
 // that query's own comments for why), restricted to case-like types only.
+// The account/project/project_type joins exist purely to feed
+// csm-notification-service's own Chat-audience routing (Team, onboarding
+// status, evaluation-account flag) — see domain.SLAStatus's own doc
+// comment for each field.
 const activeSLAStatusFromJoins = `
 	FROM active_sla als
 	JOIN work_item wi ON wi.id = als.work_item_id
@@ -75,7 +79,19 @@ const activeSLAStatusFromJoins = `
 	LEFT JOIN deployed_product dp ON dp.id = wi.deployed_product_id
 	LEFT JOIN product prod ON prod.id = dp.product_id
 	LEFT JOIN product_version pv ON pv.id = dp.version_id
+	LEFT JOIN account a ON a.id = wi.account_id
+	LEFT JOIN "group" cre ON cre.id = a.cre_team_id
+	LEFT JOIN project p ON p.id = wi.project_id
+	LEFT JOIN project_type pt ON pt.id = p.project_type_id
 	WHERE wi.type = ANY(` + caseLikeWorkItemTypes + `)`
+
+// evaluationSubscriptionProjectTypeName is project_type.name's exact value
+// for the "Evaluation Subscription" type. Matched by name, not a hardcoded
+// id: project_type isn't seeded by this repo's own migrations (it's
+// populated by an external sync), so nothing guarantees a given row's id
+// is the same across environments -- name has a UNIQUE constraint and is
+// the stable, portable key here.
+const evaluationSubscriptionProjectTypeName = "Evaluation Subscription"
 
 // stringOrEmpty returns "" for a nil column value rather than propagating a
 // nil *string into a domain type's plain string fields. Shared across this
@@ -101,12 +117,13 @@ func nullIfEmpty(s string) *string {
 func scanSLAStatus(row interface{ Scan(...any) error }) (domain.SLAStatus, error) {
 	var s domain.SLAStatus
 	var target, severity, caseType string
-	var caseNumber, wso2CaseID, caseTitle, productName, state *string
+	var caseNumber, wso2CaseID, caseTitle, productName, state, teamName, onboardingStatus *string
 	var stage string
+	var isEvaluation bool
 	err := row.Scan(
 		&s.CaseID, &target, &s.BusinessElapsedPercent, &s.HasBreached, &stage, &s.StartedOn,
 		&caseNumber, &wso2CaseID, &caseTitle, &caseType,
-		&productName, &severity, &state,
+		&productName, &severity, &state, &teamName, &onboardingStatus, &isEvaluation,
 	)
 	if err != nil {
 		return domain.SLAStatus{}, err
@@ -119,6 +136,9 @@ func scanSLAStatus(row interface{ Scan(...any) error }) (domain.SLAStatus, error
 	s.CaseType = caseType
 	s.Product = stringOrEmpty(productName)
 	s.State = stringOrEmpty(state)
+	s.Team = stringOrEmpty(teamName)
+	s.ProjectOnboardingStatus = stringOrEmpty(onboardingStatus)
+	s.IsEvaluationAccount = isEvaluation
 	if sev, ok := caseSeverityFromEnum[severity]; ok {
 		s.Priority = strings.ToUpper(string(sev))
 	}
@@ -135,7 +155,8 @@ func (r *slaStatusRepo) SearchActiveSLAStatuses(ctx context.Context, pagination 
 		SELECT als.work_item_id::TEXT, als.target::TEXT, COALESCE(als.business_elapsed_percentage, 0), COALESCE(als.has_breached, FALSE), COALESCE(als.stage::TEXT, ''), als.start_on,
 		       wi.number, wi.wso2_id, wi.subject, wi.type::TEXT,
 		       prod.name || COALESCE(' ' || pv.version, ''), COALESCE(c.severity::TEXT, ''),
-		       ` + caseLikeStateColumn + `
+		       ` + caseLikeStateColumn + `,
+		       cre.name, p.onboarding_status::TEXT, COALESCE(pt.name = $3, FALSE)
 		` + activeSLAStatusFromJoins + `
 		ORDER BY als.work_item_id, als.target
 		LIMIT $1 OFFSET $2`
@@ -151,7 +172,7 @@ func (r *slaStatusRepo) SearchActiveSLAStatuses(ctx context.Context, pagination 
 		return nil
 	})
 	eg.Go(func() error {
-		rows, err := r.db.Query(egCtx, dataQuery, pagination.Limit, pagination.Offset)
+		rows, err := r.db.Query(egCtx, dataQuery, pagination.Limit, pagination.Offset, evaluationSubscriptionProjectTypeName)
 		if err != nil {
 			return fmt.Errorf("query active sla statuses: %w", err)
 		}

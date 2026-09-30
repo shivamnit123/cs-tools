@@ -32,8 +32,9 @@ idle_timeout = "60s"
 max_body_bytes = 1048576
 
 [auth]
-# Vendor-route auth hook. Only "none" exists today: the routes are public.
-mode = "none"
+# Vendor-route auth hook. "integration_users" verifies every request against alerts-core's
+# alertintegration.integration_users table (see that repo's cmd/user/PROVISION.md).
+mode = "integration_users"
 
 [allocator]
 # Alerts waiting to be claimed; when full, new webhooks get 503 immediately.

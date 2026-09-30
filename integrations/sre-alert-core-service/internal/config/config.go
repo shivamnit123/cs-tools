@@ -28,7 +28,7 @@ import (
 // DefaultPath is used when CONFIG_PATH is unset; expected at the repo or deployment root.
 const DefaultPath = "config.toml"
 
-// Config groups every deployment tunable, previously hardcoded constants, by the subsystem it configures.
+// Config groups every deployment tunable, previously hardcoded constants, by the subsystem it configures. Security-sensitive constants (e.g. auth.Iterations, the PBKDF2 round count) intentionally stay as Go constants rather than config.toml fields, since they're not meant to vary per deployment.
 type Config struct {
 	Poll      PollConfig      `toml:"poll"`
 	Cassandra CassandraConfig `toml:"cassandra"`
@@ -46,7 +46,7 @@ type EngineConfig struct {
 
 // PollConfig tunes the alert poller's cadence, concurrency, and per-cycle alert id limits.
 type PollConfig struct {
-	// Interval is the backstop cadence; POST /alert drives real-time pickup, so this only bounds how long a dropped ping goes unnoticed.
+	// Interval is the backstop cadence; POST /alertz drives real-time pickup, so this only bounds how long a dropped ping goes unnoticed.
 	Interval Duration `toml:"interval"`
 	// Concurrency is fingerprint-sharded worker count; same-fingerprint alerts stay serialized on one worker.
 	Concurrency int `toml:"concurrency"`
@@ -96,6 +96,8 @@ type NotifyConfig struct {
 	CSMRetryMultiplier float64 `toml:"csm_retry_multiplier"`
 	// CSMRetryMaxDelay caps how long the exponential CSM retry wait can grow to.
 	CSMRetryMaxDelay Duration `toml:"csm_retry_max_delay"`
+	// Gates CreateIncidentRequest.Environment; off by default since the live connector 400s on it (verified 2026-09-28).
+	SendEnvironmentField bool `toml:"send_environment_field"`
 }
 
 // ServerConfig tunes how long the HTTP server waits for in-flight requests to drain during a graceful shutdown before forcing the process to exit.
@@ -143,16 +145,17 @@ func defaults() Config {
 			QueryTimeout:       Duration(10 * time.Second),
 		},
 		Notify: NotifyConfig{
-			MaxAttempts:        3,
-			RetryBaseDelay:     Duration(200 * time.Millisecond),
-			HTTPTimeout:        Duration(10 * time.Second),
-			RetrySweepInterval: Duration(30 * time.Second),
-			MaxCSMAttempts:     20,
-			ServiceCacheTTL:    Duration(15 * time.Minute),
-			StateCheckInterval: Duration(1 * time.Minute),
-			CSMRetryBaseDelay:  Duration(30 * time.Second),
-			CSMRetryMultiplier: 3,
-			CSMRetryMaxDelay:   Duration(time.Hour),
+			MaxAttempts:          3,
+			RetryBaseDelay:       Duration(200 * time.Millisecond),
+			HTTPTimeout:          Duration(10 * time.Second),
+			RetrySweepInterval:   Duration(30 * time.Second),
+			MaxCSMAttempts:       13,
+			ServiceCacheTTL:      Duration(15 * time.Minute),
+			StateCheckInterval:   Duration(1 * time.Minute),
+			CSMRetryBaseDelay:    Duration(30 * time.Second),
+			CSMRetryMultiplier:   3,
+			CSMRetryMaxDelay:     Duration(time.Hour),
+			SendEnvironmentField: false,
 		},
 		Server: ServerConfig{
 			ShutdownGrace: Duration(15 * time.Second),

@@ -24,7 +24,18 @@ import type {
   ScheduleAssignment,
   ScheduleShift,
 } from "../types";
-import { addDays, groupBy, initialsOf, shortDayName, timeOf, toIsoDate , isPeerRotation } from "../utils/rota";
+import {
+  addDays,
+  escalationGrid,
+  escalationTurnOf,
+  groupBy,
+  initialsOf,
+  isPeerRotation,
+  isTierlessEscalation,
+  shortDayName,
+  timeOf,
+  toIsoDate,
+} from "../utils/rota";
 import { accentOf } from "../utils/rotaHues";
 import { useTeamColour } from "../utils/teamColourContext";
 
@@ -41,6 +52,10 @@ interface MyWeekStripProps {
    *  nothing on it, which is the one thing it is not. */
   myAbsences?: ScheduleAbsence[];
   absenceKinds?: ScheduleAbsenceKind[];
+  /** Open a day in "Who is working today". Clicking a card does this when it
+   *  is given -- the reader wants that day's full view -- and the card's own
+   *  "Who's on" cue still lists the day in place. */
+  onShowDay?: (iso: string) => void;
 }
 
 /** How long the cursor must rest on a day before it opens, so sweeping across
@@ -68,6 +83,7 @@ export default function MyWeekStrip({
   tz,
   myAbsences = [],
   absenceKinds = [],
+  onShowDay,
 }: MyWeekStripProps): JSX.Element {
   const [openDay, setOpenDay] = useState<string | null>(null);
   const timer = useRef<number | null>(null);
@@ -97,7 +113,14 @@ export default function MyWeekStrip({
   // on a weekday is most of the team, and not the Americas night cover, which
   // is that team's own standing shift rather than a turn in the rota.
   const openRows = openDay
-    ? everyone.filter((a) => a.rotaDate === openDay && isPeerRotation(shifts.get(a.shiftCode)))
+    ? everyone.filter(
+        (a) =>
+          a.rotaDate === openDay &&
+          isPeerRotation(shifts.get(a.shiftCode)) &&
+          // A tier-less turn on a zone's escalation window is that zone's
+          // regular hours, not a rotation.
+          !isTierlessEscalation(a, shifts),
+      )
     : [];
   // Two different counts. "Rostered" is any day with something on it, regular
   // hours included; "on rotation" is only a turn on the rota. Counting the first
@@ -139,25 +162,43 @@ export default function MyWeekStrip({
               style={{ ["--rc" as string]: accentOf(shift?.colourToken ?? "lk") }}
               role="button"
               tabIndex={0}
-              aria-expanded={openDay === iso}
-              aria-controls="mywk-peek"
-              aria-label={`${d.toDateString()}: show everyone on rotation`}
+              aria-label={
+                onShowDay ? `${d.toDateString()}: open in Who is working today` : d.toDateString()
+              }
               onMouseEnter={() => hoverOpen(iso)}
               onMouseLeave={cancelHover}
               onFocus={() => setOpenDay(iso)}
-              onClick={() => setOpenDay(openDay === iso ? null : iso)}
+              // The card opens the day in "Who is working today", which is
+              // where a reader clicking a day wants to go. Without that view
+              // to go to, it lists the day in place as it always did.
+              onClick={() => (onShowDay ? onShowDay(iso) : setOpenDay(openDay === iso ? null : iso))}
               onKeyDown={(e) => {
+                if (e.target !== e.currentTarget) return;
                 if (e.key === "Enter" || e.key === " ") {
                   e.preventDefault();
-                  setOpenDay(openDay === iso ? null : iso);
+                  if (onShowDay) onShowDay(iso);
+                  else setOpenDay(openDay === iso ? null : iso);
                 }
               }}
             >
               {iso === todayIso ? <span className="daytag">Today</span> : null}
-              <span className="daysee" aria-hidden="true">
+              {/* The in-place list, on its own control now the card itself
+                  goes to the day view. It stops the click reaching the card. */}
+              <button
+                type="button"
+                className="daysee"
+                aria-expanded={openDay === iso}
+                aria-controls="mywk-peek"
+                aria-label={`${d.toDateString()}: show everyone on rotation`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  cancelHover();
+                  setOpenDay(openDay === iso ? null : iso);
+                }}
+              >
                 <Users size={11} />
                 <span className="dslabel">{openDay === iso ? "Hide" : "Who's on"}</span>
-              </span>
+              </button>
               <span className="dw">{shortDayName(d)}</span>
               <span className="dn tn">{d.getDate()}</span>
               {absence ? (
@@ -208,14 +249,16 @@ export default function MyWeekStrip({
               ×
             </button>
           </div>
-          <PeekRows rows={openRows} shifts={shifts} />
+          <PeekRows rows={openRows} shifts={shifts} iso={openDay} />
         </div>
       ) : (
         <div className="peek peekhint" id="mywk-peek">
           <Users size={16} />
           <span>
-            <b>See who's on rotation with you.</b> Hover over a day above, or tap it, to list
-            everyone rostered that day.
+            <b>See who's on rotation with you.</b>{" "}
+            {onShowDay
+              ? "Hover over a day above, or tap Who's on, to list everyone rostered that day. Click a day to open it in Who is working today."
+              : "Hover over a day above, or tap it, to list everyone rostered that day."}
           </span>
         </div>
       )}
@@ -225,7 +268,11 @@ export default function MyWeekStrip({
           <b>{rosteredCount}</b> of 7 days rostered this week · <b>{onRotaCount}</b> on rotation
         </span>
         {openDay ? (
-          <span className="grp hint">Click the open day again, or ×, to close it</span>
+          <span className="grp hint">
+            {onShowDay
+              ? "Who's on again, or ×, to close it · click a day to open it in Who is working today"
+              : "Click the open day again, or ×, to close it"}
+          </span>
         ) : null}
       </div>
     </>
@@ -236,45 +283,100 @@ export default function MyWeekStrip({
 function PeekRows({
   rows,
   shifts,
+  iso,
 }: {
   rows: ScheduleAssignment[];
   shifts: Map<string, ScheduleShift>;
+  iso: string;
 }): JSX.Element {
   const teamColourOf = useTeamColour();
-  const byShift = useMemo(() => {
-    const groups = [...groupBy(rows, (r) => r.shiftCode).entries()];
-    return groups.sort(
-      (a, b) => (shifts.get(a[0])?.sortOrder ?? 999) - (shifts.get(b[0])?.sortOrder ?? 999),
-    );
-  }, [rows, shifts]);
+
+  /** SRE escalation as a column per zone -- TZ1, TZ2, TZ3 across, and in
+   *  each, L1, L2 and L3 support down -- so "who is L2 in TZ2" is read off
+   *  one column rather than hunted for across a wrapped row of cards. Every
+   *  tier of every zone worked that day is listed, empty ones included, so a
+   *  tier nobody holds reads as a gap. Anything else on the rota that day
+   *  keeps a card per window below. */
+  const { zones, rest } = useMemo(() => {
+    type Group = { key: string; label: string; token: string; list: ScheduleAssignment[]; sort: number };
+    const zoneCols: { zoneCode: string; label: string; tiers: Group[] }[] = [];
+    const byTurn = new Map<string, Group>();
+    if (rows.some((r) => shifts.get(r.shiftCode)?.family === "SRE")) {
+      const sreShifts = [...shifts.values()].filter((sh) => sh.family === "SRE");
+      for (const row of escalationGrid(sreShifts, iso)) {
+        const tiers = row.tiers.map(({ tier }, ti) => {
+          const g: Group = { key: `esc:${row.zoneCode}|${tier}`, label: `${tier} support`, token: tier, list: [], sort: ti };
+          byTurn.set(g.key, g);
+          return g;
+        });
+        zoneCols.push({ zoneCode: row.zoneCode, label: row.label, tiers });
+      }
+    }
+    const others: ScheduleAssignment[] = [];
+    for (const r of rows) {
+      const turn = escalationTurnOf(r, shifts);
+      const g = turn ? byTurn.get(`esc:${turn.zoneCode}|${turn.tier}`) : undefined;
+      if (g) g.list.push(r);
+      else others.push(r);
+    }
+    const restGroups: Group[] = [...groupBy(others, (r) => r.shiftCode).entries()]
+      .map(([code, list]) => {
+        const shift = shifts.get(code);
+        return { key: code, label: shift?.label ?? code, token: shift?.colourToken ?? "", list, sort: shift?.sortOrder ?? 999 };
+      })
+      .sort((x, y) => x.sort - y.sort);
+    return { zones: zoneCols, rest: restGroups };
+  }, [rows, shifts, iso]);
 
   if (rows.length === 0) {
     return <div className="offnone">Nobody is on the rota that day.</div>;
   }
 
+  const names = (list: ScheduleAssignment[]) =>
+    list.map((a) => (
+      <div className="nm" key={a.id}>
+        <span className="av" style={{ background: teamColourOf(a.teamKey) }}>{initialsOf(a.engineer.name)}</span>
+        <span className="who">{a.engineer.name}</span>
+        {a.engineer.isLead ? <span className="tag lead-t">Lead</span> : null}
+      </div>
+    ));
+
   return (
-    <div className="peekgrid">
-      {byShift.map(([code, list]) => {
-        const shift = shifts.get(code);
-        return (
-          <div className="pg" key={code}>
-            <h5>
-              <span className={`chip sm ${shift?.colourToken ?? ""}`}>
-                {shift?.label ?? code}
-              </span>
-              <span className="count">{list.length}</span>
-            </h5>
-            {list.map((a) => (
-              <div className="nm" key={a.id}>
-                <span className="av" style={{ background: teamColourOf(a.teamKey) }}>{initialsOf(a.engineer.name)}</span>
-                <span className="who">{a.engineer.name}</span>
-                {a.engineer.isLead ? <span className="tag lead-t">Lead</span> : null}
-                <span className="team">{a.teamKey}</span>
-              </div>
-            ))}
-          </div>
-        );
-      })}
-    </div>
+    <>
+      {zones.length > 0 ? (
+        <div className="peekzones">
+          {zones.map((z) => (
+            <div className="pz" key={z.zoneCode}>
+              <h5 className="pzh">
+                <span className={`chip sm ${z.zoneCode}`}>{z.label}</span>
+                <span className="count">{z.tiers.reduce((n, t) => n + t.list.length, 0)}</span>
+              </h5>
+              {z.tiers.map((t) => (
+                <div className={`pzt${t.list.length === 0 ? " pgempty" : ""}`} key={t.key}>
+                  <h6>
+                    <span className={`chip sm ${t.token}`}>{t.label}</span>
+                    <span className="count">{t.list.length}</span>
+                  </h6>
+                  {t.list.length === 0 ? <div className="pgnone">Nobody rostered</div> : names(t.list)}
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {rest.length > 0 ? (
+        <div className="peekgrid">
+          {rest.map((g) => (
+            <div className="pg" key={g.key}>
+              <h5>
+                <span className={`chip sm ${g.token}`}>{g.label}</span>
+                <span className="count">{g.list.length}</span>
+              </h5>
+              {names(g.list)}
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </>
   );
 }

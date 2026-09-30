@@ -25,6 +25,7 @@ import (
 	"net/http"
 
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
+	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/servicenow"
 )
 
 // entityScheduleClient abstracts the entity service Team Schedule operations.
@@ -43,6 +44,9 @@ type entityScheduleClient interface {
 	GetMyLeadTeams(ctx context.Context) ([]byte, error)
 	ApplyScheduleRange(ctx context.Context, body []byte) ([]byte, error)
 	ApplyScheduleAbsence(ctx context.Context, body []byte) ([]byte, error)
+	DeleteScheduleAbsence(ctx context.Context, id, note string) ([]byte, error)
+	CreateScheduleAbsenceKind(ctx context.Context, body []byte) ([]byte, error)
+	DeleteScheduleAbsenceKind(ctx context.Context, code string) ([]byte, error)
 	GetScheduleEditMarkers(ctx context.Context, from, to string) ([]byte, error)
 }
 
@@ -285,6 +289,60 @@ func (h *ScheduleHandler) ApplyScheduleAbsence(w http.ResponseWriter, r *http.Re
 	writeJSON(w, http.StatusOK, result)
 }
 
+// DeleteScheduleAbsence handles DELETE /team-schedule/absences/{id} -- the
+// picker removing a whole span of leave or allocation in one click.
+func (h *ScheduleHandler) DeleteScheduleAbsence(w http.ResponseWriter, r *http.Request) {
+	user := middleware.UserInfoFromContext(r.Context())
+	if user == nil {
+		writeError(w, http.StatusUnauthorized, ErrMsgUnauthorized)
+		return
+	}
+
+	if _, err := h.entity.DeleteScheduleAbsence(r.Context(), r.PathValue("id"), r.URL.Query().Get("note")); err != nil {
+		slog.ErrorContext(r.Context(), "entity DeleteScheduleAbsence failed", "userID", user.UserID, "err", err)
+		mapUpstreamErrorGeneric(w, err, "Failed to remove that leave or allocation.")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// CreateScheduleAbsenceKind handles POST /team-schedule/absence-kinds -- a
+// lead adding a leave or allocation tag the catalogue does not have yet.
+func (h *ScheduleHandler) CreateScheduleAbsenceKind(w http.ResponseWriter, r *http.Request) {
+	body, userID, ok := readScheduleBody(w, r)
+	if !ok {
+		return
+	}
+
+	result, err := h.entity.CreateScheduleAbsenceKind(r.Context(), body)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "entity CreateScheduleAbsenceKind failed", "userID", userID, "err", err)
+		mapUpstreamErrorGeneric(w, err, "Failed to add the tag.")
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, result)
+}
+
+// DeleteScheduleAbsenceKind handles DELETE /team-schedule/absence-kinds/{code}
+// -- a lead deleting a tag a lead added, once nothing uses it.
+func (h *ScheduleHandler) DeleteScheduleAbsenceKind(w http.ResponseWriter, r *http.Request) {
+	user := middleware.UserInfoFromContext(r.Context())
+	if user == nil {
+		writeError(w, http.StatusUnauthorized, ErrMsgUnauthorized)
+		return
+	}
+
+	if _, err := h.entity.DeleteScheduleAbsenceKind(r.Context(), r.PathValue("code")); err != nil {
+		slog.ErrorContext(r.Context(), "entity DeleteScheduleAbsenceKind failed", "userID", user.UserID, "err", err)
+		mapUpstreamErrorGeneric(w, err, "Failed to delete the tag.")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // GetScheduleEditMarkers handles GET /team-schedule/edit-markers.
 func (h *ScheduleHandler) GetScheduleEditMarkers(w http.ResponseWriter, r *http.Request) {
 	user := middleware.UserInfoFromContext(r.Context())
@@ -302,4 +360,54 @@ func (h *ScheduleHandler) GetScheduleEditMarkers(w http.ResponseWriter, r *http.
 	}
 
 	writeJSON(w, http.StatusOK, result)
+}
+
+// splScheduleClient abstracts the ServiceNow ABT team schedule operation
+// used by SplScheduleHandler.
+type splScheduleClient interface {
+	GetABTTeamSchedule(ctx context.Context, from, duration, teamID, eventType, teamScheduleURL string) (servicenow.ABTTeamScheduleData, error)
+}
+
+// SplScheduleHandler handles HTTP requests for the ABT team schedule,
+// delegating to the ServiceNow service.
+type SplScheduleHandler struct {
+	servicenow      splScheduleClient
+	accessGuard     *AccessGuard
+	teamScheduleURL string
+}
+
+// NewSplScheduleHandler creates a SplScheduleHandler backed by the given
+// ServiceNow client. accessGuard enforces PermSPLAccess, SupportPortalLite's
+// blanket audience gate; teamScheduleURL is the static URL echoed back in
+// every response (TEAM_SCHEDULE_URL).
+func NewSplScheduleHandler(sn splScheduleClient, accessGuard *AccessGuard, teamScheduleURL string) *SplScheduleHandler {
+	return &SplScheduleHandler{servicenow: sn, accessGuard: accessGuard, teamScheduleURL: teamScheduleURL}
+}
+
+// GetABTTeamSchedule handles GET /abt-team-schedule. All query
+// parameters are optional, mirroring the Ballerina resource function's
+// `string?` parameters.
+func (h *SplScheduleHandler) GetABTTeamSchedule(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireSPLAccess(w, r, h.accessGuard)
+	if !ok {
+		return
+	}
+
+	q := r.URL.Query()
+	from, duration, teamID, eventType := q.Get("from"), q.Get("duration"), q.Get("teamId"), q.Get("eventType")
+	if teamID != "" {
+		if err := servicenow.SanitizeQueryValue(teamID); err != nil {
+			writeError(w, http.StatusBadRequest, ErrMsgBadRequest)
+			return
+		}
+	}
+
+	schedule, err := h.servicenow.GetABTTeamSchedule(r.Context(), from, duration, teamID, eventType, h.teamScheduleURL)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "servicenow GetABTTeamSchedule failed", "userID", user.UserID, "err", err)
+		mapUpstreamErrorGeneric(w, err, "Failed to retrieve team schedule.")
+		return
+	}
+
+	writeJSONValue(w, http.StatusOK, schedule)
 }

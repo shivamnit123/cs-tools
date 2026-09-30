@@ -26,7 +26,13 @@ import {
   DialogTitle,
 } from "@wso2/oxygen-ui";
 import { useState, type JSX } from "react";
-import { formatDateTimeLocal, parseDateTimeLocal } from "@utils/dateTime";
+import {
+  formatDateTimeLocal,
+  parseBackendTimestamp,
+  parseDateTimeLocal,
+  utcMsToZonedInputValue,
+  zonedInputToBackendUtc,
+} from "@utils/dateTime";
 
 const { DateTimePicker, LocalizationProvider } = DatePickers;
 
@@ -53,11 +59,15 @@ export default function CloseOutageDialog({
   onClose,
   onConfirm,
 }: CloseOutageDialogProps): JSX.Element {
-  const [end, setEnd] = useState(() => formatDateTimeLocal(new Date()));
+  // Wall-clock in the user's timezone, like the picker's own value.
+  const [end, setEnd] = useState(() => utcMsToZonedInputValue(Date.now()));
   const endDate = parseDateTimeLocal(end);
-  const beginDate = parseDateTimeLocal(begin.replace(" ", "T").slice(0, 16));
-  const endBeforeBegin = !!beginDate && !!endDate && endDate.getTime() < beginDate.getTime();
-  const canConfirm = !!endDate && !endBeforeBegin && !isSaving;
+  // Compare real instants: `begin` is UTC, `end` is the user's wall-clock.
+  const endUtc = zonedInputToBackendUtc(end);
+  const beginInstant = parseBackendTimestamp(begin);
+  const endBeforeBegin =
+    !!beginInstant && !!endUtc && parseBackendTimestamp(endUtc)!.getTime() < beginInstant.getTime();
+  const canConfirm = !!endDate && !!endUtc && !endBeforeBegin && !isSaving;
 
   return (
     <Dialog open onClose={onClose} maxWidth="xs" fullWidth>
@@ -90,7 +100,7 @@ export default function CloseOutageDialog({
         <Button
           variant="contained"
           color="success"
-          onClick={() => onConfirm(`${end.replace("T", " ")}:00`)}
+          onClick={() => endUtc && onConfirm(endUtc)}
           disabled={!canConfirm}
         >
           {isSaving ? "Closing…" : "Close outage"}

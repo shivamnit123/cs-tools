@@ -16,8 +16,8 @@
  * under the License.
  */
 
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import MyWeekStrip from "./MyWeekStrip";
 import {
@@ -26,6 +26,10 @@ import {
   MONDAY,
   REGULAR,
   TZ,
+  TZ1,
+  TZ1_L1,
+  TZ2,
+  TZ3,
   absence,
   assignment,
   shiftMap,
@@ -78,5 +82,53 @@ describe("MyWeekStrip", () => {
       myAbsences: [absence({ name: "Asela", startsOn: "2026-09-22", endsOn: "2026-09-22" })],
     });
     expect(screen.getAllByText("AL").length).toBeGreaterThan(0);
+  });
+});
+
+describe("MyWeekStrip: the open day's SRE escalation", () => {
+  it("lays out a column per zone, each listing L1, L2 and L3 support", () => {
+    const tiered = (name: string, shiftCode: string, zoneCode: string, tier: "L1" | "L2" | "L3") => ({
+      ...assignment({ name, rotaDate: "2026-09-21", shiftCode, zoneCode }),
+      tier,
+    });
+    const { container } = renderStrip({
+      shifts: shiftMap(TZ1, TZ1_L1, TZ2, TZ3),
+      everyone: [
+        tiered("Jane", TZ1_L1.code, "TZ1", "L1"),
+        tiered("John", TZ1.code, "TZ1", "L2"),
+        tiered("Ada", TZ2.code, "TZ2", "L3"),
+      ],
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Mon Sep 21 2026: show everyone on rotation/ }));
+    const columns = [...container.querySelectorAll(".peekzones .pz")];
+    expect(columns.map((c) => c.querySelector(".pzh .chip")?.textContent)).toEqual(["TZ1", "TZ2", "TZ3"]);
+    for (const c of columns) {
+      expect([...c.querySelectorAll(".pzt h6 .chip")].map((e) => e.textContent)).toEqual([
+        "L1 support",
+        "L2 support",
+        "L3 support",
+      ]);
+    }
+    const tier = (col: number, t: number) => columns[col].querySelectorAll(".pzt")[t];
+    expect(tier(0, 1)).toHaveTextContent("John");
+    expect(tier(1, 2)).toHaveTextContent("Ada");
+    expect(tier(0, 2)).toHaveTextContent("Nobody rostered");
+  });
+});
+
+describe("MyWeekStrip: a day card opens that day's view", () => {
+  it("goes to the day when a card is clicked, and lists it in place from Who's on", () => {
+    const onShowDay = vi.fn();
+    const { container } = renderStrip({
+      onShowDay,
+      everyone: [assignment({ name: "Asela", rotaDate: "2026-09-23", shiftCode: EVENING.code })],
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Wed Sep 23 2026: open in Who is working today/ }));
+    expect(onShowDay).toHaveBeenCalledWith("2026-09-23");
+
+    onShowDay.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: /Wed Sep 23 2026: show everyone on rotation/ }));
+    expect(onShowDay).not.toHaveBeenCalled();
+    expect(container.querySelector(".peekgrid")).toHaveTextContent("Asela");
   });
 });

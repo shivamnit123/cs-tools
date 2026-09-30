@@ -330,11 +330,20 @@ func TestBuildChangeRequestApprovals_PositionalLabelsAndFirstResponderWinsStatus
 	}
 	updatedOn := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
 	approvers := []changeRequestApprovalApproverRow{
-		{id: "appr-1", stageID: strPtrApproval("stage-1"), approverName: "Alice", rawStatus: strPtrApproval("approved"), updatedOn: updatedOn},
-		{id: "appr-2", stageID: strPtrApproval("stage-2"), approverName: "Bob", rawStatus: strPtrApproval("requested"), updatedOn: updatedOn},
-		{id: "appr-3", stageID: strPtrApproval("stage-2"), approverName: "Carol", rawStatus: strPtrApproval("rejected"), updatedOn: updatedOn},
+		// appr-1's approverUserID ("user-1") must end up as the domain
+		// approver's own ID -- not "appr-1" itself (the junction row's own
+		// id) -- see changeRequestApprovalApproversQuery's own doc comment
+		// for the real bug this guards against: isMyPendingApproval
+		// (webapp) can only ever match a real user id, never a junction
+		// row's id.
+		{id: "appr-1", stageID: strPtrApproval("stage-1"), approverUserID: strPtrApproval("user-1"), approverName: "Alice", rawStatus: strPtrApproval("approved"), updatedOn: updatedOn},
+		{id: "appr-2", stageID: strPtrApproval("stage-2"), approverUserID: strPtrApproval("user-2"), approverName: "Bob", rawStatus: strPtrApproval("requested"), updatedOn: updatedOn},
+		// approverUserID nil (approver_user_id null, or a since-deleted
+		// user) -- must fall back to the junction row's own id rather than
+		// an empty string.
+		{id: "appr-3", stageID: strPtrApproval("stage-2"), approverUserID: nil, approverName: "Carol", rawStatus: strPtrApproval("rejected"), updatedOn: updatedOn},
 		// stage_id NULL -- must be dropped, not attached to any stage.
-		{id: "appr-4", stageID: nil, approverName: "Orphan", rawStatus: strPtrApproval("requested"), updatedOn: updatedOn},
+		{id: "appr-4", stageID: nil, approverUserID: strPtrApproval("user-4"), approverName: "Orphan", rawStatus: strPtrApproval("requested"), updatedOn: updatedOn},
 	}
 
 	got := buildChangeRequestApprovals(stages, approvers)
@@ -356,6 +365,9 @@ func TestBuildChangeRequestApprovals_PositionalLabelsAndFirstResponderWinsStatus
 	if len(a0.Approvers) != 1 || a0.Approvers[0].RespondedOn == nil {
 		t.Errorf("stage 0 approvers = %+v, want 1 approver with a non-nil RespondedOn", a0.Approvers)
 	}
+	if got := a0.Approvers[0].ID; got != "user-1" {
+		t.Errorf("stage 0 approver ID = %q, want the resolved user id %q, not the junction row's own id", got, "user-1")
+	}
 
 	a1 := got.Approvals[1]
 	if a1.Stage != "Authorize" || a1.ApproverType != domain.ChangeRequestApproverTypeStaticGroup {
@@ -372,6 +384,18 @@ func TestBuildChangeRequestApprovals_PositionalLabelsAndFirstResponderWinsStatus
 	for _, ap := range a1.Approvers {
 		if ap.Status == "REQUESTED" && ap.RespondedOn != nil {
 			t.Errorf("REQUESTED approver %q has non-nil RespondedOn %v, want nil", ap.Name, *ap.RespondedOn)
+		}
+		switch ap.Name {
+		case "Bob":
+			if ap.ID != "user-2" {
+				t.Errorf("Bob's ID = %q, want the resolved user id %q", ap.ID, "user-2")
+			}
+		case "Carol":
+			// approverUserID was nil for this row -- falls back to the
+			// junction row's own id ("appr-3"), never an empty string.
+			if ap.ID != "appr-3" {
+				t.Errorf("Carol's ID = %q, want the junction row's own id %q (approverUserID was nil)", ap.ID, "appr-3")
+			}
 		}
 	}
 
@@ -399,4 +423,70 @@ func TestBuildChangeRequestApprovals_NoStages(t *testing.T) {
 	if len(got.Approvals) != 0 {
 		t.Errorf("got %d approvals, want 0", len(got.Approvals))
 	}
+}
+
+// TestLegalChangeRequestNextStates pins the empirically-derived forward
+// graph (see legalChangeRequestNextStates's own doc comment for how each
+// edge was confirmed against a live ServiceNow instance) -- a change to
+// this table changes what a caller is allowed to promote a change request
+// to, so a regression here would silently offer or withhold a real action.
+func TestLegalChangeRequestNextStates(t *testing.T) {
+	strPtr := func(s string) *string { return &s }
+
+	tests := []struct {
+		state string
+		want  []string
+	}{
+		{string(domain.ChangeRequestStateNew), []string{"assess", "canceled"}},
+		{string(domain.ChangeRequestStateAssess), []string{"authorize", "canceled"}},
+		// Authorize and Review each have two confirmed forward moves (see
+		// changeRequestForwardNextStates' own doc comment) -- checking
+		// several real records directly disproved the "one common case"
+		// assumption an earlier revision of this map made.
+		{string(domain.ChangeRequestStateAuthorize), []string{"scheduled", "customer_approval", "canceled"}},
+		{string(domain.ChangeRequestStateCustomerApproval), []string{"scheduled", "canceled"}},
+		{string(domain.ChangeRequestStateScheduled), []string{"implement", "canceled"}},
+		{string(domain.ChangeRequestStateImplement), []string{"review", "canceled"}},
+		{string(domain.ChangeRequestStateReview), []string{"closed", "customer_review", "canceled"}},
+		{string(domain.ChangeRequestStateCustomerReview), []string{"closed", "canceled"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.state, func(t *testing.T) {
+			got := legalChangeRequestNextStates(strPtr(tc.state))
+			if len(got) != len(tc.want) {
+				t.Fatalf("legalChangeRequestNextStates(%q) = %v, want %v", tc.state, got, tc.want)
+			}
+			for i, want := range tc.want {
+				if got[i] != want {
+					t.Errorf("legalChangeRequestNextStates(%q)[%d] = %q, want %q", tc.state, i, got[i], want)
+				}
+			}
+		})
+	}
+
+	t.Run("terminal states have no legal next state", func(t *testing.T) {
+		for _, terminal := range []domain.ChangeRequestState{
+			domain.ChangeRequestStateRollback,
+			domain.ChangeRequestStateClosed,
+			domain.ChangeRequestStateCanceled,
+		} {
+			s := string(terminal)
+			if got := legalChangeRequestNextStates(&s); got != nil {
+				t.Errorf("legalChangeRequestNextStates(%q) = %v, want nil (terminal)", s, got)
+			}
+		}
+	})
+
+	t.Run("nil state is nil", func(t *testing.T) {
+		if got := legalChangeRequestNextStates(nil); got != nil {
+			t.Errorf("legalChangeRequestNextStates(nil) = %v, want nil", got)
+		}
+	})
+
+	t.Run("unrecognized state is nil, not a guess", func(t *testing.T) {
+		s := "some_future_state_this_repo_does_not_know_about"
+		if got := legalChangeRequestNextStates(&s); got != nil {
+			t.Errorf("legalChangeRequestNextStates(%q) = %v, want nil", s, got)
+		}
+	})
 }

@@ -535,7 +535,6 @@ export interface ChangeRequestDraft {
   type: string;
   impact: string;
   priority: string;
-  state: string;
   plannedStartDate: string;
   plannedEndDate: string;
   description: string;

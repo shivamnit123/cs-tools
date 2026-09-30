@@ -18,6 +18,8 @@
 
 import { describe, expect, it } from "vitest";
 import type { ScheduleAssignment, ScheduleShift } from "../types";
+import { TZ1, TZ1_L1, TZ1_WE, TZ2, TZ2_WE, TZ3, REGULAR } from "../test/fixtures";
+import { escalationGrid, kindsOfferedOn, monthPieces, readerFamily, rosterRange, zoneLabelOn } from "./rota";
 import {
   dayLabel,
   zoneAbbreviation,
@@ -233,5 +235,134 @@ describe("standingWindowKey", () => {
 
   it("falls back to the code when the catalogue has no such shift", () => {
     expect(standingWindowKey(undefined, "MYSTERY")).toBe("MYSTERY");
+  });
+});
+
+describe("escalationGrid", () => {
+  const all = [TZ1, TZ1_L1, TZ2, TZ3, TZ1_WE, TZ2_WE, REGULAR];
+
+  it("offers L1, L2 and L3 in every weekday zone", () => {
+    const grid = escalationGrid(all, "2026-09-23"); // a Wednesday
+    expect(grid.map((r) => r.zoneCode)).toEqual(["TZ1", "TZ2", "TZ3"]);
+    for (const row of grid) expect(row.tiers.map((t) => t.tier)).toEqual(["L1", "L2", "L3"]);
+  });
+
+  it("puts a tier on the window that fixes it, else on the zone's open window", () => {
+    const tz1 = escalationGrid(all, "2026-09-23")[0];
+    expect(tz1.tiers.map((t) => t.shift?.code)).toEqual(["SRE_TZ1_L1", "SRE_TZ1", "SRE_TZ1"]);
+    const tz3 = escalationGrid(all, "2026-09-23")[2];
+    expect(tz3.tiers.map((t) => t.shift?.code)).toEqual(["SRE_TZ3", "SRE_TZ3", "SRE_TZ3"]);
+  });
+
+  it("uses the weekend windows on a weekend", () => {
+    const grid = escalationGrid(all, "2026-09-26"); // a Saturday
+    expect(grid.map((r) => r.zoneCode)).toEqual(["TZ1", "TZ2"]);
+    expect(grid[0].tiers[2].shift?.code).toBe("SRE_WE_TZ1");
+  });
+
+  it("is empty for a group with no escalation windows", () => {
+    expect(escalationGrid([REGULAR], "2026-09-23")).toEqual([]);
+  });
+});
+
+describe("zoneLabelOn", () => {
+  const WE_TZ12 = { ...TZ1_WE, shortCode: "TZ1+2", label: "Weekend TZ1 + TZ2" };
+  it("names the combined weekend crew from its window", () => {
+    expect(zoneLabelOn([TZ1, WE_TZ12, TZ3], "TZ1", true)).toBe("TZ1+2");
+  });
+  it("is the zone's own code on a weekday, and for a zone with no weekend window of its own", () => {
+    expect(zoneLabelOn([TZ1, WE_TZ12, TZ3], "TZ1", false)).toBe("TZ1");
+    expect(zoneLabelOn([TZ1, WE_TZ12, TZ3], "TZ3", true)).toBe("TZ3");
+  });
+});
+
+describe("kindsOfferedOn", () => {
+  const kind = (code: string, over: Partial<import("../types").ScheduleAbsenceKind> = {}) => ({
+    id: code,
+    code,
+    shortCode: code,
+    label: code,
+    bucket: "ALLOCATION" as const,
+    colourToken: "",
+    sortOrder: 0,
+    ...over,
+  });
+  const catalogue = [
+    kind("ANNUAL_LEAVE", { bucket: "LEAVE" }),
+    kind("ALLO_INT"),
+    kind("ALLO_EXT"),
+    kind("ALLO_BR"),
+    kind("RND", { family: "SRE" }),
+    kind("MIGRATION", { family: "CRE" }),
+    kind("CUSTOMER_OFFSITE", { retired: true }),
+    kind("EXCLUDED", { bucket: "EXCLUDED" }),
+  ];
+  const codes = (family: "CRE" | "SRE") => kindsOfferedOn(catalogue, family).map((k) => k.code);
+
+  it("offers CRE its own allocations and the shared ones, never RnD", () => {
+    expect(codes("CRE")).toEqual(["ANNUAL_LEAVE", "ALLO_INT", "ALLO_EXT", "ALLO_BR", "MIGRATION"]);
+  });
+
+  it("offers SRE RnD and the shared ones, never Migration", () => {
+    expect(codes("SRE")).toEqual(["ANNUAL_LEAVE", "ALLO_INT", "ALLO_EXT", "ALLO_BR", "RND"]);
+  });
+
+  it("never offers a retired kind or EXCLUDED", () => {
+    for (const f of ["CRE", "SRE"] as const) {
+      expect(codes(f)).not.toContain("CUSTOMER_OFFSITE");
+      expect(codes(f)).not.toContain("EXCLUDED");
+    }
+  });
+});
+
+describe("rosterRange and monthPieces", () => {
+  const MON = new Date(2026, 8, 28); // Mon 28 Sept 2026
+
+  it("centres each span on the selected day", () => {
+    const one = rosterRange(MON, 1);
+    expect([toIsoDate(one.start), toIsoDate(one.end)]).toEqual(["2026-09-14", "2026-10-12"]);
+    const three = rosterRange(MON, 3);
+    expect([toIsoDate(three.start), toIsoDate(three.end)]).toEqual(["2026-08-14", "2026-11-12"]);
+    const six = rosterRange(MON, 6);
+    expect([toIsoDate(six.start), toIsoDate(six.end)]).toEqual(["2026-06-29", "2026-12-28"]);
+  });
+
+  it("cuts a range into the months it touches, clipped at both ends", () => {
+    expect(monthPieces(new Date(2026, 8, 14), new Date(2026, 9, 12))).toEqual([
+      { from: "2026-09-14", to: "2026-09-30" },
+      { from: "2026-10-01", to: "2026-10-12" },
+    ]);
+  });
+
+  it("keeps a whole month whole, across a year end", () => {
+    expect(monthPieces(new Date(2026, 10, 20), new Date(2027, 1, 3))).toEqual([
+      { from: "2026-11-20", to: "2026-11-30" },
+      { from: "2026-12-01", to: "2026-12-31" },
+      { from: "2027-01-01", to: "2027-01-31" },
+      { from: "2027-02-01", to: "2027-02-03" },
+    ]);
+  });
+});
+
+describe("readerFamily", () => {
+  it("takes the reader's team where they have one", () => {
+    expect(readerFamily("SRE-ABT", ["cre_rota_admin"])).toBe("SRE");
+    expect(readerFamily("cre-abt", [])).toBe("CRE");
+  });
+
+  it("gives a rota admin with no team the group they run", () => {
+    expect(readerFamily(undefined, ["cre_rota_admin"])).toBe("CRE");
+    expect(readerFamily(null, ["directory.sre_rota_admin"])).toBe("SRE");
+  });
+
+  it("reads a rota admin's group from the teams they may edit, when the sign-in has no role", () => {
+    expect(readerFamily(undefined, ["cs_engineer"], ["CRE", "CRE"])).toBe("CRE");
+    expect(readerFamily(undefined, [], ["SRE"])).toBe("SRE");
+    expect(readerFamily(undefined, [], ["CRE", "SRE"])).toBeUndefined();
+  });
+
+  it("is nobody's group with neither role, or both", () => {
+    expect(readerFamily(undefined, ["admin"])).toBeUndefined();
+    expect(readerFamily(undefined, ["cre_rota_admin", "sre_rota_admin"])).toBeUndefined();
   });
 });

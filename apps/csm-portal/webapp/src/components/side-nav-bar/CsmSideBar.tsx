@@ -201,7 +201,7 @@ export default function CsmSideBar({
   // it. featureState/visibleNavChildren still apply (a deployment can still
   // WIP/hide an individual spl.* page via CSM_PORTAL_FEATURE_OVERRIDES), but
   // there is no per-user PortalAccess capability gating here — SPL's own
-  // access model is the separate useSplAccess audience gate (see
+  // access model is the separate useAccess audience gate (see
   // usePortalView.ts), not this app's `requires` mechanism.
   const splNode = view === "sales-sa" ? navNodeById("spl") : undefined;
   const splItems = splNode ? visibleNavChildren(splNode, access) : [];

@@ -14,16 +14,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Package auth is the vendor-route auth hook. Only "none" exists today: the
-// vendor URLs are public until an auth method is chosen, and the Choreo gateway rate limit is
-// the only protection. Adding Basic auth or a shared-secret header later is a new
-// Authenticator selected by auth.mode, not a restructure of the router.
+// Package auth is the vendor-route auth hook. "integration_users" is the only mode: it verifies
+// every vendor webhook against alerts-core's alertintegration.integration_users Cassandra table
+// (the same PBKDF2-hashed service-account store sre-alert-core-service uses), so both services
+// share one place to provision and rotate credentials.
 package auth
 
 import (
 	"errors"
 	"fmt"
 	"net/http"
+
+	"github.com/gocql/gocql"
 )
 
 // ErrUnauthorized is returned by an Authenticator that rejects a request; the router answers 401.
@@ -35,18 +37,12 @@ type Authenticator interface {
 	Authenticate(r *http.Request, vendor string) error
 }
 
-// None accepts every request.
-type None struct{}
-
-// Authenticate always succeeds.
-func (None) Authenticate(*http.Request, string) error { return nil }
-
 // New returns the Authenticator for auth.mode, or an error for an unknown mode so a typo in
 // config.toml fails at startup instead of silently leaving the routes open.
-func New(mode string) (Authenticator, error) {
+func New(mode string, session *gocql.Session) (Authenticator, error) {
 	switch mode {
-	case "none":
-		return None{}, nil
+	case "integration_users":
+		return NewIntegrationUsers(session), nil
 	default:
 		return nil, fmt.Errorf("unknown auth.mode %q", mode)
 	}

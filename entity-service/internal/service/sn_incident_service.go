@@ -681,11 +681,14 @@ type snCreateIncidentPayload struct {
 	// comment. Maps to ServiceNow's stock `correlation_id` field.
 	CorrelationID *string `json:"correlationId,omitempty"`
 	// Environment: see domain.CreateIncidentRequest.Environment doc comment.
-	// Maps to ServiceNow's own custom incident.u_enviroment field -- the
-	// JSON key here is that field's exact name (misspelling included), not
-	// a rewritten "environment", since this is what the Choreo connector's
-	// own contract exposes for a custom field.
-	Environment *string `json:"u_enviroment,omitempty"`
+	// Maps to ServiceNow's own custom incident.u_enviroment field, but the
+	// Choreo connector's CREATE record spells the JSON key correctly as
+	// u_environment -- confirmed by a live Azure-Staging 400, "data binding
+	// failed: undefined field 'u_enviroment'", when the misspelled key
+	// (used on PATCH, see snUpdateIncidentPayload.Environment) was sent
+	// here instead. The two operations' generated records disagree on the
+	// key's spelling; this is CREATE-only.
+	Environment *string `json:"u_environment,omitempty"`
 }
 
 // snCreateIncidentResponse mirrors the Choreo POST /incidents response.

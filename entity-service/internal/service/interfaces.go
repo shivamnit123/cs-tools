@@ -1294,3 +1294,51 @@ type OutageService interface {
 	// channels, monitored clouds) needed to render an outage create/edit form.
 	GetOutageMetadata(ctx context.Context) (domain.OutageMetadataResponse, error)
 }
+
+// CloudStatusDashboardService serves what the public cloud status dashboard
+// renders, replacing five ServiceNow Scripted REST APIs with Postgres reads.
+// Read-only: the dashboard must never be able to change what it shows.
+type CloudStatusDashboardService interface {
+	// Monitors returns the per-region, per-group monitor view for one cloud.
+	Monitors(ctx context.Context, cloud string) (domain.CloudStatusMonitorsResponse, error)
+	// Incidents returns six months of incident history for one cloud, with
+	// every month key present whether or not it has incidents.
+	Incidents(ctx context.Context, cloud string) (domain.CloudStatusIncidentsResponse, error)
+	// Availabilities returns one weighted uptime figure per region per
+	// window: the port of the /availabilities resource.
+	Availabilities(ctx context.Context, cloud string) (domain.CloudAvailabilitiesResponse, error)
+	// AvailabilityHistory returns the 90-day daily uptime chart, nested
+	// region -> group -> monitor: the port of the /history resource.
+	AvailabilityHistory(ctx context.Context, cloud string) (domain.CloudAvailabilityHistoryResponse, error)
+	// IncidentDetail returns one outage's public detail view, or nil when no
+	// outage with that id belongs to that cloud. The concrete type varies:
+	// a full detail object, or an attachments-only one when the outage's
+	// incident does not qualify -- both are the source's shapes.
+	IncidentDetail(ctx context.Context, id, cloud string) (any, error)
+}
+
+// CloudStatusService decides which outages owe the public status dashboard a
+// webhook, and records what was delivered.
+//
+// The port of ServiceNow's `Cloud Status Event Notification Flow`. It decides
+// and records only; the posting is done by csm-scheduled-tasks, the same
+// division the outage and query-hour notices use.
+type CloudStatusService interface {
+	// Sweep records a webhook for every in-scope outage transition not
+	// already recorded. It is idempotent: a sweep that finds nothing new
+	// records nothing, which is the steady state.
+	Sweep(ctx context.Context) (domain.CloudStatusSweepResponse, error)
+
+	// PendingWebhooks returns the webhooks still owed to the dashboard, with
+	// their cloud already translated to the dashboard's slug.
+	PendingWebhooks(ctx context.Context) (domain.PendingCloudStatusWebhooksResponse, error)
+
+	// RecordDelivery stamps the outcome of one attempt. A ValidationError is
+	// returned when a failure is reported without an error message.
+	RecordDelivery(ctx context.Context, req domain.RecordCloudStatusDeliveryRequest) error
+
+	// HandleOutages re-derives the current transition for the named outages.
+	// The record-triggered counterpart to Sweep, reaching the same conclusions
+	// by the same code -- see CloudStatusDrainer.
+	HandleOutages(ctx context.Context, outageIDs []string) error
+}

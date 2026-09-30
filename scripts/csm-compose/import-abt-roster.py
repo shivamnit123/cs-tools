@@ -78,6 +78,15 @@ ABSENCES = {
     "ll": ("LIEU_LEAVE", None),
     "l": ("LIEU_LEAVE", None),  # one cell in 2026; LL with the second L missing
     "sl": ("SICK_LEAVE", None),
+    # ML on the sheet is Maternity leave, confirmed by the people who keep the
+    # sheet. It was mapped to SICK_LEAVE for a while on the reading that it
+    # meant Medical leave; that was wrong, and it filed real maternity leave as
+    # sick leave.
+    #
+    # The sheet itself says so twice over, which is worth recording because the
+    # short-code coincidence is genuinely confusing: SL above is already sick
+    # leave, so a second code for the same thing would be redundant, and PL
+    # directly below is paternity. ML and PL are a pair.
     "ml": ("MATERNITY_LEAVE", None),
     "pl": ("PATERNITY_LEAVE", None),
     "mig": ("MIGRATION", None),
@@ -86,8 +95,12 @@ ABSENCES = {
     "mig-rota": ("MIGRATION", None),
     "on-boarding": ("ONBOARDING", None),
     "exclude": ("EXCLUDED", None),
-    "allo-ext": ("CUSTOMER_OFFSITE", None),
-    "allo-int": ("RND", None),
+    # Allo-EXT and Allo-INT are the catalogue's own external / internal
+    # allocation kinds. They used to be filed as a customer allocation and as
+    # RnD; both were retired from CRE's list (RnD is SRE's), so they land on
+    # the kinds a lead now picks for the same thing.
+    "allo-ext": ("ALLO_EXT", None),
+    "allo-int": ("ALLO_INT", None),
     "allo-br": ("ALLO_BR", None),
 }
 
@@ -105,12 +118,19 @@ CANONICAL_TEAM_KEYS = {
 }
 
 CUSTOMER_PREFIX = "allo-"
-CUSTOMER_KIND = "CUSTOMER_OFFSITE"
+# A named customer ("Allo-Acme") is external work, with the customer kept as
+# allocated_to -- the same kind 0154 moves older customer allocations onto.
+CUSTOMER_KIND = "ALLO_EXT"
+
+# What follows Allo- when it names the Brazil rotation rather than a customer.
+# tokens() has already stripped the spaces and lowercased by this point, so
+# "Allo-BR Rotation" arrives as "allo-brrotation".
+BRAZIL_ROTATION = re.compile(r"(br|brazil|brasil)(rotation|rota)?")
 
 # Kinds whose span may run across a weekend with nothing written on it. An
 # allocation or an exclusion does not stop for a Saturday; leave does -- a
 # Friday and a Monday off are two separate absences, not four days.
-BRIDGES_WEEKENDS = {"MIGRATION", "ONBOARDING", "EXCLUDED", "CUSTOMER_OFFSITE", "CUSTOMER_ONSITE", "RND", "ALLO_BR"}
+BRIDGES_WEEKENDS = {"MIGRATION", "ONBOARDING", "EXCLUDED", "ALLO_EXT", "ALLO_INT", "RND", "ALLO_BR"}
 
 # Cells whose meaning is their colour alone -- no text, the fill of a code.
 # Only these fills, and only on an otherwise empty cell.
@@ -240,6 +260,17 @@ def main(xlsx, sheet, out_path):
                 elif code in ABSENCES:
                     kind, to = ABSENCES[code]
                     days_by_person[mail].setdefault(d, (key, []))[1].append((kind, to))
+                elif code.startswith(CUSTOMER_PREFIX) and BRAZIL_ROTATION.fullmatch(
+                    code[len(CUSTOMER_PREFIX):]
+                ):
+                    # Brazil is a rotation the team takes a turn at, not a
+                    # customer somebody is allocated to. Only the exact
+                    # 'Allo-BR' reached ABSENCES above, so every other way the
+                    # sheet writes it -- Allo-Brazil, Allo-BR Rotation, which
+                    # loses its space in tokens() -- fell through to the
+                    # customer branch and became an off-site allocation to a
+                    # customer named Brazil.
+                    days_by_person[mail].setdefault(d, (key, []))[1].append(("ALLO_BR", None))
                 elif code.startswith(CUSTOMER_PREFIX):
                     # From the original cell, so 'Allo-Acme' keeps the casing
                     # the sheet wrote -- but matched against THIS code, not the

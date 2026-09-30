@@ -26,7 +26,11 @@ paths:
         Entity Account, only when CSM_MIGRATION_SALESFORCE_ACCOUNT_INGEST_ENABLED=true
         (otherwise acknowledged and ignored): fetches the Account via REST
         sales/sales-entity-service POST /customer-search (isRealTime true), not GraphQL
-        sales/entity-graphql-service, and upserts the csm-platform account table.
+        sales/entity-graphql-service, and upserts the csm-platform account table
+        (Salesforce-owned columns only) with its salesforce_ingest_state ledger row;
+        a replay whose lastModifiedDate is not newer than the ledger is a 204 no-op,
+        a customer without a name is a 204 recorded FAILED in the ledger, and
+        DELETED sets account.deleted_on (RESTORED clears it) instead of deleting.
         Entity Project_Contact__c (also accepted as Project_Contact), only when
         CSM_MIGRATION_SALESFORCE_MEMBERSHIP_INGEST_ENABLED=true: CREATED/UPDATED/RESTORED fetch
         the membership and its Contact (POST /project-contacts/search,
@@ -1164,6 +1168,325 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /cloud-status/monitors:
+    get:
+      summary: >-
+        The public cloud status dashboard's monitor view for one cloud, keyed
+        by region and grouped as the page renders it. Replaces the ServiceNow
+        Scripted REST API `monitors` that wso2-enterprise/uptime-dashboard
+        calls today; the response shape is that dashboard's and is reproduced
+        field for field.
+      operationId: getCloudStatusMonitors
+      parameters:
+        - name: cloud
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [asgardeo, choreo, bijira, devant, moesif, choreo-eu, agent-manager]
+          description: >-
+            Seven clouds, where the ServiceNow script accepted five. choreo-eu
+            and agent-manager have monitors and a dashboard but have never
+            been reachable, because the notification flow's URL script has no
+            branch for them.
+      responses:
+        "200":
+          description: >-
+            An object keyed by region ("cp - us", "eu - dp - eu"), each holding
+            the groups shown in that column.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/CloudStatusMonitorGroup'
+        "400":
+          description: BadRequest — unknown cloud.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: InternalServerError.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /cloud-status/incidents:
+    get:
+      summary: >-
+        Six months of incident history for one cloud, keyed "YYYY-M". Every
+        month key is present whether or not it has incidents — the dashboard
+        renders a row per key, so omitting empty months would shorten the page.
+      operationId: getCloudStatusIncidents
+      parameters:
+        - name: cloud
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [asgardeo, choreo, bijira, devant, moesif, choreo-eu, agent-manager]
+      responses:
+        "200":
+          description: Six month keys, newest first in the dashboard's rendering.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  $ref: '#/components/schemas/CloudStatusIncidentMonth'
+        "400":
+          description: BadRequest — unknown cloud.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: InternalServerError.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /cloud-status/availabilities:
+    get:
+      summary: >-
+        Weighted uptime for one cloud, one figure per region per window.
+        Replaces the ServiceNow Scripted REST API `/availabilities`. Each
+        region's figure is a weighted average over the service offerings
+        beneath one parent service; the weights are a product decision that
+        exists only in the deployed ServiceNow script and is reproduced
+        verbatim, not recomputed.
+      operationId: getCloudStatusAvailabilities
+      parameters:
+        - name: cloud
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [asgardeo, choreo, bijira, devant, moesif, choreo-eu, agent-manager]
+      responses:
+        "200":
+          description: >-
+            An object keyed by region ("cp", "us - dp", "eu - dp - eu"), each
+            holding exactly four windows in the order the dashboard renders
+            them: last 7 days, last 30 days, last 90 days, last 12 months.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/CloudAvailabilityWindow'
+        "400":
+          description: BadRequest — unknown cloud.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: InternalServerError.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /cloud-status/availability-history:
+    get:
+      summary: >-
+        The 90-day daily uptime chart for one cloud, nested region → group →
+        monitor. Replaces the ServiceNow Scripted REST API `/history`. Unlike
+        the availabilities endpoint this one applies no weighting at all.
+      operationId: getCloudStatusAvailabilityHistory
+      parameters:
+        - name: cloud
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [asgardeo, choreo, bijira, devant, moesif, choreo-eu, agent-manager]
+      responses:
+        "200":
+          description: >-
+            An object keyed by region, each holding the groups shown in that
+            column. A monitor with no daily data carries an empty history
+            rather than a fabricated figure.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/AvailabilityHistoryGroup'
+        "400":
+          description: BadRequest — unknown cloud.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: InternalServerError.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /cloud-status/incidents/{id}:
+    get:
+      summary: >-
+        One outage's public detail view. Replaces the ServiceNow Scripted
+        REST API `/incident/{sys_id}`.
+      description: >
+        *** THE 200 BODY HAS TWO SHAPES, AND THE SPARSE ONE IS THE COMMON
+        CASE. *** The ServiceNow script builds its payload from an incident
+        lookup gated on state, then assigns attachments onto whatever came
+        back. An outage with no linked incident — or one whose incident is
+        still New, On Hold or Canceled — therefore yields an object carrying
+        only `attachments`, with no id, begin or type. That is the majority
+        of outages. Reproduced rather than normalised, because the frontend
+        already handles it.
+
+
+        `comments` come from the outage's external communications, NOT from
+        the linked incident's comments. Postgres holds incident comments,
+        work notes and approval history; publishing those here would put
+        internal commentary on a public page, and ServiceNow does not.
+
+
+        `attachments` is always empty: nothing in Postgres stores outage
+        attachments, nothing writes any, and the dashboard frontend never
+        reads the field.
+      operationId: getCloudStatusIncidentDetail
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: The outage id.
+        - name: cloud
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [asgardeo, choreo, bijira, devant, moesif, choreo-eu, agent-manager]
+      responses:
+        "200":
+          description: The outage's detail, or an attachments-only object.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/CloudStatusIncidentDetail'
+                  - $ref: '#/components/schemas/CloudStatusIncidentAttachmentsOnly'
+        "400":
+          description: BadRequest — unknown cloud or missing id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: No outage with that id belongs to that cloud.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: InternalServerError.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /internal/cloud-status/sweep:
+    post:
+      summary: >-
+        Internal-caller-only. Re-derives which outage transitions the public
+        cloud status dashboards are owed and records any not already recorded.
+        Decides only — sends nothing. The port of ServiceNow's `Cloud Status
+        Event Notification Flow`; invoked by operations/csm-scheduled-tasks'
+        cloud_status_webhooks sub-cron immediately before it delivers.
+        Idempotent: a sweep that finds nothing new records nothing, which is
+        the steady state.
+      operationId: sweepCloudStatusTransitions
+      responses:
+        "200":
+          description: The sweep ran. Recorded is 0 in the steady state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CloudStatusSweepResult'
+        "500":
+          description: InternalServerError.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /internal/cloud-status/pending:
+    get:
+      summary: >-
+        Internal-caller-only. Returns the cloud status webhooks still owed to
+        the public dashboards and not yet past their attempt limit, oldest
+        first, with each cloud already translated to the slug the dashboards
+        are addressed by.
+      operationId: listPendingCloudStatusWebhooks
+      responses:
+        "200":
+          description: The webhooks still owed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PendingCloudStatusWebhooks'
+        "500":
+          description: InternalServerError.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /internal/cloud-status/{id}/delivery:
+    post:
+      summary: >-
+        Internal-caller-only. Records the outcome of one webhook attempt.
+        Increments the attempt count on success and failure alike — it counts
+        what was tried, not what failed.
+      operationId: recordCloudStatusDelivery
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloudStatusDeliveryReport'
+      responses:
+        "204":
+          description: Outcome recorded.
+        "400":
+          description: >-
+            BadRequest — invalid id, or a failure reported with no error
+            message.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: No such webhook.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: InternalServerError.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /scheduled-tasks/attempts:
     post:
       summary: >-
@@ -1972,7 +2295,10 @@ paths:
 
   /accounts/search:
     post:
-      summary: Search accounts by name or Salesforce ID.
+      summary: >-
+        Search accounts by name or Salesforce ID. Accounts deleted in Salesforce
+        (account.deleted_on set by the Salesforce Account ingest) are never
+        returned; GET /accounts/{id} still resolves them.
       operationId: searchAccounts
       requestBody:
         required: true
@@ -2661,10 +2987,14 @@ paths:
     patch:
       summary: Replace a contact's roles on a project.
       description: >
-        Replaces the membership's Salesforce roles, and with them its project groups.
-        The membership's state is untouched. An empty roles list is accepted and means
-        "no roles" — it removes every project group rather than leaving the current set
-        alone. The database transaction and the Salesforce write succeed together or
+        Replaces the membership's portal-managed Salesforce roles (Portal user, Security
+        Contact, Lead, Admin), and with them its project groups. Every other Role__c label
+        already on the Salesforce membership (Business Contact, Business/Technical
+        Owner, Champion, Promoter or Detractor, or any label this service does not know)
+        is kept. If the membership's current roles cannot be read from Salesforce the
+        call fails with 503 instead of overwriting them. The membership's state is
+        untouched. An empty roles list is accepted and removes every portal-managed role
+        and its project group; labels set only in Salesforce stay. The database transaction and the Salesforce write succeed together or
         neither is applied; the database commits last.
 
 
@@ -3625,8 +3955,7 @@ paths:
   /cases/feedback/search:
     post:
       summary: >-
-        Search case-feedback (satisfaction rating) records across cases
-        (ServiceNow data source only).
+        Search case-feedback (satisfaction rating) records across cases.
       description: >-
         Backs the case-feedback dashboard's list view. Distinct from any
         single-case feedback lookup: this is filterable by case, accounts,
@@ -3680,11 +4009,15 @@ paths:
     post:
       summary: >-
         Date-bucketed rating aggregation of case-feedback records across
-        cases (ServiceNow data source only).
+        cases.
       description: >-
         Backs the case-feedback dashboard's rating-trend chart. This is the
         many-cases trend endpoint, not scoped to one case, so filters.caseId
         is not accepted here (unlike POST /cases/feedback/search).
+
+        Postgres: the reasons_* buckets return an empty result (the stored
+        feedback carries no per-rating reason selections), and pageSize is
+        capped at 50 on search.
       operationId: aggregateCaseFeedback
       requestBody:
         required: true
@@ -5704,6 +6037,168 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         "500":
           description: Unexpected server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /team-schedule/absences/{id}:
+    delete:
+      summary: Remove one absence — the whole span, open-ended or not.
+      description: >
+        Lead edit, gated on the team the absence belongs to (read from the row,
+        not from the caller). Unlike clearing a date range with
+        /team-schedule/absences/apply, this also removes an absence with no end
+        date. The removal is recorded in the absence history before the row
+        goes.
+      operationId: deleteScheduleAbsence
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: note
+          in: query
+          required: false
+          description: Why it was removed, kept on the history row.
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Removed.
+        "400":
+          description: Bad request — malformed id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller does not lead this absence's team.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: No such absence.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Unexpected error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /team-schedule/absence-kinds:
+    post:
+      summary: Add a leave or allocation kind to the shared catalogue.
+      description: >
+        Any team lead may add one, and every team then sees it. The code is
+        derived from the label (upper case, words joined by underscores), so the
+        same label cannot be added twice. The colour must be one the rota draws
+        a leave or allocation chip for.
+      operationId: createScheduleAbsenceKind
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateScheduleAbsenceKindRequest'
+      responses:
+        "201":
+          description: The new kind.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduleAbsenceKind'
+        "400":
+          description: Bad request — a missing or over-long field, an unknown bucket or colour.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller neither leads a team nor is a rota admin.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "409":
+          description: A kind with that label, or an active kind with that short code, already exists.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Unexpected error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /team-schedule/absence-kinds/{code}:
+    delete:
+      summary: Delete a tag a lead added.
+      description: >
+        Any team lead may. Only a tag added from the portal can be deleted, never
+        one of the catalogue's own, and only once no leave or allocation uses it
+        -- a tag still in use is refused with how many entries use it, since
+        retiring it quietly would leave those entries with no label or colour.
+      operationId: deleteScheduleAbsenceKind
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Deleted.
+        "401":
+          description: Unauthenticated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller leads no team, or the tag is a built-in one.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: No such tag.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "409":
+          description: The tag is still in use.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Unexpected error.
           content:
             application/json:
               schema:
@@ -11396,8 +11891,9 @@ components:
             type: string
             enum: [Portal user, Security Contact, Lead, Admin]
           description: >
-            The membership's new complete set of Salesforce roles — a replacement, not a merge.
-            An empty list is allowed and removes every project group.
+            The membership's new complete set of portal-managed Salesforce roles. It replaces
+            the Portal user / Security Contact / Lead / Admin labels; other Role__c labels
+            already on the Salesforce membership are kept. An empty list is allowed.
 
     ProjectMembership:
       type: object
@@ -11435,8 +11931,10 @@ components:
           items:
             type: string
           description: >
-            The raw Salesforce Role__c labels the membership now carries, exactly as written to
-            Salesforce — not the derived project_role/project_group values.
+            The portal-managed Salesforce Role__c labels (Portal user / Security Contact / Lead /
+            Admin) the membership now carries, as written to Salesforce — not the derived
+            project_role/project_group values. Labels set only in Salesforce (e.g. Business
+            Contact) are kept on the record but not listed here.
 
     SearchProjectContactsResponse:
       type: object
@@ -16128,6 +16626,23 @@ components:
           description: >-
             Display order, and what gives a team a stable colour without any
             client naming it.
+    CreateScheduleAbsenceKindRequest:
+      type: object
+      required: [shortCode, label, bucket, colourToken]
+      properties:
+        shortCode:
+          type: string
+          maxLength: 12
+          description: What a roster cell draws, e.g. "Trn". Unique among active kinds.
+        label:
+          type: string
+          maxLength: 100
+        bucket:
+          type: string
+          enum: [LEAVE, ALLOCATION]
+        colourToken:
+          type: string
+          enum: [AL, LL, MAT, PAT, RND, EXT, INT, BR, MIG, ONB, EXC, IND]
     ScheduleAbsenceKind:
       type: object
       description: Why someone is out of the rota.
@@ -16139,6 +16654,18 @@ components:
         bucket: { type: string, enum: [LEAVE, ALLOCATION, EXCLUDED] }
         colourToken: { type: string }
         sortOrder: { type: integer }
+        custom:
+          type: boolean
+          description: True for a tag a lead added from the portal, which a lead may also delete.
+        family:
+          type: string
+          enum: [CRE, SRE]
+          description: The rota the kind is offered on. Absent for a kind both rotas use, which is every kind of leave.
+        retired:
+          type: boolean
+          description: >-
+            True for a kind no longer offered. Still served so the days already
+            marked with it keep their label; a client must not offer it.
     ScheduleCatalogue:
       type: object
       properties:
@@ -16194,7 +16721,7 @@ components:
           type: string
           description: >-
             A schedule_absence_kind code, e.g. ANNUAL_LEAVE. Empty, or omitted,
-            brings them back over the span instead.
+            brings them back over the span instead. Must be an active kind.
         from:
           type: string
           format: date
@@ -16203,6 +16730,13 @@ components:
           format: date
         note:
           type: string
+        allocatedTo:
+          type: string
+          maxLength: 100
+          description: >-
+            Who an allocation is for: the customer, or the product team for
+            RnD. Stored only with an ALLOCATION kind; ignored for leave, and a
+            blank value is treated as absent.
     ApplyScheduleAbsenceResponse:
       type: object
       required: [created, removed, trimmed]
@@ -16239,6 +16773,24 @@ components:
         note:
           type: string
           nullable: true
+        tier:
+          type: string
+          enum: [L1, L2, L3]
+          description: >-
+            For an escalation window that leaves the tier to the person
+            (SRE_TZ1, SRE_TZ3, ...), which tier they hold. Omitted takes the
+            window's own tier; a window that fixes a tier accepts only that
+            one, and a window that is not an escalation window accepts none.
+            An escalation window that leaves the tier open requires one --
+            with no tier, the person is on the zone's regular hours, which
+            have a window of their own.
+        zoneCode:
+          type: string
+          description: >-
+            With shiftCode empty, clears only this zone's turn and leaves the
+            rest of the day. (An escalation turn only ever displaces what is in
+            its own zone or overlaps it in time, so one engineer can hold turns
+            in two zones on one day.)
 
     ApplyScheduleRangeResponse:
       type: object
@@ -20875,6 +21427,283 @@ components:
         offset:
           type: integer
 
+    CloudAvailabilityWindow:
+      type: object
+      description: One weighted uptime figure for one window.
+      properties:
+        availability:
+          description: >-
+            The figure, rounded to three decimals. *** THE JSON TYPE VARIES BY
+            CLOUD, AND THAT IS DELIBERATE. *** Six clouds emit a STRING
+            ("100.000") because the ServiceNow weighting functions end in
+            toFixed; asgardeo emits a NUMBER (100) because it takes an
+            unweighted mean and parseFloat drops the trailing zeros. Verified
+            against the live API on 2026-09-29. Normalising the two would
+            change six clouds' payloads.
+          oneOf:
+            - type: string
+            - type: number
+        duration:
+          type: string
+          description: The window's label, rendered verbatim by the frontend.
+          enum: ["Last 7 days", "Last 30 days", "Last 90 days", "Last 12 months"]
+      required: [availability, duration]
+    AvailabilityHistoryPoint:
+      type: object
+      description: One day's uptime.
+      properties:
+        availability:
+          type: number
+          description: >-
+            A plain number for every cloud — the history resource uses
+            parseFloat and never toFixed, unlike the availabilities one.
+        date:
+          type: string
+          format: date
+          description: >-
+            The local day, YYYY-MM-DD, in the ServiceNow instance's timezone
+            (Asia/Colombo), which is where the daily buckets are cut.
+      required: [availability, date]
+    AvailabilityHistorySubgroup:
+      type: object
+      description: One monitored component's 90-day history.
+      properties:
+        display_name:
+          type: string
+        history:
+          type: array
+          items:
+            $ref: '#/components/schemas/AvailabilityHistoryPoint'
+      required: [display_name, history]
+    AvailabilityHistoryGroup:
+      type: object
+      description: One named group within a region.
+      properties:
+        display_name:
+          type: string
+        subgroups:
+          type: array
+          items:
+            $ref: '#/components/schemas/AvailabilityHistorySubgroup'
+      required: [display_name, subgroups]
+    CloudStatusIncidentComment:
+      type: object
+      description: One entry from the outage's external communications.
+      properties:
+        comment:
+          type: string
+        created_on:
+          type: string
+          description: UTC, "YYYY-MM-DD HH:MM:SS".
+      required: [comment, created_on]
+    CloudStatusIncidentAttachment:
+      type: object
+      properties:
+        name:
+          type: string
+        id:
+          type: string
+      required: [name, id]
+    CloudStatusIncidentDetail:
+      type: object
+      description: The full detail view, when the outage's incident qualifies.
+      properties:
+        id:
+          type: string
+        begin:
+          type: string
+        end:
+          type: string
+          description: Empty string while the outage is ongoing.
+        type:
+          type: string
+          description: >-
+            Not the enum and not plain title case — degradation renders as
+            "Degraded" and planned as "Maintenance".
+          enum: [Outage, Degraded, Maintenance]
+        status:
+          type: string
+          enum: ["In Progress", "Resolved"]
+        short_description:
+          type: string
+        comments:
+          type: array
+          items:
+            $ref: '#/components/schemas/CloudStatusIncidentComment'
+        attachments:
+          type: array
+          items:
+            $ref: '#/components/schemas/CloudStatusIncidentAttachment'
+      required: [id, begin, end, type, status, short_description, comments, attachments]
+    CloudStatusIncidentAttachmentsOnly:
+      type: object
+      description: >-
+        What the endpoint returns when the outage's incident does not
+        qualify — the majority case. Carries no incident fields at all.
+      properties:
+        attachments:
+          type: array
+          items:
+            $ref: '#/components/schemas/CloudStatusIncidentAttachment'
+      required: [attachments]
+    CloudStatusMonitorGroup:
+      type: object
+      properties:
+        display_name:
+          type: string
+        subgroups:
+          type: array
+          items:
+            $ref: '#/components/schemas/CloudStatusMonitorSubgroup'
+      required: [display_name, subgroups]
+    CloudStatusMonitorSubgroup:
+      type: object
+      properties:
+        description:
+          type: string
+        display_name:
+          type: string
+        status:
+          type: integer
+          description: >-
+            0 Operational · 1 Maintenance · 2 Degraded · 3 Outage. The
+            dashboard's own scale, fixed by its constants.js.
+        availability:
+          type: array
+          items:
+            $ref: '#/components/schemas/CloudStatusAvailability'
+        message:
+          type: string
+          description: >-
+            Short description of an ongoing outage, and only when that
+            outage's type agrees with the status shown. Empty otherwise.
+      required: [description, display_name, status, availability, message]
+    CloudStatusAvailability:
+      type: object
+      properties:
+        availability:
+          type: string
+          description: >-
+            A string, not a number — the dashboard renders it verbatim and has
+            always received it as text.
+        duration:
+          type: string
+          enum: ["Last 30 days", "Last 90 days"]
+      required: [availability, duration]
+    CloudStatusIncidentMonth:
+      type: object
+      properties:
+        incidents:
+          type: array
+          items:
+            $ref: '#/components/schemas/CloudStatusIncident'
+      required: [incidents]
+    CloudStatusIncident:
+      type: object
+      properties:
+        id:
+          type: string
+        begin:
+          type: string
+        end:
+          type: string
+          description: Empty while the outage is ongoing.
+        type:
+          type: string
+          enum: [Outage, Degradation, Planned]
+        status:
+          type: string
+          enum: [Ongoing, Resolved]
+        short_description:
+          type: string
+        expanded:
+          type: boolean
+          description: Drives a UI accordion; always false on the wire.
+      required: [id, begin, end, type, status, short_description, expanded]
+    CloudStatusSweepResult:
+      type: object
+      properties:
+        scanned:
+          type: integer
+          description: How many in-scope outages the sweep considered.
+        recorded:
+          type: integer
+          description: >-
+            How many new transitions were recorded. 0 is the steady state — a
+            sweep that records nothing is working correctly.
+        skippedNoCloud:
+          type: integer
+          description: >-
+            In-scope outages whose configuration item has no cloud monitor, or
+            whose cloud offering this build cannot address, and which therefore
+            cannot be routed to any dashboard. Non-zero means those outages are
+            never reaching the status page — a data problem in the outage
+            record, not a failure of the sweep.
+      required: [scanned, recorded, skippedNoCloud]
+    PendingCloudStatusWebhook:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        outageId:
+          type: string
+          format: uuid
+        number:
+          type: string
+          description: >-
+            The outage number, for logging and for whoever reads a failure. Not
+            part of the webhook body sent to the dashboard.
+        event:
+          type: string
+          enum: [OUTAGE_BEGIN, OUTAGE_END]
+          description: >-
+            This service's own name for the transition, for logs and for the
+            operator reading a failure. NOT what the webhook body carries --
+            see wireEvent.
+        wireEvent:
+          type: string
+          description: >-
+            The literal the webhook body must carry, e.g. "outage_begin". Kept
+            separate from event because the two are different contracts: event
+            belongs to this API, wireEvent belongs to the status dashboard and
+            cannot change without coordinating with it.
+        cloud:
+          type: string
+          description: >-
+            The dashboard slug, already translated from the stored offering
+            enum — e.g. "choreo-eu", not "CHOREO_EU".
+        timestamp:
+          type: string
+          format: date-time
+          description: >-
+            The outage's own begin or end instant, matching event — not the
+            moment of sending, so a delayed or retried webhook still reports
+            when the outage actually changed.
+        attemptCount:
+          type: integer
+        lastError:
+          type: string
+      required: [id, outageId, number, event, wireEvent, cloud, timestamp, attemptCount]
+    PendingCloudStatusWebhooks:
+      type: object
+      properties:
+        count:
+          type: integer
+        webhooks:
+          type: array
+          items:
+            $ref: '#/components/schemas/PendingCloudStatusWebhook'
+      required: [count, webhooks]
+    CloudStatusDeliveryReport:
+      type: object
+      properties:
+        delivered:
+          type: boolean
+        error:
+          type: string
+          description: Required when delivered is false.
+      required: [delivered]
     AnnouncementRequest:
       description: >
         A draft, in-review, or approved announcement that has not yet been

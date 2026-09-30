@@ -22,6 +22,7 @@ Go HTTP server (`net/http`, Go 1.26+) that acts as a backend-for-frontend (BFF) 
 - **Every route goes through `route(pattern, perm, handler)` in `cmd/server/main.go`.** `perm` is a required argument with no default — pick `PermView` for reads/searches/aggregates, `PermViewOperations` for reads under the Operations area (incidents, change requests, problems, incident tasks, outages, alerts), `PermTimeCardsAndUpdates` for every time-card route and the update-level lookups (CS engineer, admin and time-card approver — viewing/managing, not approving, see `PermApproveTimeCard` below), `PermWrite` for other state changes, `PermAdmin` for the handful of actions reserved for admin alone (currently just `POST /users`, creating a new platform user), `PermViewSecurityCenter` for Security Center (both `/products/vulnerabilities/*` routes; see "Security Center access" below for how `/cases/*` is handled), or one of the narrower ones (`PermEscalate`, `PermDownloadAttachment`). `PermApproveTimeCard` is not a route-level permission at all — see its own note below. Case, incident and change-request comments are `PermWrite`. `PermAuthenticated` (no role needed) is only for the caller's own `/users/me`. `/health` is the only route registered directly on the mux.
 - **The policy is `NewAccessGuard`.** `admin` satisfies every permission, including `PermAdmin`; `cs_engineer` satisfies every other route permission (view, download, write, including comments, security center, time cards and updates) but **not** `PermAdmin`, `PermEscalate`, or `PermApproveTimeCard` — escalating a case and approving a time card are each a dedicated responsibility, held only by their own role (`escalator` / `timecard-approver`) plus admin, the same way `PermAdmin` is admin-only; `escalator`/`attachment-downloader` grant only their one ability plus view (so a view-only role cannot read Operations — `PermViewOperations` is CS engineer and admin only, matching the frontend's `canUseOperations`); `timecard-approver` grants view plus `PermTimeCardsAndUpdates` plus `PermApproveTimeCard`; `usage-metrics-viewer`/`dashboard-designer` grant only view here (no backend route for those features); the frontend gates them. Every role implies view, **except** `PermViewSecurityCenter` — a plain viewer/escalator/attachment_downloader/usage_metrics_viewer/timecard_approver/dashboard_designer holds `PermView` but not this.
 - **`PermApproveTimeCard` gates a state transition inside a shared route, not a route of its own.** `PATCH /time-cards/{id}` carries EITHER a plain field edit OR an approve/reject transition (`state: "approved"`/`"rejected"`, entity-service's `UpdateTimeCardRequest`) — the same shared-endpoint problem Security Center's `POST /cases/search` has, solved the identical way: `TimeCardHandler` (wired with `WithAccessGuard`, same pattern as `CaseHandler`) inspects the request body itself (`timeCardUpdateTargetsStateTransition`, checking for a non-nil `state`) and additionally requires `PermApproveTimeCard` only when it's present. A CS engineer without `timecard-approver`/`admin` can still search/create/edit their own time cards (`PermTimeCardsAndUpdates`), just not approve/reject one.
+- **PLG's routes go through this guard too, and through a second one of their own.** `internal/plg/plg.go` registers all 24 as `accessGuard.Require(perm, identity(fn))` — the guard OUTSIDE PLG's `identity` middleware, deliberately, because the guard is a set lookup while `identity` is an entity-service round trip, so a denied caller costs nothing upstream. Two permissions: `PermUsePlg` (CS engineer and admin) for 20 routes, and `PermManagePlaybooks` (admin only) for the four that author a playbook template. `PermUsePlg` is narrower than `PermView` on purpose — every portal role holds `PermView`, but PLG is a worklist staff act on, and a view-only role that could open it would meet a 403 on every control. Reading a playbook (`GET /plg/playbooks`, `GET /plg/playbooks/{id}`) and assigning one to a pairing (`POST .../playbook-runs`) are `PermUsePlg`, NOT `PermManagePlaybooks`: running a template and writing one are different jobs, so gating on the `/plg/playbooks` path prefix would be wrong. `PermManagePlaybooks` is kept separate from `PermAdmin`, which it currently matches exactly, so granting playbook authoring to a future PLG-admin role does not also hand out platform-user creation. `identity` still runs and is not redundant: it resolves the `"user".id` every PLG write records as `actorId`, and refuses anyone who is not ACTIVE INTERNAL staff — a roles claim cannot tell you somebody was offboarded this morning. `internal/plg/routes_access_test.go` pins every route's permission and the middleware ordering.
 - **`GET /users/me` reports `roles`** (from `AccessGuard.RolesFor`): the stable keys of the portal roles the token roles grant — several possible, fixed order — and is **not** the entity service's role data, which the response no longer carries. The frontend decides what to show or hide from these roles (there is deliberately no derived `permissions` list); the backend's `403` is the real gate. Dashboard-designer access is only the `AUTH_DASHBOARD_DESIGNER_ROLES` role (the old `DASHBOARD_DESIGNER_EMAILS` email allow-list is gone).
 - **`GET /users/{id}` reports the SAME portal-role vocabulary for an internal target, via SCIM instead of a JWT.** `RolesFor` only ever takes `[]string` -- it doesn't care whether those strings came from the live caller's own JWT `roles` claim (`GetMe`) or somewhere else, so `GetUser`'s own `withPortalRoles` (`internal/handler/user_portal_roles.go`) reaches the same vocabulary for the profile being *viewed* by calling `scim.SearchUser` for that user's email instead: SCIM's own user search returns the same role assignment for any user, not just the caller. Two things worth knowing:
   - SCIM's `roles` spans every Asgardeo application the person holds a role in, not just this portal, so `withPortalRoles` filters to `scim.CSMAppRolePrefix` ("app-csm-") first -- matching what the JWT's own `roles` claim already narrows to at token-issuance time. Passing the unfiltered list into `RolesFor` would still be *correct* (a role name from another app just never matches `AUTH_<ROLE>_ROLES`), the filter exists so a caller reading the intermediate `[]string` mid-pipeline sees only this portal's roles, not an unrelated app's.
@@ -74,6 +75,43 @@ different mechanisms, because the feature isn't backed by its own exclusive rout
   residual gap is a caller who already has one (a pre-existing bookmark, or a guess) fetching it
   directly by id. Closing that fully needs entity-service itself to resolve and enforce it (it has
   reliable type data on either data source), not this BFF layer.
+
+## Redacting raw base64 inline images (`internal/handler/inline_image_redact.go`)
+
+A pasted screenshot in a comment or case/incident/change-request description is normally extracted
+into a real, `PermDownloadAttachment`-gated attachment on the way in (see
+`internal/handler/inline_images.go`'s `InlineImageProcessor`, `SFTPGO_ATTACHMENT_STORAGE_ENABLED`
+only) and rewritten to a `.iix` reference. Content authored before that flag was on — or with it off
+— never goes through that extraction: the image stays as a raw `data:image/...;base64,...` `<img>`
+src embedded directly in the comment/description HTML itself, which every read response already
+returns to *any* caller holding `PermView` — there is no separate attachment resource for
+`PermDownloadAttachment` to gate. Found live: a `viewer`/`escalator` role, neither of which holds
+`canDownloadAttachment`, could see a pasted screenshot in a case comment despite the `.iix` mechanism
+being correctly gated.
+
+`redactRawBase64Images` strips the base64 payload out of raw response bytes (a compiled regex over
+`data:image/...;base64,<payload>`, replaced with a short inert placeholder that still starts with
+`data:image/` — the frontend's own `useResolvedInlineImageHtml` still recognizes and hides it, see
+`apps/csm-portal/webapp`'s own `CLAUDE.md`) for a caller who fails `shouldRedactInlineImages` (no
+`PermDownloadAttachment`, or `access == nil`, which fails closed the same way `CaseHandler`'s own
+Security Center check does). It operates on the raw `[]byte` response — comment/description HTML
+appears under different field names across endpoints (`content`, `bodyHtml`, `description`, ...) and
+this backend already treats these responses as raw passthrough (see "Response shape" below); a
+byte-level substitution keeps that convention and can't miss a field by name the way a typed reshape
+could.
+
+**Wired into every read response that can carry comment/description HTML**: `CaseHandler.SearchCases`/
+`SearchCaseComments`/`SearchCaseActivities`/`GetCase`, `IncidentHandler.SearchIncidents`/`GetIncident`/
+`SearchIncidentComments`/`SearchIncidentActivities`, `ChangeRequestHandler.SearchChangeRequests`/
+`GetChangeRequest`/`SearchChangeRequestComments` — each calls `WithAccessGuard` at construction (same
+pattern as `CaseHandler`'s own Security Center wiring) and checks `shouldRedactInlineImages(h.access,
+user.Roles)` immediately before its final `writeJSON`. A *create* endpoint (`CreateCaseComment` and
+its incident/change-request equivalents) is deliberately **not** redacted: the caller is the one who
+just submitted that exact content, so echoing it back leaks nothing new to them.
+
+This is the server-side half of a two-part fix — `apps/csm-portal/webapp`'s own `denyRawBase64`
+mitigation (added first, still in place) only ever hid the image *after* the bytes had already
+reached the browser; this is what stops them being sent at all to a caller who shouldn't see them.
 
 ## Health endpoints
 

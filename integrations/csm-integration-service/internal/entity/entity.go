@@ -264,3 +264,47 @@ func (c *Client) UpdateIncident(ctx context.Context, id string, body []byte) ([]
 func (c *Client) SearchITServices(ctx context.Context, body []byte) ([]byte, error) {
 	return c.do(ctx, http.MethodPost, "/services/search", body)
 }
+
+// GetCloudStatusMonitors calls GET /cloud-status/monitors on the entity
+// service. Response is returned as raw JSON; typed response structs are
+// deferred, as elsewhere here.
+//
+// The cloud is passed through as a query parameter rather than validated: the
+// entity service owns the list of valid clouds and returns a 400 for anything
+// else, and duplicating that list here would give two places to update when a
+// cloud is added.
+func (c *Client) GetCloudStatusMonitors(ctx context.Context, cloud string) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, "/cloud-status/monitors?cloud="+url.QueryEscape(cloud), nil)
+}
+
+// GetCloudStatusIncidents calls GET /cloud-status/incidents on the entity
+// service.
+func (c *Client) GetCloudStatusIncidents(ctx context.Context, cloud string) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, "/cloud-status/incidents?cloud="+url.QueryEscape(cloud), nil)
+}
+
+// GetCloudStatusAvailabilities calls GET /cloud-status/availabilities on the
+// entity service -- the weighted uptime figures the dashboard prints beside
+// each region.
+func (c *Client) GetCloudStatusAvailabilities(ctx context.Context, cloud string) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, "/cloud-status/availabilities?cloud="+url.QueryEscape(cloud), nil)
+}
+
+// GetCloudStatusIncidentDetail calls GET /cloud-status/incidents/{id} on the
+// entity service -- one outage's public detail view.
+//
+// The id is forwarded as given. The entity service accepts both the dashed
+// uuid and the 32-hex sys_id form, so a link created before the cutover
+// still resolves after it; normalising here would put that rule in two
+// places.
+func (c *Client) GetCloudStatusIncidentDetail(ctx context.Context, id, cloud string) ([]byte, error) {
+	return c.do(ctx, http.MethodGet,
+		"/cloud-status/incidents/"+url.PathEscape(id)+"?cloud="+url.QueryEscape(cloud), nil)
+}
+
+// GetCloudStatusAvailabilityHistory calls GET
+// /cloud-status/availability-history on the entity service -- the 90-day
+// daily chart.
+func (c *Client) GetCloudStatusAvailabilityHistory(ctx context.Context, cloud string) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, "/cloud-status/availability-history?cloud="+url.QueryEscape(cloud), nil)
+}

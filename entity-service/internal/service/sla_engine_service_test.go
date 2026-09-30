@@ -163,6 +163,17 @@ func TestSLAEngineService_CompleteResponseClock(t *testing.T) {
 	}
 }
 
+func TestSLAEngineService_CompleteWorkaroundClock(t *testing.T) {
+	repo := newRecordingSLAEngineRepo()
+	svc := NewSLAEngineService(repo, nil)
+
+	svc.CompleteWorkaroundClock(context.Background(), "case-5")
+
+	if len(repo.completed) != 1 || repo.completed[0] != "case-5|WORKAROUND" {
+		t.Errorf("completed = %v, want [case-5|WORKAROUND]", repo.completed)
+	}
+}
+
 func TestSLAEngineService_ApplyCaseStateEffects(t *testing.T) {
 	tests := []struct {
 		name          string

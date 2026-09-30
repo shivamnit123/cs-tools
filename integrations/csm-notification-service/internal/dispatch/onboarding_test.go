@@ -65,9 +65,12 @@ func (m *mockIdentityProvisioner) EnsureExternalUser(ctx context.Context, email,
 // RecordOnboardingStep, keeping every write in order.
 type mockStepRecorder struct {
 	err error
-	// emailAlreadySent / emailSentErr drive the durable duplicate-invitation
-	// guard; emailSentChecks counts how often it was consulted.
+	// emailAlreadySent / emailSentOn / emailSentErr drive the durable
+	// duplicate-invitation guard: emailAlreadySent puts a SUCCEEDED EMAIL
+	// step on the ledger, stamped with emailSentOn (empty = no timestamp);
+	// emailSentChecks counts how often it was consulted.
 	emailAlreadySent bool
+	emailSentOn      string
 	emailSentErr     error
 	emailSentChecks  int
 	// requireLiveContext makes every write fail if its context has already
@@ -78,13 +81,19 @@ type mockStepRecorder struct {
 	calls              []entity.OnboardingStepRequest
 }
 
-// emailAlreadySent is what EmailAlreadySent answers; emailSentErr makes the
-// ledger read itself fail.
-func (m *mockStepRecorder) EmailAlreadySent(context.Context, string) (bool, error) {
+// SucceededEmailStep answers from emailAlreadySent/emailSentOn;
+// emailSentErr makes the ledger read itself fail.
+func (m *mockStepRecorder) SucceededEmailStep(context.Context, string) (*entity.RecordedOnboardingStep, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.emailSentChecks++
-	return m.emailAlreadySent, m.emailSentErr
+	if m.emailSentErr != nil {
+		return nil, m.emailSentErr
+	}
+	if !m.emailAlreadySent {
+		return nil, nil
+	}
+	return &entity.RecordedOnboardingStep{Step: entity.OnboardingStepEmail, Status: entity.OnboardingStepSucceeded, EventModifiedOn: m.emailSentOn}, nil
 }
 
 func (m *mockStepRecorder) RecordOnboardingStep(ctx context.Context, req entity.OnboardingStepRequest) error {
@@ -129,6 +138,17 @@ func invitedRecord(integration bool) eventbus.Record {
 		isIntegration = "true"
 	}
 	return eventbus.Record{Value: []byte(`{"type":"project_contact.invited","entityId":"` + invitedMembership + `","payload":{"membershipSfId":"` + invitedMembership + `","contactSfId":"003000000000001AAA","email":"jane@acme.com","givenName":"Jane","familyName":"Doe","projectName":"Acme Cloud","projectKey":"ACMECLOUD","roles":["Admin","Portal user"],"isIntegrationUser":` + isIntegration + `,"type":"OWN CONTACT"}}`)}
+}
+
+// invitedRecordAt is invitedRecord(false) carrying eventModifiedOn -- the
+// membership's Salesforce LastModifiedDate, i.e. the version being invited.
+func invitedRecordAt(eventModifiedOn string) eventbus.Record {
+	return eventbus.Record{Value: []byte(`{"type":"project_contact.invited","entityId":"` + invitedMembership + `","payload":{"membershipSfId":"` + invitedMembership + `","contactSfId":"003000000000001AAA","email":"jane@acme.com","givenName":"Jane","familyName":"Doe","projectName":"Acme Cloud","projectKey":"ACMECLOUD","roles":["Admin","Portal user"],"isIntegrationUser":false,"type":"OWN CONTACT","eventModifiedOn":"` + eventModifiedOn + `"}}`)}
+}
+
+// resentInvitedRecordAt is resentInvitedRecord carrying eventModifiedOn.
+func resentInvitedRecordAt(eventModifiedOn string) eventbus.Record {
+	return eventbus.Record{Value: []byte(`{"type":"project_contact.invited","entityId":"` + invitedMembership + `","payload":{"membershipSfId":"` + invitedMembership + `","contactSfId":"003000000000001AAA","email":"jane@acme.com","givenName":"Jane","familyName":"Doe","projectName":"Acme Cloud","projectKey":"ACMECLOUD","roles":["Admin","Portal user"],"isIntegrationUser":false,"type":"OWN CONTACT","isResend":true,"eventModifiedOn":"` + eventModifiedOn + `"}}`)}
 }
 
 // resentInvitedRecord is the same invitation republished by entity-service
@@ -530,7 +550,7 @@ func TestDispatcher_Handle_ProjectContactInvited_NamelessInviteeUsesEmailLocalPa
 // not FAILED, and the identity step still runs.
 func TestDispatcher_Handle_ProjectContactInvited_Killswitch(t *testing.T) {
 	identity, email, steps := &mockIdentityProvisioner{}, &mockEmailSender{}, &mockStepRecorder{}
-	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{}, false, false, nil, true, "", "").
+	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{}, false, false, nil, true, "").
 		WithOnboarding(OnboardingConfig{Identity: identity, Email: email, Steps: steps, IdentityEnabled: true, EmailEnabled: true, PortalURL: "https://support.wso2.com"})
 
 	if err := d.Handle(context.Background(), invitedRecord(false)); err != nil {
@@ -546,7 +566,7 @@ func TestDispatcher_Handle_ProjectContactInvited_Killswitch(t *testing.T) {
 // mode sends the invitation to the test list, never to the real contact.
 func TestDispatcher_Handle_ProjectContactInvited_DebugModeRedirects(t *testing.T) {
 	email, steps := &mockEmailSender{}, &mockStepRecorder{}
-	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{}, true, true, []string{"debug@wso2.com"}, true, "", "").
+	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{}, true, true, []string{"debug@wso2.com"}, true, "").
 		WithOnboarding(OnboardingConfig{Identity: &mockIdentityProvisioner{}, Email: email, Steps: steps, IdentityEnabled: true, EmailEnabled: true, PortalURL: "https://support.wso2.com"})
 
 	if err := d.Handle(context.Background(), invitedRecord(false)); err != nil {
@@ -804,6 +824,139 @@ func TestDispatcher_Handle_ProjectContactInvited_LedgerWriteSurvivesCancellation
 	}
 	if len(email.calls) != 1 {
 		t.Fatalf("emails sent = %d, want 1", len(email.calls))
+	}
+	assertSteps(t, steps, "IDENTITY=SUCCEEDED", "EMAIL=SUCCEEDED")
+}
+
+// firstInvitedOn is the membership version the ledger's SUCCEEDED EMAIL step
+// was recorded for in the re-invitation tests below -- the first invitation.
+// entity-service returns it the way Go marshals a time.Time.
+const firstInvitedOn = "2026-09-01T08:00:00.123Z"
+
+// TestDispatcher_Handle_ProjectContactInvited_VersionedLedgerGuard pins what
+// "already sent" means: sent for this version of the membership. The ledger
+// keeps one EMAIL row per membership, so a bare "is there a SUCCEEDED row"
+// check let the first invitation block every later one -- a contact
+// deactivated and then re-invited (a newer Salesforce LastModifiedDate)
+// never got an email. A newer version sends; the same version (Salesforce's
+// several UPDATED events per save, or a redelivery) and an older one (a
+// delayed delivery) are still skipped. When either timestamp is missing or
+// unreadable the versions cannot be compared, so any SUCCEEDED row still
+// means sent.
+func TestDispatcher_Handle_ProjectContactInvited_VersionedLedgerGuard(t *testing.T) {
+	cases := map[string]struct {
+		eventOn    string // payload eventModifiedOn; "" = omitted
+		recordedOn string // ledger EMAIL step eventModifiedOn; "" = absent
+		wantSent   bool
+	}{
+		"re-invite: newer version than the recorded invitation sends": {eventOn: "2026-09-20T10:30:00.000Z", recordedOn: firstInvitedOn, wantSent: true},
+		"duplicate: same version is skipped":                          {eventOn: firstInvitedOn, recordedOn: firstInvitedOn, wantSent: false},
+		"duplicate: same instant in another offset is skipped":        {eventOn: "2026-09-01T13:30:00.123+05:30", recordedOn: firstInvitedOn, wantSent: false},
+		"redelivery: older version is skipped":                        {eventOn: "2026-08-15T09:00:00Z", recordedOn: firstInvitedOn, wantSent: false},
+		"missing event timestamp falls back to skip":                  {eventOn: "", recordedOn: firstInvitedOn, wantSent: false},
+		"missing recorded timestamp falls back to skip":               {eventOn: "2026-09-20T10:30:00Z", recordedOn: "", wantSent: false},
+		"zero recorded timestamp falls back to skip":                  {eventOn: "2026-09-20T10:30:00Z", recordedOn: "0001-01-01T00:00:00Z", wantSent: false},
+		"unparseable recorded timestamp falls back to skip":           {eventOn: "2026-09-20T10:30:00Z", recordedOn: "yesterday", wantSent: false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			identity, email := &mockIdentityProvisioner{existed: true}, &mockEmailSender{}
+			steps := &mockStepRecorder{emailAlreadySent: true, emailSentOn: tc.recordedOn}
+			d := newOnboardingDispatcher(identity, email, steps, true, true)
+
+			rec := invitedRecord(false)
+			if tc.eventOn != "" {
+				rec = invitedRecordAt(tc.eventOn)
+			}
+			if err := d.Handle(context.Background(), rec); err != nil {
+				t.Fatalf("Handle() error = %v", err)
+			}
+			if steps.emailSentChecks != 1 {
+				t.Errorf("ledger consulted %d times, want exactly 1", steps.emailSentChecks)
+			}
+			if len(identity.calls) != 1 {
+				t.Errorf("EnsureExternalUser called %d times, want 1: identity runs whatever the ledger says", len(identity.calls))
+			}
+			if !tc.wantSent {
+				if len(email.calls) != 0 {
+					t.Errorf("sent %d emails, want none", len(email.calls))
+				}
+				assertSteps(t, steps, "IDENTITY=SUCCEEDED")
+				return
+			}
+			if len(email.calls) != 1 {
+				t.Fatalf("sent %d emails, want 1", len(email.calls))
+			}
+			// A re-invitation is an ordinary invitation, not a reminder:
+			// the account already exists, so the "added" wording.
+			if sent := email.calls[0]; strings.Contains(sent.subject, "Reminder") || !strings.Contains(sent.subject, "has been added") {
+				t.Errorf("subject = %q, want the existing-account invitation wording", sent.subject)
+			}
+			assertSteps(t, steps, "IDENTITY=SUCCEEDED", "EMAIL=SUCCEEDED")
+			// The new EMAIL row is stamped with the re-invitation's version,
+			// so a duplicate of this event is recognised in turn.
+			want, _ := time.Parse(time.RFC3339Nano, tc.eventOn)
+			if got := steps.calls[len(steps.calls)-1].EventModifiedOn; !got.Equal(want) {
+				t.Errorf("EMAIL step eventModifiedOn = %v, want the event's %v", got, want)
+			}
+		})
+	}
+}
+
+// TestDispatcher_Handle_ProjectContactInvited_ReinviteThenDuplicate walks the
+// staging scenario end to end against one ledger: the first invitation is
+// sent and recorded, its duplicate is skipped, a later re-invitation sends,
+// and that re-invitation's own duplicate is skipped.
+func TestDispatcher_Handle_ProjectContactInvited_ReinviteThenDuplicate(t *testing.T) {
+	const reinvitedOn = "2026-09-20T10:30:00.456Z"
+	identity, email, steps := &mockIdentityProvisioner{}, &mockEmailSender{}, &mockStepRecorder{}
+	d := newOnboardingDispatcher(identity, email, steps, true, true)
+
+	deliver := func(eventOn string, offset int64, wantEmails int) {
+		t.Helper()
+		rec := invitedRecordAt(eventOn)
+		rec.Offset = offset
+		if err := d.Handle(context.Background(), rec); err != nil {
+			t.Fatalf("Handle(%s) error = %v", eventOn, err)
+		}
+		if len(email.calls) != wantEmails {
+			t.Fatalf("after delivering %s: sent %d emails in total, want %d", eventOn, len(email.calls), wantEmails)
+		}
+		// Mirror what entity-service would now return for the EMAIL row.
+		for _, c := range steps.calls {
+			if c.Step == entity.OnboardingStepEmail && c.Status == entity.OnboardingStepSucceeded {
+				steps.emailAlreadySent = true
+				steps.emailSentOn = c.EventModifiedOn.Format(time.RFC3339Nano)
+			}
+		}
+	}
+	deliver(firstInvitedOn, 1, 1) // first invitation
+	deliver(firstInvitedOn, 2, 1) // Salesforce's second UPDATED event for the same save
+	deliver(reinvitedOn, 3, 2)    // deactivated, then re-invited
+	deliver(reinvitedOn, 4, 2)    // redelivery of the re-invitation
+	deliver(firstInvitedOn, 5, 2) // a very late copy of the first invitation
+}
+
+// TestDispatcher_Handle_ProjectContactInvited_ResendIgnoresVersions: the
+// versioned guard does not apply to a resend. Even with the ledger holding a
+// SUCCEEDED EMAIL step for the very same version, a resend always sends,
+// never reads the ledger, and uses the reminder template.
+func TestDispatcher_Handle_ProjectContactInvited_ResendIgnoresVersions(t *testing.T) {
+	identity, email := &mockIdentityProvisioner{existed: true}, &mockEmailSender{}
+	steps := &mockStepRecorder{emailAlreadySent: true, emailSentOn: firstInvitedOn}
+	d := newOnboardingDispatcher(identity, email, steps, true, true)
+
+	if err := d.Handle(context.Background(), resentInvitedRecordAt(firstInvitedOn)); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if steps.emailSentChecks != 0 {
+		t.Errorf("ledger consulted %d times on a resend, want 0", steps.emailSentChecks)
+	}
+	if len(email.calls) != 1 {
+		t.Fatalf("sent %d emails, want 1", len(email.calls))
+	}
+	if sent := email.calls[0]; !strings.Contains(sent.subject, "Reminder") || !strings.Contains(sent.htmlBody, "Here is your invitation to the project") {
+		t.Errorf("subject = %q, want the reminder template", sent.subject)
 	}
 	assertSteps(t, steps, "IDENTITY=SUCCEEDED", "EMAIL=SUCCEEDED")
 }

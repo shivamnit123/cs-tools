@@ -18,13 +18,18 @@
 
 import { useEffect, useMemo, useRef, useState, type JSX } from "react";
 import type {
+  CellAbsence,
   ScheduleAbsence,
   ScheduleAbsenceKind,
   ScheduleAssignment,
   ScheduleShift,
+  ScheduleTier,
 } from "../types";
-import { addDays, initialsOf, isRotationShift, mondayOf, toIsoDate } from "../utils/rota";
+import { addDays, initialsOf, isRotationShift, mondayOf, toIsoDate, zoneLabelOn, type RosterSpan } from "../utils/rota";
 import { useTeamColour } from "../utils/teamColourContext";
+
+export type { RosterSpan };
+const SPANS: readonly RosterSpan[] = [1, 3, 6];
 
 interface MonthRosterProps {
   /** The first month on the grid. */
@@ -33,6 +38,16 @@ interface MonthRosterProps {
    *  sheet this replaces showed a whole year; one month was too little to
    *  check a swap against last month or plan the next. */
   monthCount?: number;
+  /** The exact first and last day, where the grid is a window around a day
+   *  rather than whole months. Both or neither; with them, `month` and
+   *  `monthCount` are ignored. */
+  from?: Date;
+  to?: Date;
+  /** The span the reader has picked, and the way to change it. The page owns
+   *  it because the page fetches the months; without a handler there is no
+   *  choice to offer. */
+  span?: RosterSpan;
+  onSpanChange?: (span: RosterSpan) => void;
   assignments: ScheduleAssignment[];
   absences: ScheduleAbsence[];
   shifts: Map<string, ScheduleShift>;
@@ -94,15 +109,21 @@ interface MonthRosterProps {
     teamKey: string;
     rotaDate: string;
     shiftCode?: string;
+    /** The tier held on that window, where it holds one. */
+    tier?: ScheduleTier;
     absenceKindCode?: string;
     /** Which zone column was clicked, on an SRE day split across them. The
      *  picker narrows to that zone's own windows: offering TZ1's windows
      *  from the TZ2 column is a mis-click waiting to happen. Absent on a CRE
      *  day, and on leave, which belongs to the whole day rather than a zone. */
     zoneCode?: string;
+    /** The whole absence this cell is one day of, so the picker can offer to
+     *  remove all of it rather than the day that was clicked. */
+    absence?: CellAbsence;
     anchor: { top: number; left: number; bottom: number; right: number };
   }) => void;
 }
+
 
 interface Cell {
   code: string;
@@ -114,10 +135,28 @@ interface Cell {
   /** The window this cell came from, where it came from a rota row at all.
    *  Absent for leave and allocations, which are not a window. */
   shiftCode?: string;
+  /** The tier held on that window, where it holds one. */
+  tier?: ScheduleTier;
   /** The absence kind covering this day, where one does. The picker marks it
    *  as what is held so leave reads the same as a rotation does. */
   absenceKindCode?: string;
+  /** The span that kind comes from, which the picker can remove whole. */
+  absence?: CellAbsence;
 }
+
+/** What a weekday nobody has marked is: an ordinary working day.
+ *
+ *  Drawn, never stored. The rota sheet this replaces wrote LK into every
+ *  such cell by hand; here it is simply what an empty weekday means, so it
+ *  gives way the moment leave, an allocation or a turn is marked, and there
+ *  is nothing to clean up when one is. Not a turn, so "Rotations only" fades
+ *  it like the rest of the standing hours. */
+const WORKING_DAY: Cell = {
+  code: "LK",
+  token: "LK",
+  title: "Working day (LK)",
+  isRotation: false,
+};
 
 /**
  * The month as engineers down the side and days across the top -- the shape of
@@ -130,6 +169,10 @@ interface Cell {
 export default function MonthRoster({
   month,
   monthCount = 1,
+  from: rangeFrom,
+  to: rangeTo,
+  span,
+  onSpanChange,
   assignments,
   absences,
   shifts,
@@ -167,12 +210,19 @@ export default function MonthRoster({
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const touched = useRef(false);
 
+  // Keyed on the days themselves: the page hands a fresh Date each render.
+  const fromIso = rangeFrom ? toIsoDate(rangeFrom) : "";
+  const toIso = rangeTo ? toIsoDate(rangeTo) : "";
   const days = useMemo(() => {
-    const first = new Date(month.getFullYear(), month.getMonth(), 1);
-    const last = new Date(month.getFullYear(), month.getMonth() + monthCount, 0);
+    const first = fromIso
+      ? new Date(`${fromIso}T00:00:00`)
+      : new Date(month.getFullYear(), month.getMonth(), 1);
+    const last = toIso
+      ? new Date(`${toIso}T00:00:00`)
+      : new Date(month.getFullYear(), month.getMonth() + monthCount, 0);
     const count = Math.round((last.getTime() - first.getTime()) / 86_400_000) + 1;
-    return Array.from({ length: count }, (_, i) => new Date(first.getFullYear(), first.getMonth(), i + 1));
-  }, [month, monthCount]);
+    return Array.from({ length: count }, (_, i) => new Date(first.getFullYear(), first.getMonth(), first.getDate() + i));
+  }, [month, monthCount, fromIso, toIso]);
   /** The 1st of each month after the first: where the grid draws a month rule
    *  and names the month, so ninety columns still read as three months. */
   const opensMonth = (d: Date): boolean => d.getDate() === 1 && d.getTime() !== days[0].getTime();
@@ -222,13 +272,21 @@ export default function MonthRoster({
         days: Map<string, Cell>;
         /** Zoned facts, keyed `${iso}|${zoneCode}` -- one per sub-column. */
         zoned: Map<string, Cell>;
+        /** An allocation on a day that also holds a rotation turn. Kept beside
+         *  the turn rather than over it: an engineer on RnD who is also L1
+         *  for TZ1 that day is both, and the cell says both. */
+        allocs: Map<string, Cell>;
+        /** A zone's regular hours on a day the engineer also holds a turn in
+         *  that zone, keyed like `zoned`. Kept under the turn, the same way an
+         *  allocation is, so the cell says both: TZ1 regular hours and L1. */
+        zonedBase: Map<string, Cell>;
       }
     >();
 
     const seat = (userId: string, name: string, email: string, teamKey: string) => {
       let row = people.get(userId);
       if (!row) {
-        row = { name, email, teamKey, days: new Map(), zoned: new Map() };
+        row = { name, email, teamKey, days: new Map(), zoned: new Map(), allocs: new Map(), zonedBase: new Map() };
         people.set(userId, row);
       }
       return row;
@@ -251,6 +309,7 @@ export default function MonthRoster({
         title: shift?.label ?? a.shiftCode,
         isRotation,
         shiftCode: a.shiftCode,
+        tier: a.tier,
       };
 
       // A zoned window lands in its own sub-column; anything else is a fact
@@ -259,14 +318,33 @@ export default function MonthRoster({
       if (zone) {
         const key = `${a.rotaDate}|${zone}`;
         const held = row.zoned.get(key);
-        if (!held || a.tier) row.zoned.set(key, made);
+        if (!held) {
+          row.zoned.set(key, made);
+        } else if (made.isRotation && !held.isRotation) {
+          // A turn arriving over the zone's regular hours: the turn is the
+          // cell, the regular hours sit under it.
+          row.zonedBase.set(key, held);
+          row.zoned.set(key, made);
+        } else if (!made.isRotation && held.isRotation) {
+          row.zonedBase.set(key, made);
+        } else if (a.tier) {
+          row.zoned.set(key, made);
+        }
         continue;
       }
       if (!existing || a.tier) row.days.set(a.rotaDate, made);
     }
 
-    // Absences win: someone on leave is not on the rota that day, whatever a
-    // generated row says.
+    /** Does this engineer hold a rotation turn on this day -- anything but
+     *  regular hours -- in any zone or none? */
+    const holdsTurn = (row: { days: Map<string, Cell>; zoned: Map<string, Cell> }, iso: string) =>
+      Boolean(row.days.get(iso)?.isRotation) ||
+      [...row.zoned.entries()].some(([k, c]) => k.startsWith(`${iso}|`) && c.isRotation);
+
+    // Leave wins: someone on leave is not on the rota that day, whatever a
+    // generated row says. An allocation is different -- time given elsewhere
+    // does not stop someone holding a turn the same day -- so on a day with a
+    // turn it is kept beside it rather than over it.
     for (const ab of absences) {
       const kind = kindByCode.get(ab.kindCode);
       const row = seat(ab.engineer.userId, ab.engineer.name, ab.engineer.email, ab.teamKey);
@@ -279,8 +357,17 @@ export default function MonthRoster({
         const weekendDay = d.getDay() === 0 || d.getDay() === 6;
         if (weekendDay && kind?.bucket === "LEAVE") continue;
         if (iso >= ab.startsOn && iso <= end) {
-          row.days.set(iso, {
+          const target =
+            kind?.bucket === "ALLOCATION" && holdsTurn(row, iso) ? row.allocs : row.days;
+          target.set(iso, {
             absenceKindCode: ab.kindCode,
+            absence: {
+              id: ab.id,
+              kindCode: ab.kindCode,
+              startsOn: ab.startsOn,
+              endsOn: ab.endsOn,
+              allocatedTo: ab.allocatedTo,
+            },
             // An allocation names who it is for, where it knows: a lead
             // scanning the month wants "TFL", not six identical "CUS-OFF"s.
             // Clipped to what a day column holds; the title has it in full.
@@ -378,7 +465,9 @@ export default function MonthRoster({
       teamKey: row.teamKey,
       rotaDate: iso,
       shiftCode: cell?.shiftCode,
+      tier: cell?.tier,
       absenceKindCode: cell?.absenceKindCode,
+      absence: cell?.absence,
       zoneCode,
       anchor: { top: r.top, left: r.left, bottom: r.bottom, right: r.right },
     });
@@ -451,19 +540,23 @@ export default function MonthRoster({
   return (
     <>
       <div className="card-head">
-        <div className="seg teamseg" role="tablist" aria-label="Show CRE or SRE">
-          {families.map((f) => (
-            <button
-              key={f}
-              role="tab"
-              aria-selected={family === f}
-              className={family === f ? "on" : ""}
-              onClick={() => onFamilyChange(f)}
-            >
-              {f}
-            </button>
-          ))}
-        </div>
+        {/* One group means nothing to switch to: only Today, or a manager,
+            can look at the other group. */}
+        {families.length > 1 ? (
+          <div className="seg teamseg" role="tablist" aria-label="Show CRE or SRE">
+            {families.map((f) => (
+              <button
+                key={f}
+                role="tab"
+                aria-selected={family === f}
+                className={family === f ? "on" : ""}
+                onClick={() => onFamilyChange(f)}
+              >
+                {f}
+              </button>
+            ))}
+          </div>
+        ) : null}
 
         <h2>
           Roster <span className="count">{rows.length}</span>
@@ -499,6 +592,24 @@ export default function MonthRoster({
             ) : null}
           </label>
 
+          {onSpanChange ? (
+            // One month to work through, three to check a swap against the
+            // months around it, six to plan ahead. The same for CRE and SRE.
+            <div className="seg spanseg" role="group" aria-label="Months shown">
+              {SPANS.map((n) => (
+                <button
+                  key={n}
+                  type="button"
+                  className={span === n ? "on" : ""}
+                  aria-pressed={span === n}
+                  onClick={() => onSpanChange(n)}
+                >
+                  {n === 1 ? "1 month" : `${n} months`}
+                </button>
+              ))}
+            </div>
+          ) : null}
+
           <select
             className="teampick"
             aria-label="Show one team"
@@ -531,7 +642,11 @@ export default function MonthRoster({
         <table className={`tw roster${split ? " split" : ""}`}>
           <thead>
             <tr>
-              <th className="lab">Engineer</th>
+              {/* Spans the zone row too on a split day, so the heading sits in
+                  the middle of the header rather than on top of an empty cell. */}
+              <th className="lab eng" rowSpan={split ? 2 : undefined}>
+                Engineer
+              </th>
               {days.map((d) => {
                 const iso = toIsoDate(d);
                 const weekend = d.getDay() === 0 || d.getDay() === 6;
@@ -546,7 +661,10 @@ export default function MonthRoster({
                     title={d.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" })}
                   >
                     <span className="d">{d.getDate()}</span>
-                    {d.getDate() === 1 ? (
+                    {/* The month is named where it starts, and on the first
+                        column too: a window opening on the 14th still has to
+                        say which month the 14th is in. */}
+                    {d.getDate() === 1 || d.getTime() === days[0].getTime() ? (
                       <span className="mo">{d.toLocaleDateString(undefined, { month: "short" })}</span>
                     ) : null}
                   </th>
@@ -555,11 +673,10 @@ export default function MonthRoster({
             </tr>
 
             {/* The zone row. A weekend has two columns rather than three
-                because there is no weekend TZ3 window to be rostered into --
-                the catalogue says so, and this follows it. */}
+                because TZ1 and TZ2 are one crew at the weekend ("TZ1+2") and
+                TZ3 is as it is -- the catalogue says so, and this follows it. */}
             {split ? (
               <tr className="zrow">
-                <th className="lab" aria-hidden="true" />
                 {days.map((d) => {
                   const iso = toIsoDate(d);
                   const weekend = d.getDay() === 0 || d.getDay() === 6;
@@ -568,10 +685,12 @@ export default function MonthRoster({
                       key={`${iso}|${z}`}
                       className={`zc ${i === 0 ? "zfirst" : ""} ${weekend ? "wknd" : ""}${
                         i === 0 && opensMonth(d) ? " mstart" : ""
-                      }`}
+                      }${toIsoDate(d) === todayIso ? " today" : ""}${toIsoDate(d) === selectedIso ? " sel" : ""}`}
                       scope="col"
+                      title={zoneLabelOn(shifts, z, weekend) === z ? undefined : `${zoneLabelOn(shifts, z, weekend)}: TZ1 and TZ2 are one crew at the weekend`}
                     >
-                      {z}
+                      {/* "TZ1+2" at the weekend, when TZ1 and TZ2 are one crew. */}
+                      {zoneLabelOn(shifts, z, weekend)}
                     </th>
                   ));
                 })}
@@ -593,7 +712,9 @@ export default function MonthRoster({
               <tr
                 key={row.userId}
                 ref={isMe ? meRow : undefined}
-                className={`${isMe ? "me" : ""}${opensTeam ? " teamtop" : ""}`.trim() || undefined}
+                // Every other row banded, so one engineer's month reads across
+                // the grid without a hover to follow it.
+                className={`${isMe ? "me" : ""}${opensTeam ? " teamtop" : ""}${i % 2 === 1 ? " alt" : ""}`.trim() || undefined}
                 aria-current={isMe ? "true" : undefined}
               >
                 <th className="lab">
@@ -618,26 +739,47 @@ export default function MonthRoster({
                   const faded = (c: Cell | undefined) =>
                     rotationsOnly && c && !c.isRotation ? "muted" : "";
 
+                  const alloc = row.allocs.get(iso);
+                  /** A turn and the allocation beside it, as one thing to
+                   *  open: the picker shows the turn as held and offers to
+                   *  remove the allocation. */
+                  const withAlloc = (c: Cell | undefined): Cell | undefined =>
+                    alloc
+                      ? {
+                          ...(c ?? alloc),
+                          absenceKindCode: alloc.absenceKindCode,
+                          absence: alloc.absence,
+                          title: c ? `${c.title} · also ${alloc.title}` : alloc.title,
+                        }
+                      : c;
+
                   if (!split) {
                     const editable = canEdit(row.teamKey);
                     const touched = changedBy(row.userId, iso);
+                    // An unmarked weekday is a working day; a weekend is not.
+                    const shown = cell ?? alloc ?? (weekend ? undefined : WORKING_DAY);
                     return (
                       <td
                         key={iso}
-                        className={`${marks} ${faded(cell)}${editable ? " c editable" : ""}${
+                        className={`${marks} ${faded(shown)}${editable ? " c editable" : ""}${
                           touched.mark ? " touched" : ""
                         }`}
                         title={
                           editable
-                            ? `${row.name} · ${cell ? cell.title : "nothing rostered"}${touched.note} — click to change`
-                            : cell || touched.mark
-                              ? `${row.name} · ${cell ? cell.title : "nothing rostered"}${touched.note}`
+                            ? `${row.name} · ${shown ? (withAlloc(cell)?.title ?? shown.title) : "nothing rostered"}${touched.note} — click to change`
+                            : shown || touched.mark
+                              ? `${row.name} · ${shown ? shown.title : "nothing rostered"}${touched.note}`
                               : undefined
                         }
-                        onClick={editable ? (e) => openCell(e, row, iso, cell) : undefined}
+                        onClick={editable ? (e) => openCell(e, row, iso, withAlloc(cell)) : undefined}
                       >
-                        {cell ? (
-                          <span className={`chip sm ${cell.token}`}>{cell.code}</span>
+                        {cell && alloc ? (
+                          <span className="duo">
+                            <span className={`chip sm ${cell.token}`}>{cell.code}</span>
+                            <span className={`chip sm ${alloc.token}`}>{alloc.code}</span>
+                          </span>
+                        ) : shown ? (
+                          <span className={`chip sm ${shown.token}${shown === WORKING_DAY ? " dflt" : ""}`}>{shown.code}</span>
                         ) : (
                           <span className="none">·</span>
                         )}
@@ -649,31 +791,41 @@ export default function MonthRoster({
 
                   // Leave belongs to the day, not to a zone: somebody away is
                   // away from all of them, so it spans rather than picking one
-                  // arbitrarily.
-                  if (cell) {
+                  // arbitrarily. So does an unmarked weekday -- a working day,
+                  // in no zone yet -- which reads as one LK, not three blanks.
+                  const unmarked =
+                    !cell && !alloc && !weekend && zones.every((z) => !row.zoned.has(`${iso}|${z}`));
+                  const whole = cell ?? (unmarked ? WORKING_DAY : undefined);
+                  if (whole) {
                     const editable = canEdit(row.teamKey);
                     return (
                       <td
                         key={iso}
                         colSpan={zones.length}
-                        className={`c zwhole ${marks} ${faded(cell)}${
+                        className={`c zwhole ${marks} ${faded(whole)}${
                           editable ? " editable" : ""
                         }`}
                         title={
                           editable
-                            ? `${row.name} · ${cell.title} — click to change`
-                            : `${row.name} · ${cell.title}`
+                            ? `${row.name} · ${whole.title} — click to change`
+                            : `${row.name} · ${whole.title}`
                         }
                         onClick={editable ? (e) => openCell(e, row, iso, cell) : undefined}
                       >
-                        <span className={`chip sm ${cell.token}`}>{cell.code}</span>
+                        <span className={`chip sm ${whole.token}${whole === WORKING_DAY ? " dflt" : ""}`}>{whole.code}</span>
                       </td>
                     );
                   }
 
                   const editable = canEdit(row.teamKey);
                   return zones.map((z, i) => {
-                    const zc = row.zoned.get(`${iso}|${z}`);
+                    // A zone the engineer holds a turn in shows the turn; the
+                    // rest of the day shows the allocation that fills it.
+                    const turn = row.zoned.get(`${iso}|${z}`);
+                    const zc = turn ?? alloc;
+                    // Under a turn: the allocation the rest of the day is
+                    // given to, else the zone's regular hours.
+                    const under = turn && turn.isRotation ? (alloc ?? row.zonedBase.get(`${iso}|${z}`)) : alloc;
                     return (
                       <td
                         key={`${iso}|${z}`}
@@ -688,14 +840,22 @@ export default function MonthRoster({
                         } ${faded(zc)}${editable ? " editable" : ""}`}
                         title={
                           editable
-                            ? `${row.name} · ${z} · ${zc ? zc.title : "nothing rostered"} — click to change`
+                            ? `${row.name} · ${z} · ${zc ? (withAlloc(row.zoned.get(`${iso}|${z}`))?.title ?? zc.title) : "nothing rostered"} — click to change`
                             : zc
                               ? `${row.name} · ${z} · ${zc.title}`
                               : undefined
                         }
-                        onClick={editable ? (e) => openCell(e, row, iso, zc, z) : undefined}
+                        onClick={editable ? (e) => openCell(e, row, iso, withAlloc(row.zoned.get(`${iso}|${z}`)), z) : undefined}
                       >
-                        {zc ? (
+                        {turn && under ? (
+                          // The zone's turn and what it sits on, stacked: L1
+                          // in TZ1 on an RnD day, or on TZ1's regular hours --
+                          // the cell says both.
+                          <span className="duo">
+                            <span className={`chip sm ${turn.token}`}>{turn.code}</span>
+                            <span className={`chip sm ${under.token}`}>{under.code}</span>
+                          </span>
+                        ) : zc ? (
                           <span className={`chip sm ${zc.token}`}>{zc.code}</span>
                         ) : (
                           <span className="zempty" />

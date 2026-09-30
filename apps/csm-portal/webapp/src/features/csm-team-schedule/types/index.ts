@@ -64,6 +64,15 @@ export interface ScheduleAbsenceKind {
   bucket: "LEAVE" | "ALLOCATION" | "EXCLUDED";
   colourToken: string;
   sortOrder: number;
+  /** A tag a lead added from the portal, which a lead may also delete. The
+   *  catalogue's own kinds are never custom. */
+  custom?: boolean;
+  /** The rota the kind is offered on; absent for a kind both use, which is
+   *  every kind of leave. SRE allocates RnD, CRE allocates Migration. */
+  family?: "CRE" | "SRE";
+  /** No longer offered. Still served so the days already marked with it keep
+   *  their label, but a picker must not offer it. */
+  retired?: boolean;
 }
 
 /** One team the rota is run for, served so no client holds the list. */
@@ -123,6 +132,17 @@ export interface ScheduleAbsence {
   note?: string;
   /** Who an allocation is for -- the customer, or the product team for RnD.
    *  The kind says what sort of time it is; this says for whom. */
+  allocatedTo?: string;
+}
+
+/** One leave or allocation span as a roster cell hands it to the picker, so
+ *  the picker can remove the whole span rather than the day that was clicked. */
+export interface CellAbsence {
+  id: string;
+  kindCode: string;
+  startsOn: string;
+  /** Absent for a span that runs until further notice. */
+  endsOn?: string;
   allocatedTo?: string;
 }
 

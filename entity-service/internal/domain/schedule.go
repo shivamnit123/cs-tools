@@ -74,6 +74,15 @@ type ScheduleAbsenceKind struct {
 	Bucket      string `json:"bucket"`
 	ColourToken string `json:"colourToken"`
 	SortOrder   int    `json:"sortOrder"`
+	// Custom is true for a kind a lead added from the portal, which a lead may
+	// also delete. The catalogue's own kinds, seeded by migration, are not.
+	Custom bool `json:"custom"`
+	// Family is the rota the kind is offered on, CRE or SRE; absent for a kind
+	// both rotas use, which is every kind of leave.
+	Family *string `json:"family,omitempty"`
+	// Retired is true for a kind no longer offered. It is still served so the
+	// days already marked with it keep their label, but nothing should offer it.
+	Retired bool `json:"retired,omitempty"`
 }
 
 // ScheduleCatalogue is everything the UI needs before it can draw a rota:
@@ -157,6 +166,13 @@ type ApplyScheduleRangeRequest struct {
 	From      string  `json:"from"`
 	To        string  `json:"to"`
 	Note      *string `json:"note,omitempty"`
+	// Tier is L1, L2 or L3, for an escalation window that leaves the tier to
+	// the person (SRE_TZ1, SRE_TZ3, ...). Absent takes the window's own tier.
+	// A window that fixes a tier accepts only that one.
+	Tier *string `json:"tier,omitempty"`
+	// ZoneCode narrows a clear (ShiftCode empty) to that zone's turn, leaving
+	// the rest of the person's day. Only meaningful when clearing.
+	ZoneCode *string `json:"zoneCode,omitempty"`
 }
 
 // ApplyScheduleRangeResponse says what actually happened, because it is
@@ -184,6 +200,21 @@ type ApplyScheduleAbsenceRequest struct {
 	From     string  `json:"from"`
 	To       string  `json:"to"`
 	Note     *string `json:"note,omitempty"`
+	// AllocatedTo is who an allocation is for: the customer, or the product
+	// team for RnD. Kept only when KindCode is an ALLOCATION kind -- leave is
+	// not "for" anybody -- and dropped when blank.
+	AllocatedTo *string `json:"allocatedTo,omitempty"`
+}
+
+// CreateScheduleAbsenceKindRequest is a lead adding a kind of time away the
+// catalogue does not have yet. The kind is shared: once created it is offered
+// to every team. The code is derived from the label, not taken from the
+// caller, so two leads naming the same thing arrive at the same code.
+type CreateScheduleAbsenceKindRequest struct {
+	ShortCode   string `json:"shortCode"`
+	Label       string `json:"label"`
+	Bucket      string `json:"bucket"`
+	ColourToken string `json:"colourToken"`
 }
 
 // ApplyScheduleAbsenceResponse says what the span did to what was already

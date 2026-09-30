@@ -144,6 +144,15 @@ type SLAStatus struct {
 	Team                   string     `json:"team,omitempty"`
 	Priority               string     `json:"priority,omitempty"`
 	State                  string     `json:"state,omitempty"`
+	// ProjectOnboardingStatus/IsEvaluationAccount exist purely for this
+	// engine's own Chat-audience routing (see chataudience.Resolve, called
+	// from Engine.sendBreachAlert) — the same team/onboarding/evaluation
+	// facts entity-service resolves for its own project. Best-effort
+	// display/routing enrichment, not part of the SLA clock itself; see
+	// entity-service's own domain.SLAStatus doc comment for exactly how
+	// each is derived.
+	ProjectOnboardingStatus string `json:"projectOnboardingStatus,omitempty"`
+	IsEvaluationAccount     bool   `json:"isEvaluationAccount,omitempty"`
 }
 
 // searchSLAStatusResponse mirrors entity-service's domain.SearchSLAStatusResponse.

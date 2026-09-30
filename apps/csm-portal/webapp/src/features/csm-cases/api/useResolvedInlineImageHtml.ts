@@ -81,7 +81,18 @@ function blobToDataUrl(blob: Blob): Promise<string | null> {
  * request — the backend would 403 both anyway — and every referenced image is
  * replaced with a "no permission" placeholder instead of a blank `<img>`.
  *
- * @param html - Sanitized HTML that may contain `.iix` `<img>` src references.
+ * A third case: content authored before/without `sftpgoAttachmentStorageEnabled`
+ * never gets extracted into a `.iix`-referenced attachment at all — the image
+ * stays embedded as a raw base64 `data:` URI directly in the HTML, which
+ * `GET .../comments/search` already sends to anyone holding `PermView` alone
+ * (there's no separate attachment resource for `PermDownloadAttachment` to
+ * gate). `replaceInlineImageSrcs`'s `denyRawBase64` parameter hides these the
+ * same way — see its own doc comment for why this is a display-only
+ * mitigation, not a real confidentiality fix (the bytes already reached the
+ * browser by the time this runs).
+ *
+ * @param html - Sanitized HTML that may contain `.iix` `<img>` src references
+ * or raw base64-embedded images.
  */
 export function useResolvedInlineImageHtml(html: string): {
   resolvedHtml: string;
@@ -158,7 +169,7 @@ export function useResolvedInlineImageHtml(html: string): {
     .join(",");
 
   const resolvedHtml = useMemo(
-    () => replaceInlineImageSrcs(html, dataUrls, deniedIds),
+    () => replaceInlineImageSrcs(html, dataUrls, deniedIds, !canDownloadAttachment),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [html, dataUrlsKey, canDownloadAttachment],
   );

@@ -106,6 +106,27 @@ export const TZ2 = shift({
   sortOrder: 20,
 });
 
+/** TZ1's own L1 window -- the one escalation window that fixes its tier. */
+export const TZ1_L1 = shift({
+  code: "SRE_TZ1_L1",
+  shortCode: "L1",
+  label: "TZ1 L1 support",
+  family: "SRE",
+  zoneCode: "TZ1",
+  tier: "L1",
+  isEscalation: true,
+  sortOrder: 5,
+});
+export const TZ3 = shift({
+  code: "SRE_TZ3",
+  shortCode: "TZ3",
+  label: "TZ3 escalation",
+  family: "SRE",
+  zoneCode: "TZ3",
+  isEscalation: true,
+  sortOrder: 30,
+});
+
 /** The weekend pair. The catalogue has no weekend TZ3, which is why a
  *  weekend earns two zone columns and a weekday three -- and why the roster
  *  only splits a day at all when both scopes have zones to split into. */

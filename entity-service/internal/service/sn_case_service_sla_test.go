@@ -32,10 +32,11 @@ import (
 // projectId/caseId/state actually reach SLAEngineService, not the
 // resolver/repository logic behind it.
 type fakeSLAEngineService struct {
-	registerCalls []fakeSLARegisterCall
-	reviseCalls   []fakeSLARegisterCall
-	completeCalls []string // caseID
-	stateCalls    []fakeSLAStateCall
+	registerCalls           []fakeSLARegisterCall
+	reviseCalls             []fakeSLARegisterCall
+	completeCalls           []string // caseID (response clock)
+	completeWorkaroundCalls []string // caseID (workaround clock)
+	stateCalls              []fakeSLAStateCall
 }
 
 type fakeSLARegisterCall struct {
@@ -59,6 +60,10 @@ func (f *fakeSLAEngineService) ReviseCaseClocks(_ context.Context, caseID string
 
 func (f *fakeSLAEngineService) CompleteResponseClock(_ context.Context, caseID string) {
 	f.completeCalls = append(f.completeCalls, caseID)
+}
+
+func (f *fakeSLAEngineService) CompleteWorkaroundClock(_ context.Context, caseID string) {
+	f.completeWorkaroundCalls = append(f.completeWorkaroundCalls, caseID)
 }
 
 func (f *fakeSLAEngineService) ApplyCaseStateEffects(_ context.Context, caseID string, state domain.CaseState) {

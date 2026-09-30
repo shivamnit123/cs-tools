@@ -28,9 +28,12 @@ import (
 	"testing"
 	"time"
 
-	"sre-alert-ingestion-service/internal/auth"
 	"sre-alert-ingestion-service/internal/server"
 )
+
+type allowAll struct{}
+
+func (allowAll) Authenticate(*http.Request, string) error { return nil }
 
 // blockingPipeline holds each request until release is closed.
 type blockingPipeline struct {
@@ -81,7 +84,7 @@ func startInFlight(t *testing.T, pipe *blockingPipeline) (*server.Server, *http.
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := server.New(server.Options{
-		Logger: logger, Auth: auth.None{}, Pipeline: pipe, Vendors: []string{"aws"},
+		Logger: logger, Auth: allowAll{}, Pipeline: pipe, Vendors: []string{"aws"},
 		MaxBodyBytes: 1 << 20, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second,
 	})
 	httpSrv := srv.HTTPServer("")

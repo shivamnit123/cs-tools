@@ -276,11 +276,11 @@ type CaseCreatedPayload struct {
 	// dispatch.Dispatcher falls back to DEFAULT_CHAT_PRODUCT, same as before
 	// this field was populated.
 	Product string `json:"product,omitempty"`
-	// Team is the case's account's CRE team display name (e.g. "Team Nova")
+	// Team is the case's account's CRE team display name (e.g. "Castor")
 	// — cv.AccountDetails.CreTeam.Name, "" when the case has no account or
-	// the account has no CRE team assigned. A purely-display value in
-	// csm-notification-service's Chat cards, same as Product; unlike
-	// Product, it plays no role in routing. Depends on ServiceNow's
+	// the account has no CRE team assigned. Displayed in
+	// csm-notification-service's Chat cards — purely a display value there,
+	// no routing role (unlike Product). Depends on ServiceNow's
 	// case-embedded account object actually carrying creTeam/sreTeam — see
 	// caseTeamName's own doc comment for the current caveat around that.
 	Team        string   `json:"team,omitempty"`
@@ -344,5 +344,5 @@ type ProjectContactInvitedPayload struct {
 	// is what was actually asked for. Omitted on every ordinary invitation,
 	// so the wire shape is unchanged for them. Mirror any change here in
 	// csm-notification-service's own copy of this struct.
-	Resend bool `json:"resend,omitempty"`
+	Resend bool `json:"isResend,omitempty"`
 }

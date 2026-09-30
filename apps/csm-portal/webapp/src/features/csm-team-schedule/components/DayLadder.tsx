@@ -50,6 +50,21 @@ const HOUR_PX = 38;
  */
 const MIN_COLUMN_PX = 148;
 
+/** A lane holding a single column of cards -- TZ3, whose one card is its
+ *  whole night -- still has to show an engineer's full name, so it gets a
+ *  floor of its own above one column's, and a little more than one column's
+ *  share of the width. */
+const SINGLE_LANE_MIN_PX = 220;
+const SINGLE_LANE_SHARE = 1.25;
+
+/** How wide a lane must be, and what share of the spare width it takes. */
+function laneSizing(columns: number): { minWidth: number; flexGrow: number } {
+  const n = Math.max(1, columns);
+  return n === 1
+    ? { minWidth: SINGLE_LANE_MIN_PX, flexGrow: SINGLE_LANE_SHARE }
+    : { minWidth: n * MIN_COLUMN_PX, flexGrow: n };
+}
+
 const px = (minutes: number): number => Math.round((minutes / 60) * HOUR_PX);
 
 export interface LadderLane {
@@ -119,6 +134,9 @@ interface Block {
   /** Lay the sections out as columns rather than stacked -- for a card that
    *  holds several windows with the same hours, in a lane wide enough for it. */
   sideBySide?: boolean;
+  /** The sections are the escalation ladder, L1 to L3: every tier is shown,
+   *  empty ones included, each ruled off from the next. */
+  tiered?: boolean;
 }
 
 /** The escalation tiers, in the order the rota talks about them. */
@@ -143,6 +161,23 @@ function noteFor(
 }
 
 /** How many names a card shows before it counts the rest. */
+/**
+ * The off-rota column's width on a day with a single lane (CRE). The narrow
+ * width it has elsewhere is SRE's budget -- three zone lanes have to fit a
+ * laptop -- but CRE's one lane leaves room, and off rota is where CRE carries
+ * the most: leave by team, allocations, and who each is for.
+ */
+const OFF_ROTA_WIDE_PX = 340;
+
+/**
+ * Off rota's width on a day with several lanes (SRE's zones). The stylesheet
+ * sizes the column; this is the allowance the ladder's minimum width makes for
+ * it. The two move together -- 80px over the original 240 on both sides -- so
+ * off rota widens by adding to the day rather than by taking from the zone
+ * lanes beside it.
+ */
+const OFF_ROTA_PX = 320;
+
 const NAME_LIMIT = 12;
 
 /**
@@ -310,10 +345,12 @@ export default function DayLadder({
           const startMin = Math.min(...items.map((x) => x.p.startMin));
           const endMin = Math.max(...items.map((x) => x.p.endMin));
           const earliest = items.reduce((a, b) => (a.p.startMin <= b.p.startMin ? a : b));
+          // Every tier, empty ones included: an escalation that has nobody at
+          // L3 says so, rather than reading as though L3 did not exist.
           const sections: BlockRow[] = TIERS.map((tier) => ({
             label: `${tier} escalation`,
             list: items.filter((x) => x.a.tier === tier).map((x) => x.a),
-          })).filter((r) => r.list.length > 0);
+          }));
 
           return {
             key: `${laneName}:escalation:${segment}`,
@@ -324,6 +361,7 @@ export default function DayLadder({
             note: noteFor(earliest.p, earliest.a, tz),
             rows: items.map((x) => x.a),
             sections,
+            tiered: true,
           };
         })
         .sort((a, b) => a.startMin - b.startMin);
@@ -340,7 +378,25 @@ export default function DayLadder({
         title: `Others in ${lane.name}`,
         hideTags: true,
       }));
-      return { ...lane, columns: [escalationCards(lane.name, tiered), others] };
+      // A zone whose regular hours are the same stretch as its escalation
+      // window -- TZ3, 21:00-06:00, with no middle of the day to cover -- is
+      // one card, not two side by side saying the same hours twice: the
+      // regular-hours people become a last section of the escalation card.
+      // TZ1 and TZ2 work regular hours wider than their escalation block, so
+      // theirs stay cards of their own.
+      const escalation = escalationCards(lane.name, tiered);
+      const apart = others.filter((o) => {
+        const same = escalation.find((e) => e.startMin === o.startMin && e.endMin === o.endMin);
+        if (!same) return true;
+        same.sections = [...(same.sections ?? []), { label: "Regular hours", list: o.rows }];
+        same.rows = [...same.rows, ...o.rows];
+        return false;
+      });
+      // An empty column is left out rather than drawn: a zone with nobody
+      // on ordinary hours that day should not hold half its width open for
+      // them, while the zones beside it cut their card titles short.
+      const columns = [escalation, apart].filter((c) => c.length > 0);
+      return { ...lane, columns: columns.length > 0 ? columns : [[]] };
     });
   }, [day, lanes, shifts, tz]);
 
@@ -368,8 +424,8 @@ export default function DayLadder({
   const ladderWidth = useMemo(
     () =>
       56 +
-      built.reduce((sum, lane) => sum + Math.max(1, lane.columns.length) * MIN_COLUMN_PX + 12, 0) +
-      240,
+      built.reduce((sum, lane) => sum + laneSizing(lane.columns.length).minWidth + 12, 0) +
+      (built.length === 1 ? OFF_ROTA_WIDE_PX : OFF_ROTA_PX),
     [built],
   );
 
@@ -389,19 +445,23 @@ export default function DayLadder({
           looking at, and which team within it, stated where the day is read
           rather than only in the page toolbar above. */}
       <div className="card-head">
-        <div className="seg teamseg" role="tablist" aria-label="Show CRE or SRE">
-          {families.map((f) => (
-            <button
-              key={f}
-              role="tab"
-              aria-selected={family === f}
-              className={family === f ? "on" : ""}
-              onClick={() => onFamilyChange(f)}
-            >
-              {f}
-            </button>
-          ))}
-        </div>
+        {/* One group means nothing to switch to: only Today, or a manager,
+            can look at the other group. */}
+        {families.length > 1 ? (
+          <div className="seg teamseg" role="tablist" aria-label="Show CRE or SRE">
+            {families.map((f) => (
+              <button
+                key={f}
+                role="tab"
+                aria-selected={family === f}
+                className={family === f ? "on" : ""}
+                onClick={() => onFamilyChange(f)}
+              >
+                {f}
+              </button>
+            ))}
+          </div>
+        ) : null}
 
         <h2>
           On the rota <span className="count">{headcount}</span>
@@ -438,7 +498,7 @@ export default function DayLadder({
           TZ1's column. Sticky to the top keeps them visible while the day
           scrolls down; being in the same scroller keeps them over the right
           column while it scrolls across. */}
-      <div className="ladhd" style={{ minWidth: ladderWidth }}>
+      <div className={`ladhd${built.length === 1 ? " onelane" : ""}`} style={{ minWidth: ladderWidth }}>
         {/* The clock sits at the head of the column of times it describes,
             aligned with the hours below it -- the same place a table puts a
             unit. A sentence above the card said the same thing in a whole row
@@ -452,10 +512,10 @@ export default function DayLadder({
             className="lnh"
             style={{
               ["--zc" as string]: lane.colour ?? "var(--faint)",
-              // The same floor its lane has. Without it the heading row and
-              // the lane row distribute their flex space differently and each
-              // heading sits a few pixels off the column it names.
-              minWidth: Math.max(1, lane.columns.length) * MIN_COLUMN_PX,
+              // The same floor and share its lane has. Without them the heading
+              // row and the lane row distribute their flex space differently
+              // and each heading sits off the column it names.
+              ...laneSizing(lane.columns.length),
             }}
           >
             <span className="zchip">{lane.name}</span>
@@ -468,7 +528,10 @@ export default function DayLadder({
         </div>
       </div>
 
-      <div className="ladder" style={{ height: px(1440) + 8, minWidth: ladderWidth }}>
+      <div
+        className={`ladder${built.length === 1 ? " onelane" : ""}`}
+        style={{ height: px(1440) + 8, minWidth: ladderWidth }}
+      >
           <div className="lax">
             {hours.map((h) => (
               <span key={h} className="hr" style={{ top: px(h * 60) }}>
@@ -489,7 +552,10 @@ export default function DayLadder({
                 className="lane"
                 style={{
                   ["--zc" as string]: lane.colour ?? "var(--faint)",
-                  minWidth: Math.max(1, lane.columns.length) * MIN_COLUMN_PX,
+                  // A share of the day's width per column of cards it holds,
+                  // not an equal share per zone: a zone with two cards side
+                  // by side needs twice the room of one with a single card.
+                  ...laneSizing(lane.columns.length),
                 }}
               >
                 <div className={`lncols${lane.columns.length < 2 ? " one" : ""}`}>
@@ -604,7 +670,9 @@ function LadderBlock({ block, tz }: { block: Block; tz: string }): JSX.Element {
         <span className="zbn">{block.rows.length}</span>
       </div>
       {block.note ? <div className="zbw">{block.note}</div> : null}
-      <div className={`zbp${block.sections && block.sideBySide ? " sides" : ""}`}>
+      <div
+        className={`zbp${block.sections && block.sideBySide ? " sides" : ""}${block.tiered ? " tiers" : ""}`}
+      >
         {block.sections ? (
           // A row per tier, each with its own heading: "who is L2 here" is a
           // question the reader should not have to answer by scanning.
@@ -619,6 +687,7 @@ function LadderBlock({ block, tz }: { block: Block; tz: string }): JSX.Element {
                 // name costs width that the name itself needs.
                 <NameRow key={a.id} assignment={a} hideTag />
               ))}
+              {section.list.length === 0 ? <span className="gap">Nobody rostered</span> : null}
             </div>
           ))
         ) : crowded ? (

@@ -92,11 +92,20 @@ type SLAEngineService interface {
 	// sn_case_service.go's applyResponseSLAOnComment-equivalent hook for the
 	// exact qualification check, ported from the old design).
 	CompleteResponseClock(ctx context.Context, caseID string)
-	// ApplyCaseStateEffects pauses/resumes/completes the case's
-	// CSM-authored "workaround"/"resolution" clocks in reaction to a
-	// state-changing PATCH -- see the old design's applyCaseStateSLAEffects
-	// for the exact per-state behavior this ports (unchanged, including its
-	// documented workaround-completion gap).
+	// CompleteWorkaroundClock marks the case's CSM-authored "workaround"
+	// clock ACHIEVED -- called when a case's WorkaroundProvided is set to
+	// true (the "Provide Workaround" action), the one genuine "workaround
+	// was provided" signal that exists anywhere in the domain model. Closes
+	// a real, previously-accepted gap: ApplyCaseStateEffects below only
+	// ever paused this clock, on any state including Closed, since it had
+	// no signal of its own to complete it on.
+	CompleteWorkaroundClock(ctx context.Context, caseID string)
+	// ApplyCaseStateEffects pauses/resumes the case's CSM-authored
+	// "workaround"/"resolution" clocks, and completes "resolution", in
+	// reaction to a state-changing PATCH -- see the old design's
+	// applyCaseStateSLAEffects for the exact per-state behavior this ports.
+	// "workaround" is only ever paused/resumed here, never completed --
+	// CompleteWorkaroundClock above is its own, independent trigger.
 	ApplyCaseStateEffects(ctx context.Context, caseID string, state domain.CaseState)
 }
 
@@ -239,6 +248,13 @@ func (s *slaEngineService) ReviseCaseClocks(ctx context.Context, caseID string, 
 func (s *slaEngineService) CompleteResponseClock(ctx context.Context, caseID string) {
 	if _, err := s.repo.CompleteClock(ctx, caseID, slaClockTypeTarget[slaClockTypeResponse]); err != nil {
 		slog.ErrorContext(ctx, "sla engine: complete response clock failed", "caseId", caseID, "err", err)
+	}
+}
+
+// CompleteWorkaroundClock implements SLAEngineService.
+func (s *slaEngineService) CompleteWorkaroundClock(ctx context.Context, caseID string) {
+	if _, err := s.repo.CompleteClock(ctx, caseID, slaClockTypeTarget[slaClockTypeWorkaround]); err != nil {
+		slog.ErrorContext(ctx, "sla engine: complete workaround clock failed", "caseId", caseID, "err", err)
 	}
 }
 

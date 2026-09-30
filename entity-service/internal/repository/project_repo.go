@@ -308,6 +308,8 @@ func (r *projectRepo) GetProjectByID(ctx context.Context, id string, scope Searc
 	// still resolve, just with SubscriptionType/HasSr left at their zero
 	// value below.
 	var projectTypeName *string
+	// sf_id is nullable in production data (migration 0095 dropped NOT NULL).
+	var sfID *string
 	// has_service_request_write_access (migration 0130) is a direct port of
 	// ServiceNow's ProjectTypeFeatureManager.FEATURE_MATRIX (see
 	// reference_data_repo.go's own doc comment) -- reusing it here is what
@@ -380,7 +382,7 @@ func (r *projectRepo) GetProjectByID(ctx context.Context, id string, scope Searc
 		 LEFT JOIN "user" amu ON amu.id = a.account_manager_id
 		 WHERE p.id = $1`+scopeClause, scopeArgs...,
 	).Scan(
-		&v.ID, &v.SfID, &v.Name, &v.Key,
+		&v.ID, &sfID, &v.Name, &v.Key,
 		&v.StartDate, &v.EndDate, &v.CreatedOn, &v.UpdatedOn,
 		&aID, &aName, &aNumber, &v.Account.ActivationDate, &v.Account.Region,
 		&agentEnabled, &kbReferencesEnabled,
@@ -416,6 +418,7 @@ func (r *projectRepo) GetProjectByID(ctx context.Context, id string, scope Searc
 	if aNumber != nil {
 		v.Account.Number = *aNumber
 	}
+	v.SfID = stringOrEmpty(sfID)
 	v.Account.AgentEnabled = agentEnabled != nil && *agentEnabled
 	v.Account.KbReferencesEnabled = kbReferencesEnabled != nil && *kbReferencesEnabled
 	v.Account.Tier = stringOrEmpty(supportTier)

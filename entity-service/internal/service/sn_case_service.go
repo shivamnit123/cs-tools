@@ -1074,27 +1074,59 @@ func (s *snCaseService) CreateCase(ctx context.Context, req domain.CreateCaseReq
 }
 
 // registerCaseSLAClocks best-effort registers the CSM-native SLA engine's
-// clocks for a newly created case (see SLAEngineService.RegisterCaseClocks).
-// Skips entirely when s.slaEngine is nil (no database configured — see
-// snCaseService.slaEngine's own doc comment) or when the re-fetch below
-// fails; both are logged, neither fails case creation.
+// clocks for a newly created case — a thin wrapper around
+// registerCaseSLAClocksEvent using this service's own slaEngine/GetCaseByID
+// (see that function's own doc comment for the shared logic and why it's
+// factored out).
 func (s *snCaseService) registerCaseSLAClocks(ctx context.Context, caseID string) {
-	if s.slaEngine == nil {
+	registerCaseSLAClocksEvent(ctx, s.slaEngine, s.GetCaseByID, caseID)
+}
+
+// registerCaseSLAClocksEvent is registerCaseSLAClocks's actual body,
+// factored out to a package-level function so caseService.createCaseSNFirst
+// (the dual-write pilot) can call it too, AFTER its own Postgres insert
+// succeeds — same reasoning publishCaseCreatedEvent's
+// own doc comment gives for the publish call, and for the identical
+// underlying problem: registering a clock here inserts into "sla", whose
+// work_item_id has a hard foreign key against work_item(id) (migration
+// 0048). Calling this any earlier — as it used to, unconditionally inside
+// snCaseService.CreateCase, reached via snCaseMirrorSvc.CreateCase in
+// dual-write mode BEFORE createCaseSNFirst's own Postgres insert — fails
+// with a foreign-key violation (SQLSTATE 23503) every time, since that
+// mode's own Postgres work_item row doesn't exist yet at that point. This
+// was a real, live-observed bug: every dual-write case creation logged
+// "sla engine: register clock failed" and registered no clocks at all,
+// silently (best-effort, logged only — never surfaced to the caller or
+// retried), which meant no SLA breach alert ever fired for any dual-write
+// case. Fixed by disabling snCaseMirrorSvc's own automatic registration
+// (routes.go now constructs it with a nil slaEngine, mirroring its
+// existing nil publisher) and having createCaseSNFirst call this function
+// itself once its own insert has succeeded — the exact same fix shape
+// publishCaseCreatedEvent already established for the publish call.
+//
+// getCaseByID is the caller's own GetCaseByID method value (ServiceNow-backed
+// for snCaseService, Postgres-backed for caseService) — re-fetches rather
+// than trusting the create response for severity/projectID, same
+// "independent re-fetch" pattern every other best-effort hook in this file
+// uses. Skips entirely when slaEngine is nil (no database configured) or
+// when the re-fetch fails; both are logged, neither fails case creation.
+func registerCaseSLAClocksEvent(ctx context.Context, slaEngine SLAEngineService, getCaseByID func(context.Context, string) (domain.CaseView, error), caseID string) {
+	if slaEngine == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(ctx, applyCaseStateSLATimeout)
 	defer cancel()
 
-	cv, err := s.GetCaseByID(ctx, caseID)
+	cv, err := getCaseByID(ctx, caseID)
 	if err != nil {
-		slog.ErrorContext(ctx, "sn create case: sla clock registration not evaluated, get case failed", "caseId", caseID)
+		slog.ErrorContext(ctx, "create case: sla clock registration not evaluated, get case failed", "caseId", caseID)
 		return
 	}
 	projectID := ""
 	if cv.ProjectDetails != nil {
 		projectID = cv.ProjectDetails.ID
 	}
-	s.slaEngine.RegisterCaseClocks(ctx, caseID, cv.Severity, projectID)
+	slaEngine.RegisterCaseClocks(ctx, caseID, cv.Severity, projectID)
 }
 
 // publishCaseCreated best-effort publishes a case.created event for a newly
@@ -1115,9 +1147,7 @@ func (s *snCaseService) publishCaseCreated(ctx context.Context, req domain.Creat
 // in this mode) cannot yet, or ever, return. getCaseByID is the caller's
 // own GetCaseByID method value (ServiceNow-backed for snCaseService,
 // Postgres-backed for caseService) — this function is data-source-agnostic
-// beyond that. resolveProjectContactEmailsByRole is the caller's own
-// ProjectContactEmailsByRole method value, used only for req.Type ==
-// "announcement" (see below).
+// beyond that.
 //
 // It re-fetches the case via getCaseByID rather than building the payload
 // from the create response/req alone: a create response carries only a
@@ -1125,6 +1155,10 @@ func (s *snCaseService) publishCaseCreated(ctx context.Context, req domain.Creat
 // display name, the project's name, and each watcher's email — exactly
 // what events.CaseCreatedPayload needs and req/the create response don't
 // have.
+//
+// resolveProjectContactEmailsByRole is the caller's own
+// ProjectContactEmailsByRole method value, used only for req.Type ==
+// "announcement" (see below).
 //
 // Only type=="case" requires a severity to publish at all: a case with no
 // severity has no priority to report (CaseCreatedPayload.Priority has no
@@ -1751,8 +1785,16 @@ func publishSeverityChangedEvent(ctx context.Context, publisher EventPublisherSe
 		return
 	}
 
+	// before.ProjectDetails is nilable on the Postgres data source (this
+	// function serves both, called directly from caseService.UpdateCase
+	// too) — see publishCaseAssigned's own comment.
+	projectID := ""
+	if before.ProjectDetails != nil {
+		projectID = before.ProjectDetails.ID
+	}
+
 	payload, err := json.Marshal(events.SeverityChangedPayload{
-		ProjectID:   before.ProjectDetails.ID,
+		ProjectID:   projectID,
 		CaseID:      caseID,
 		CaseNumber:  before.Number,
 		WSO2CaseID:  before.InternalID,
@@ -3352,6 +3394,16 @@ func (s *snCaseService) UpdateCase(ctx context.Context, req domain.UpdateCaseReq
 	if s.slaEngine != nil && req.State != nil && resp.Case.State != nil {
 		s.applyCaseStateSLAEffects(ctx, req.ID, derefState(resp.Case.State))
 	}
+	// Deliberately independent of s.publisher, same reasoning as the state
+	// effects call just above. WorkaroundProvided is the one genuine
+	// "workaround was provided" signal anywhere in the domain model --
+	// applyCaseStateSLAEffects only ever pauses/resumes this clock, never
+	// completes it. false (a recall) is deliberately not handled the
+	// opposite way -- see SLAEngineService.CompleteWorkaroundClock's own
+	// doc comment.
+	if s.slaEngine != nil && req.WorkaroundProvided != nil && *req.WorkaroundProvided {
+		s.slaEngine.CompleteWorkaroundClock(ctx, req.ID)
+	}
 	if publishCaseAssign {
 		assigneeName := assigneeEmail
 		if snResp.Case.AssignedTo != nil && snResp.Case.AssignedTo.Name != "" {
@@ -3392,6 +3444,20 @@ func (s *snCaseService) UpdateCase(ctx context.Context, req domain.UpdateCaseReq
 			projectID = caseBeforeSeverity.ProjectDetails.ID
 		}
 		s.reviseCaseSLAClocks(ctx, req.ID, resp.Case.Severity, projectID)
+		// reviseCaseSLAClocks' own replacement clocks always start
+		// IN_PROGRESS, with no awareness of the case's current state -- a
+		// case already paused (Awaiting Info/Solution Proposed) at the
+		// moment its severity changes would otherwise get fresh
+		// workaround/resolution clocks that immediately start counting
+		// down unpaused, producing a false breach later. Re-applying
+		// applyCaseStateSLAEffects against the case's already-known
+		// current state (State is mutually exclusive with Severity on one
+		// request, so caseBeforeSeverity's State here is unaffected by
+		// this update) re-pauses them to match reality; a harmless no-op
+		// when the case isn't currently paused.
+		if caseBeforeSeverity.State != nil {
+			s.applyCaseStateSLAEffects(ctx, req.ID, *caseBeforeSeverity.State)
+		}
 	}
 
 	return resp, nil
@@ -3415,8 +3481,26 @@ func (s *snCaseService) UpdateCase(ctx context.Context, req domain.UpdateCaseReq
 // traffic. At most one of state/severity/workState/markFixIssued is expected
 // non-nil at a time -- this method does not enforce that itself, the caller
 // already has.
-func (s *snCaseService) patchCaseFields(ctx context.Context, caseID string, state *domain.CaseState, severity *domain.CaseSeverity, workState *domain.CaseWorkState, markFixIssued *bool) (domain.UpdatedCase, error) {
+func (s *snCaseService) patchCaseFields(ctx context.Context, caseID string, state *domain.CaseState, severity *domain.CaseSeverity, workState *domain.CaseWorkState, markFixIssued *bool, resolution *caseResolutionFields) (domain.UpdatedCase, error) {
 	payload := snUpdateCasePayload{}
+	if resolution != nil {
+		if resolution.Code != nil {
+			key, ok := snResolutionCodeKey[*resolution.Code]
+			if !ok {
+				return domain.UpdatedCase{}, &apierror.ValidationError{Msg: "resolutionCode contains invalid value: " + string(*resolution.Code)}
+			}
+			payload.ResolutionCode = &key
+		}
+		if resolution.Cause != nil {
+			key, ok := snCauseKey[*resolution.Cause]
+			if !ok {
+				return domain.UpdatedCase{}, &apierror.ValidationError{Msg: "cause contains invalid value: " + string(*resolution.Cause)}
+			}
+			val := strconv.Itoa(key)
+			payload.Cause = &val
+		}
+		payload.CloseNotes = resolution.CloseNotes
+	}
 	if state != nil {
 		if !validCaseState[*state] {
 			return domain.UpdatedCase{}, &apierror.ValidationError{Msg: "state contains invalid value: " + string(*state)}

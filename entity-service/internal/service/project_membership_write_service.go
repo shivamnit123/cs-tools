@@ -691,7 +691,14 @@ type salesforceWriteRecord struct {
 // have succeeded. A by-id read that fails for any reason falls back to the
 // address search, so every self-healing path this had before still works.
 func (s *projectMembershipWriteService) writeSalesforce(ctx context.Context, wc repository.MembershipWriteContext, intent salesforceWriteIntent) (domain.SalesforceMembershipUpsert, salesforceWriteRecord, error) {
+	// preWriteModified and patched let the version stamped on this write be
+	// kept strictly newer than the record's version before the PATCH.
+	var preWriteModified time.Time
+	var patched bool
 	var rec salesforceWriteRecord
+	// writtenRoles is the Role__c list Salesforce ends up with: the intent's
+	// roles, plus on an update the labels the portal does not manage.
+	writtenRoles := intent.Roles
 
 	var contact salesentity.Contact
 	var found bool
@@ -767,10 +774,20 @@ func (s *projectMembershipWriteService) writeSalesforce(ctx context.Context, wc 
 			state = &intent.State
 		}
 		if intent.SetRoles {
-			r := intent.Roles
-			roles = &r
+			// Role__c is replaced as a whole list, and the portal owns only
+			// four of its labels. The rest (Business Contact, the D2 labels,
+			// anything newer) are set in Salesforce and must survive a
+			// portal edit, so they are read off the record just fetched.
+			merged, merr := mergePortalManagedRoles(intent.Roles, membership)
+			if merr != nil {
+				return domain.SalesforceMembershipUpsert{}, rec, merr
+			}
+			writtenRoles = merged
+			roles = &merged
 		}
 		if state != nil || roles != nil {
+			preWriteModified, _ = parseSalesforceLastModified(membership.LastModifiedDate)
+			patched = true
 			// PATCH answers with the record it re-read, or 200 with an empty
 			// body when only that re-read failed. An empty body is a zero
 			// value, not an error: the write landed either way, so the id we
@@ -789,10 +806,19 @@ func (s *projectMembershipWriteService) writeSalesforce(ctx context.Context, wc 
 		return domain.SalesforceMembershipUpsert{}, rec, &apierror.ServiceUnavailableError{Msg: "sales/sales-entity-service returned a membership with no id"}
 	}
 	rec.State = intent.State
-	rec.Roles = intent.Roles
-	if modified, ok := parseSalesforceLastModified(membership.LastModifiedDate); ok {
+	rec.Roles = writtenRoles
+	modified, ok := parseSalesforceLastModified(membership.LastModifiedDate)
+	switch {
+	case patched && (!ok || !modified.After(preWriteModified)):
+		// The PATCH landed but its re-read was empty or stale, so the record
+		// in hand still carries the pre-write version. This write must be
+		// strictly newer than that version, at the ledger's microsecond
+		// precision, or csm-notification-service reads a re-invitation as a
+		// duplicate of the last one and drops its email.
+		rec.LastModifiedOn = laterOf(time.Now().UTC(), preWriteModified.Add(time.Microsecond))
+	case ok:
 		rec.LastModifiedOn = modified
-	} else {
+	default:
 		rec.LastModifiedOn = time.Now().UTC()
 	}
 
@@ -810,7 +836,10 @@ func (s *projectMembershipWriteService) writeSalesforce(ctx context.Context, wc 
 
 	groups := intent.Groups
 	if groups == nil {
-		groups, _ = mapProjectGroups(intent.Roles)
+		// From what Salesforce now holds, so a preserved Business Contact
+		// keeps its group here too rather than waiting for an echo that
+		// the version stamp below suppresses.
+		groups, _ = mapProjectGroups(writtenRoles)
 	}
 	// The Salesforce value wins for a contact that already existed. For one
 	// this call just CREATED, POST /contacts is only contracted to return an
@@ -821,7 +850,11 @@ func (s *projectMembershipWriteService) writeSalesforce(ctx context.Context, wc 
 	if rec.CreatedContact && contact.IsCsIntegrationUser == nil {
 		isIntegrationUser = intent.IsCsIntegrationUser
 	}
-	globalRoles, managed, adminRole := mapGlobalRoles(membershipType, isIntegrationUser)
+	// customer/partner follow the contact's account classification, as in
+	// the ingest. A contact this call just created carries no account in
+	// the create response; mapGlobalRoles then treats it as a customer
+	// without revoking anything.
+	globalRoles := mapGlobalRoles(contact.Account, isIntegrationUser)
 
 	first, last := strings.TrimSpace(derefString(contact.FirstName)), strings.TrimSpace(derefString(contact.LastName))
 	if first == "" && last == "" {
@@ -854,9 +887,10 @@ func (s *projectMembershipWriteService) writeSalesforce(ctx context.Context, wc 
 		IsCsIntegrationUser: isIntegrationUser,
 		ProjectSfID:         wc.Target.ProjectSfID,
 		ProjectKey:          wc.Target.ProjectKey,
-		GlobalRoles:         globalRoles,
-		ManagedAdminRoles:   managed,
-		AdminRoleName:       adminRole,
+		GlobalRoles:         globalRoles.Grant,
+		ManagedGlobalRoles:  globalRoles.ManagedGlobal,
+		ManagedAdminRoles:   globalRoles.ManagedAdmin,
+		AdminRoleName:       globalRoles.AdminRole,
 		ProjectGroups:       groups,
 	}, rec, nil
 }
@@ -903,7 +937,14 @@ func (s *projectMembershipWriteService) publishInvited(ctx context.Context, m do
 		Roles:             m.Roles,
 		IsIntegrationUser: rec.IsIntegrationUser,
 		Type:              rec.Type,
-		Resend:            resend,
+		// The Salesforce record's LastModifiedDate after this write -- the
+		// same version the DATABASE step is stamped with. csm-notification-
+		// service compares it with the one on its recorded EMAIL step to
+		// tell a re-invitation (newer) from a duplicate (same or older);
+		// without it a portal re-invitation of a contact who was invited
+		// once before is indistinguishable from a duplicate and is dropped.
+		EventModifiedOn: rec.LastModifiedOn.UTC().Format(time.RFC3339Nano),
+		Resend:          resend,
 	})
 	if err != nil {
 		slog.ErrorContext(ctx, "membership write: encode project_contact.invited payload", "membershipSfId", m.MembershipSfID, "err", err)
@@ -1025,4 +1066,59 @@ func canonicalSalesforceRoles(raw []string) ([]string, error) {
 		out = append(out, label)
 	}
 	return out, nil
+}
+
+// mergePortalManagedRoles is the Role__c list a portal role edit writes to
+// an existing Salesforce membership: the requested portal-managed labels
+// (validSalesforceRoles: Portal user, Security Contact, Lead, Admin) first,
+// then every other label the membership already carries, in its stored
+// order — Business Contact, Business Owner/Promoter/Detractor, Technical
+// Owner/Champion/Detractor, and any label this service has never seen. A
+// portal-managed label the request leaves out is removed; nothing else is.
+//
+// The current list comes from the record the write path just fetched:
+// roles (Sales Entity documents it as never null), else the raw
+// semicolon-separated role. When the record carries neither, the current
+// roles are unknown, and writing the requested list would silently erase
+// whatever Salesforce holds, so the write fails instead (503: the caller
+// may retry once Sales Entity answers in full).
+func mergePortalManagedRoles(requested []string, current salesentity.ProjectContact) ([]string, error) {
+	var existing []string
+	switch {
+	case current.Roles != nil:
+		existing = current.Roles
+	case current.Role != nil:
+		existing = splitSalesforceRoles(*current.Role)
+	default:
+		return nil, &apierror.ServiceUnavailableError{Msg: "the Salesforce membership's current roles could not be read; not overwriting them"}
+	}
+	out := make([]string, 0, len(requested)+len(existing))
+	seen := map[string]bool{}
+	add := func(label string) {
+		label = strings.TrimSpace(label)
+		key := strings.ToLower(label)
+		if key == "" || seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, label)
+	}
+	for _, r := range requested {
+		add(r)
+	}
+	for _, r := range existing {
+		if _, managed := validSalesforceRoles[strings.ToLower(strings.TrimSpace(r))]; managed {
+			continue
+		}
+		add(r)
+	}
+	return out, nil
+}
+
+// laterOf returns the later of two instants.
+func laterOf(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
 }
