@@ -123,11 +123,19 @@ func (r *deploymentRepo) SearchDeployments(ctx context.Context, req domain.Searc
 	// returns a row -- CreatedBy comes back nil rather than a fabricated
 	// EntityRef with an empty id (see the domain package's own
 	// "empty strings must never appear" convention).
+	// deployedProductCount was never selected at all, so it stayed at its Go
+	// zero value on every row -- the customer portal's Usage Metrics page
+	// filters its deployment tabs on productCount > 0, so every deployment
+	// silently looked like it had zero products regardless of how many
+	// deployed_product rows actually existed under it. A correlated
+	// subquery, not a JOIN + GROUP BY, since every other selected column
+	// here is per-deployment and a join would multiply rows.
 	dataQuery := fmt.Sprintf(
 		`SELECT d.id, d.number, d.name, d.type::TEXT, d.description,
 		        d.created_on, d.updated_on,
 		        u.id, COALESCE(u.name, NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), '')),
-		        p.id, p.name
+		        p.id, p.name,
+		        (SELECT COUNT(*) FROM deployed_product dp WHERE dp.deployment_id = d.id)
 		 FROM deployment d
 		 LEFT JOIN "user" u ON LOWER(u.email) = LOWER(d.created_by)
 		 JOIN project p ON d.project_id = p.id
@@ -167,6 +175,7 @@ func (r *deploymentRepo) SearchDeployments(ctx context.Context, req domain.Searc
 				&d.CreatedOn, &d.UpdatedOn,
 				&creatorID, &creatorName,
 				&d.Project.ID, &d.Project.Name,
+				&d.DeployedProductCount,
 			); err != nil {
 				return fmt.Errorf("scan deployment: %w", err)
 			}

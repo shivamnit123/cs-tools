@@ -109,8 +109,10 @@ type SLAEngineRepository interface {
 	RegisterClock(ctx context.Context, workItemID string, policy SLAPolicyRef) (bool, error)
 
 	// CompleteClock marks the active source='CSM' clock for
-	// (workItemID, target) ACHIEVED (end_on=now, 100% elapsed). Returns
-	// whether a row was found and updated -- false (not an error) when no
+	// (workItemID, target) ACHIEVED (end_on=now, business_elapsed_percentage
+	// set to the clock's real elapsed percentage at completion time, not
+	// unconditionally 100 -- see this method's own implementation comment).
+	// Returns whether a row was found and updated -- false (not an error) when no
 	// such clock was ever registered, e.g. a LOW/Query-severity case, which
 	// never gets a "response" clock's workaround/resolution siblings, or a
 	// case whose policy lookup found nothing at create time.
@@ -304,11 +306,29 @@ func (r *slaEngineRepo) RegisterClock(ctx context.Context, workItemID string, po
 }
 
 // CompleteClock implements SLAEngineRepository.
+//
+// business_elapsed_percentage is set to the clock's REAL elapsed percentage
+// at completion time (same flat wall-clock formula RecomputeActive uses),
+// not a hardcoded 100 -- an earlier version of this query always wrote 100
+// regardless of how much of the clock's duration had actually passed, which
+// made a response answered within minutes look identical, on read, to one
+// that ran the entire window and barely made it. That false 100% had a
+// real, live-observed downstream effect beyond just a misleading UI number:
+// csm-notification-service's SLA-breach poller (internal/slaengine.
+// tierForStatus) treats businessElapsedPercent >= 100 as tier 100 on its
+// own, with no regard for stage -- so a same-clock ACHIEVED reading at a
+// fabricated 100% was indistinguishable from a genuine breach, and fired a
+// spurious "Response SLA Violation" Chat alert for a case answered well
+// within its window. Computing the real percentage here means an early
+// completion reads (and alerts) as what it actually was.
 func (r *slaEngineRepo) CompleteClock(ctx context.Context, workItemID, target string) (bool, error) {
 	const query = `
 		UPDATE sla s
 		SET stage = 'ACHIEVED'::sla_stage_enum, end_on = NOW(),
-		    business_elapsed_percentage = 100, updated_on = NOW(), updated_by = $3
+		    business_elapsed_percentage = LEAST(100, GREATEST(0,
+		        EXTRACT(EPOCH FROM (NOW() - s.start_on)) / NULLIF(EXTRACT(EPOCH FROM s.duration), 0) * 100
+		    )),
+		    updated_on = NOW(), updated_by = $3
 		FROM sla_policy sp
 		WHERE s.sla_policy_id = sp.id
 		  AND s.work_item_id = $1::uuid

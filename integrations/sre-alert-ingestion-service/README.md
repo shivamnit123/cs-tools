@@ -9,7 +9,7 @@ alerts-core's own tables (`alert_cursor`, `incidents_*`, `processor_lease`).
 ```
 vendor ──POST──▶ ingestion (transform → allocator: CAS-claim ids → insert + read back) ──▶ alerts
                                            │                                               ▲
-                                           └── POST /alertz (wake-up) ──▶ alerts-core ──reads┘
+                                           └── POST /alert (wake-up) ──▶ alerts-core ──reads┘
 ```
 
 ## What it does
@@ -37,7 +37,7 @@ vendor ──POST──▶ ingestion (transform → allocator: CAS-claim ids →
 - **Memory**: everything accepted but not finished is capped at `allocator.queue_max_bytes`; past
   it, new webhooks get `503` at once.
 - **Response**: `201` only after every alert in the request has been written and read back.
-- **Wake-up**: one `POST /alertz` to alerts-core per written batch. Calls are coalesced so at most
+- **Wake-up**: one `POST /alert` to alerts-core per written batch. Calls are coalesced so at most
   one is in flight. If it fails, alerts-core's own 10-second poll still picks the rows up.
 - **Chat cards** (Google Chat, cardsV2): a *rejected webhook* card (at most one per vendor + error
   class, and 10 in total, per `reject.window`) and a *DB failure* card (at most `fallback.cards_per_minute`, then one
@@ -54,28 +54,6 @@ vendor ──POST──▶ ingestion (transform → allocator: CAS-claim ids →
 
 Vendors: `aws`, `azure`, `datadog`, `elasticsearch`, `gcp`, `icinga`, `openobserve`,
 `opensearch`, `prometheus`, `site24x7`.
-
-## Authentication
-
-Every vendor POST requires an `Authorization` header naming an enabled, non-expired row in
-alerts-core's `alertintegration.integration_users` table (`internal/auth.IntegrationUsers`,
-selected via `auth.mode = "integration_users"`, the only mode). A credential isn't tied to a
-particular vendor: any account may authenticate any vendor route, and any number of accounts may
-exist. Provision one with alerts-core's `cmd/user` (see that repo's `cmd/user/PROVISION.md`), then
-send either header form:
-
-```bash
-# Basic
-curl -X POST "https://<host>/api/wso2/v1/sre_alert_api/elasticsearch" \
-  -u "<username>:<secret>" \
-  -H "Content-Type: application/json" -d '{...}'
-
-# Bearer, base64("username:secret")
-TOKEN=$(printf '%s:%s' <username> '<secret>' | base64 | tr -d '\n')
-curl -X POST "https://<host>/api/wso2/v1/sre_alert_api/elasticsearch" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" -d '{...}'
-```
 
 Responses:
 
@@ -132,8 +110,7 @@ docker run --rm -p 8080:8080 --env-file .env \
 | `CASSANDRA_KEY` | yes | Cosmos DB primary or secondary key (secret) |
 | `CASSANDRA_USERNAME` | no | Defaults to the account name (first DNS label of the contact point) |
 | `CASSANDRA_PORT` | no | Default `10350` |
-| `ALERT_CORE_WAKE_URL` | no | alerts-core's `POST /alertz` URL. Empty: no wake-up, alerts-core's poll still works |
-| `ALERT_CORE_WAKE_USERNAME` / `ALERT_CORE_WAKE_SECRET` | no | `integration_users` credentials for the wake-up call (secret). Empty: call is sent unauthenticated, alerts-core 401s it, poll still works |
+| `ALERT_CORE_WAKE_URL` | no | alerts-core's `POST /alert` URL. Empty: no wake-up, alerts-core's poll still works |
 | `FALLBACK_CHAT_WEBHOOK_URLS` | no | Comma-separated Google Chat webhook URLs (secret). Empty: no cards, only logs |
 | `AWS_SNS_SUBSCRIPTION_NOTIFICATION_CONFIG` | no | `{"teams":{"<team>":"<email>","Default":"<email>"}}`: who is emailed about SNS subscription confirmations, by the AWS URL's `?team=` |
 | `EMAIL_BASE_URL`, `EMAIL_TOKEN_URL`, `EMAIL_CLIENT_ID`, `EMAIL_CLIENT_SECRET`, `EMAIL_FROM_ADDRESS` | no | WSO2 email notification service (OAuth2 client credentials) for those emails. `EMAIL_CLIENT_SECRET` is a secret. Empty `EMAIL_BASE_URL` disables email |
@@ -160,7 +137,7 @@ default and a comment. The main knobs:
 | `server.write_timeout` | `30s` | Connection write limit; must be at least 1s above `request_wait` |
 | `server.idle_timeout` | `60s` | Idle keep-alive connections are closed after this |
 | `server.max_body_bytes` | `1048576` | Larger bodies get `413` |
-| `auth.mode` | `integration_users` | Vendor-route auth hook; verifies against alerts-core's `integration_users` table (only mode) |
+| `auth.mode` | `none` | Hook for vendor authentication; only `none` exists today |
 | `allocator.queue_size` | `5000` | Queued submissions per replica before `503` |
 | `allocator.queue_max_bytes` | `268435456` | Memory cap (256 MiB) on accepted, unfinished alerts before `503`; about half the container memory limit |
 | `allocator.max_batch` | `200` | Most ids claimed in one compare-and-set |
@@ -177,42 +154,39 @@ id, and the alert would be silently ignored. Stopping at 5m leaves time for the 
 
 ## Example requests
 
-`BASE=http://localhost:8080/api/wso2/v1/sre_alert_api`. Every vendor route requires the
-`Authorization` header described above, so also set `INTEGRATION_USERNAME`/`INTEGRATION_SECRET` to
-credentials provisioned via alerts-core's `cmd/user` before running these; without them the
-requests below get `401`. The same payloads, plus a recovery payload for each vendor, are in
-[`internal/vendors/testdata/`](internal/vendors/testdata/).
+`BASE=http://localhost:8080/api/wso2/v1/sre_alert_api`. The same payloads, plus a recovery
+payload for each vendor, are in [`internal/vendors/testdata/`](internal/vendors/testdata/).
 
 ```sh
 # AWS (SNS notification wrapping a CloudWatch alarm)
-curl -sS -X POST "$BASE/aws" -u "$INTEGRATION_USERNAME:$INTEGRATION_SECRET" -H 'Content-Type: application/json' -d '{"Type":"Notification","MessageId":"7a3f9c2e-4b1d-4e8a-9c3f-2b8d5e6f1a9c","TopicArn":"arn:aws:sns:us-east-1:487629103847:prod-cloudwatch-alarms","Message":"{\"AlarmName\":\"prod-rds-cpu-utilization-high\",\"AlarmArn\":\"arn:aws:cloudwatch:us-east-1:487629103847:alarm:prod-rds-cpu-utilization-high\",\"NewStateValue\":\"ALARM\",\"NewStateReason\":\"Threshold Crossed: 1 datapoint [92.4] was greater than the threshold (90.0)\",\"AlarmDescription\":\"{\\\"service\\\":\\\"client-medlineprod-alert-integration\\\",\\\"category\\\":\\\"service_interruption\\\",\\\"environment\\\":\\\"production\\\",\\\"severity\\\":\\\"critical\\\"}\"}","Timestamp":"2026-09-24T05:12:33.512Z"}'
+curl -sS -X POST "$BASE/aws" -H 'Content-Type: application/json' -d '{"Type":"Notification","MessageId":"7a3f9c2e-4b1d-4e8a-9c3f-2b8d5e6f1a9c","TopicArn":"arn:aws:sns:us-east-1:487629103847:prod-cloudwatch-alarms","Message":"{\"AlarmName\":\"prod-rds-cpu-utilization-high\",\"AlarmArn\":\"arn:aws:cloudwatch:us-east-1:487629103847:alarm:prod-rds-cpu-utilization-high\",\"NewStateValue\":\"ALARM\",\"NewStateReason\":\"Threshold Crossed: 1 datapoint [92.4] was greater than the threshold (90.0)\",\"AlarmDescription\":\"{\\\"service\\\":\\\"client-medlineprod-alert-integration\\\",\\\"category\\\":\\\"service_interruption\\\",\\\"environment\\\":\\\"production\\\",\\\"severity\\\":\\\"critical\\\"}\"}","Timestamp":"2026-09-24T05:12:33.512Z"}'
 
 # Azure Monitor (common alert schema)
-curl -sS -X POST "$BASE/azure" -u "$INTEGRATION_USERNAME:$INTEGRATION_SECRET" -H 'Content-Type: application/json' -d '{"schemaId":"azureMonitorCommonAlertSchema","data":{"essentials":{"alertId":"/subscriptions/4c9e2a1f-8b3d-4e7c-9f1a-2b6d8e3c5a9f/providers/Microsoft.AlertsManagement/alerts/7f3a9c2e-4b1d-4e8a-9c3f-2b8d5e6f1a9c","alertRule":"prod-app-service-response-time-high","severity":"Sev1","signalType":"Metric","monitorCondition":"Fired","monitoringService":"Platform","firedDateTime":"2026-09-24T05:12:33.481Z"},"customProperties":{"service":"client-medlineprod-alert-integration","category":"service_interruption","environment":"production"},"alertContext":{}}}'
+curl -sS -X POST "$BASE/azure" -H 'Content-Type: application/json' -d '{"schemaId":"azureMonitorCommonAlertSchema","data":{"essentials":{"alertId":"/subscriptions/4c9e2a1f-8b3d-4e7c-9f1a-2b6d8e3c5a9f/providers/Microsoft.AlertsManagement/alerts/7f3a9c2e-4b1d-4e8a-9c3f-2b8d5e6f1a9c","alertRule":"prod-app-service-response-time-high","severity":"Sev1","signalType":"Metric","monitorCondition":"Fired","monitoringService":"Platform","firedDateTime":"2026-09-24T05:12:33.481Z"},"customProperties":{"service":"client-medlineprod-alert-integration","category":"service_interruption","environment":"production"},"alertContext":{}}}'
 
 # Datadog
-curl -sS -X POST "$BASE/datadog" -u "$INTEGRATION_USERNAME:$INTEGRATION_SECRET" -H 'Content-Type: application/json' -d '{"event_name":"prod-web high memory usage","trigger_name":"avg(last_5m):avg:system.mem.pct_usable{env:production} < 0.1","transition":"Triggered","alert_id":"148502937","service":"client-medlineprod-alert-integration","category":"service_interruption","tags":"env:production,severity:1,team:sre"}'
+curl -sS -X POST "$BASE/datadog" -H 'Content-Type: application/json' -d '{"event_name":"prod-web high memory usage","trigger_name":"avg(last_5m):avg:system.mem.pct_usable{env:production} < 0.1","transition":"Triggered","alert_id":"148502937","service":"client-medlineprod-alert-integration","category":"service_interruption","tags":"env:production,severity:1,team:sre"}'
 
 # Elasticsearch
-curl -sS -X POST "$BASE/elasticsearch" -u "$INTEGRATION_USERNAME:$INTEGRATION_SECRET" -H 'Content-Type: application/json' -d '{"rule_id":"a8f2c9e1-3b7d-4f6a-9c1e-8d2b5f7a3c9e","rule_name":"prod-cluster-disk-watermark-exceeded","trigger_name":"disk.watermark.flood_stage","state":"ACTIVE","alert_id":"ZQ79cZ0B6qTDiYX-WKue","severity":"1","service":"client-medlineprod-alert-integration","category":"service_interruption"}'
+curl -sS -X POST "$BASE/elasticsearch" -H 'Content-Type: application/json' -d '{"rule_id":"a8f2c9e1-3b7d-4f6a-9c1e-8d2b5f7a3c9e","rule_name":"prod-cluster-disk-watermark-exceeded","trigger_name":"disk.watermark.flood_stage","state":"ACTIVE","alert_id":"ZQ79cZ0B6qTDiYX-WKue","severity":"1","service":"client-medlineprod-alert-integration","category":"service_interruption"}'
 
 # GCP Cloud Monitoring
-curl -sS -X POST "$BASE/gcp" -u "$INTEGRATION_USERNAME:$INTEGRATION_SECRET" -H 'Content-Type: application/json' -d '{"incident":{"incident_id":"0.mzq9x7k2j8h4","state":"open","severity":"critical","policy_name":"prod-api-5xx-error-rate","condition_name":"5xx error rate above 5% for 5 minutes","resource":{"type":"gce_instance","labels":{"service":"client-medlineprod-alert-integration","category":"service_interruption","environment":"production"}},"started_at":1758700800},"version":"1.2"}'
+curl -sS -X POST "$BASE/gcp" -H 'Content-Type: application/json' -d '{"incident":{"incident_id":"0.mzq9x7k2j8h4","state":"open","severity":"critical","policy_name":"prod-api-5xx-error-rate","condition_name":"5xx error rate above 5% for 5 minutes","resource":{"type":"gce_instance","labels":{"service":"client-medlineprod-alert-integration","category":"service_interruption","environment":"production"}},"started_at":1758700800},"version":"1.2"}'
 
 # Icinga
-curl -sS -X POST "$BASE/icinga" -u "$INTEGRATION_USERNAME:$INTEGRATION_SECRET" -H 'Content-Type: application/json' -d '{"notification_type":"PROBLEM","host_name":"prod-db-primary-01","host_display_name":"prod-db-primary-01.medlineprod.internal","host_state":"UP","service_name":"postgres-replication-lag","service_state":"CRITICAL","vars":{"service":"client-medlineprod-alert-integration","environment":"production"}}'
+curl -sS -X POST "$BASE/icinga" -H 'Content-Type: application/json' -d '{"notification_type":"PROBLEM","host_name":"prod-db-primary-01","host_display_name":"prod-db-primary-01.medlineprod.internal","host_state":"UP","service_name":"postgres-replication-lag","service_state":"CRITICAL","vars":{"service":"client-medlineprod-alert-integration","environment":"production"}}'
 
 # OpenObserve
-curl -sS -X POST "$BASE/openobserve" -u "$INTEGRATION_USERNAME:$INTEGRATION_SECRET" -H 'Content-Type: application/json' -d '{"short_description":"prod-api-gateway: p99 latency above 2000ms","description":"p99 latency has been above 2000ms for 5 minutes","urgency":"1","impact":"1","correlation_id":"9f3a7c2e-4b1d-4e8a-9c3f-2b8d5e6f1a9c","caller_id":"openobserve","service":"client-medlineprod-alert-integration","category":"service_interruption","environment":"production"}'
+curl -sS -X POST "$BASE/openobserve" -H 'Content-Type: application/json' -d '{"short_description":"prod-api-gateway: p99 latency above 2000ms","description":"p99 latency has been above 2000ms for 5 minutes","urgency":"1","impact":"1","correlation_id":"9f3a7c2e-4b1d-4e8a-9c3f-2b8d5e6f1a9c","caller_id":"openobserve","service":"client-medlineprod-alert-integration","category":"service_interruption","environment":"production"}'
 
 # OpenSearch
-curl -sS -X POST "$BASE/opensearch" -u "$INTEGRATION_USERNAME:$INTEGRATION_SECRET" -H 'Content-Type: application/json' -d '{"monitor_id":"T3x9mZQBv8h5k2j4L7n1","monitor_name":"prod-cluster-jvm-heap-usage-critical","trigger_name":"jvm-heap-above-90pct","state":"ACTIVE","alert_id":"xY29Y5oB7fN3k1L8Qm4R","severity":"1","service":"client-medlineprod-alert-integration","category":"service_interruption"}'
+curl -sS -X POST "$BASE/opensearch" -H 'Content-Type: application/json' -d '{"monitor_id":"T3x9mZQBv8h5k2j4L7n1","monitor_name":"prod-cluster-jvm-heap-usage-critical","trigger_name":"jvm-heap-above-90pct","state":"ACTIVE","alert_id":"xY29Y5oB7fN3k1L8Qm4R","severity":"1","service":"client-medlineprod-alert-integration","category":"service_interruption"}'
 
 # Prometheus Alertmanager (one id per alert in "alerts")
-curl -sS -X POST "$BASE/prometheus" -u "$INTEGRATION_USERNAME:$INTEGRATION_SECRET" -H 'Content-Type: application/json' -d '{"receiver":"sre-alert-integration","status":"firing","alerts":[{"status":"firing","labels":{"alertname":"PodCrashLoopBackOff","severity":"critical","service":"client-medlineprod-alert-integration","category":"service_interruption","environment":"production","namespace":"medlineprod"},"annotations":{"summary":"Pod restarted 5 times in 10 minutes"},"startsAt":"2026-09-24T05:12:33Z","fingerprint":"a1b2c3d4e5f6a7b8"}]}'
+curl -sS -X POST "$BASE/prometheus" -H 'Content-Type: application/json' -d '{"receiver":"sre-alert-integration","status":"firing","alerts":[{"status":"firing","labels":{"alertname":"PodCrashLoopBackOff","severity":"critical","service":"client-medlineprod-alert-integration","category":"service_interruption","environment":"production","namespace":"medlineprod"},"annotations":{"summary":"Pod restarted 5 times in 10 minutes"},"startsAt":"2026-09-24T05:12:33Z","fingerprint":"a1b2c3d4e5f6a7b8"}]}'
 
 # Site24x7 (needs SITE24X7_ALERT_CONFIG={"TagList":{"Service":"svc","Category":"cat","Environment":"env"}})
-curl -sS -X POST "$BASE/site24x7" -u "$INTEGRATION_USERNAME:$INTEGRATION_SECRET" -H 'Content-Type: application/json' -d '{"STATUS":"DOWN","MONITORNAME":"prod-medlineprod-api-https-check","MONITOR_ID":"100004312589","TAGS":["svc:client-medlineprod-alert-integration","cat:service_interruption","env:production"]}'
+curl -sS -X POST "$BASE/site24x7" -H 'Content-Type: application/json' -d '{"STATUS":"DOWN","MONITORNAME":"prod-medlineprod-api-https-check","MONITOR_ID":"100004312589","TAGS":["svc:client-medlineprod-alert-integration","cat:service_interruption","env:production"]}'
 ```
 
 ## Deploying on Choreo
@@ -238,9 +212,7 @@ curl -sS -X POST "$BASE/site24x7" -u "$INTEGRATION_USERNAME:$INTEGRATION_SECRET"
    defaults.
 5. **Connecting to alerts-core**: add a connection from this component to the
    `sre-alert-core-service` component's endpoint (Project visibility is enough) and set
-   `ALERT_CORE_WAKE_URL` to that endpoint's URL plus `/alertz`, plus
-   `ALERT_CORE_WAKE_USERNAME`/`ALERT_CORE_WAKE_SECRET` to an `integration_users` credential
-   provisioned there (see that repo's `cmd/user/PROVISION.md`). Both components must use the same
+   `ALERT_CORE_WAKE_URL` to that endpoint's URL plus `/alert`. Both components must use the same
    `CASSANDRA_*` values: this service writes the `alerts` rows that alerts-core reads.
 6. **Replicas**: any number. Ids stay unique across replicas because every claim is a
    compare-and-set on `alert_seq`.

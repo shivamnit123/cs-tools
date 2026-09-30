@@ -42,7 +42,7 @@ func (f *fakePipeline) Ingest(_ context.Context, req Request) Result {
 func newTestServer(p Pipeline) *Server {
 	return New(Options{
 		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Auth:         allowAll{},
+		Auth:         auth.None{},
 		Pipeline:     p,
 		Vendors:      []string{"aws", "prometheus"},
 		MaxBodyBytes: 16,
@@ -188,10 +188,6 @@ type denyAll struct{}
 
 func (denyAll) Authenticate(*http.Request, string) error { return auth.ErrUnauthorized }
 
-type allowAll struct{}
-
-func (allowAll) Authenticate(*http.Request, string) error { return nil }
-
 func TestVendorRoute_AuthHookRunsBeforePipeline(t *testing.T) {
 	p := &fakePipeline{result: Result{Status: http.StatusCreated}}
 	s := New(Options{
@@ -211,7 +207,7 @@ func TestAccessLog_CarriesVendorAndAltIDs(t *testing.T) {
 	var buf strings.Builder
 	p := &fakePipeline{result: Result{Status: http.StatusCreated, AltIDs: []string{"ALT000000007"}}}
 	s := New(Options{
-		Logger: slog.New(slog.NewJSONHandler(&buf, nil)), Auth: allowAll{}, Pipeline: p,
+		Logger: slog.New(slog.NewJSONHandler(&buf, nil)), Auth: auth.None{}, Pipeline: p,
 		Vendors: []string{"aws"}, MaxBodyBytes: 1024,
 	})
 	do(t, s, "POST", VendorRoutePrefix+"aws", "{}")

@@ -93,7 +93,7 @@ func TestLoad_RejectsInvalidValues(t *testing.T) {
 
 func TestLoadEnv(t *testing.T) {
 	t.Setenv("PORT", "")
-	t.Setenv("ALERT_CORE_WAKE_URL", " http://core/alertz ")
+	t.Setenv("ALERT_CORE_WAKE_URL", " http://core/alert ")
 	t.Setenv("FALLBACK_CHAT_WEBHOOK_URLS", "https://a, ,https://b ")
 	e, err := LoadEnv()
 	if err != nil {
@@ -102,7 +102,7 @@ func TestLoadEnv(t *testing.T) {
 	if e.Port != "8080" {
 		t.Errorf("Port = %q, want 8080 default", e.Port)
 	}
-	if e.WakeURL != "http://core/alertz" {
+	if e.WakeURL != "http://core/alert" {
 		t.Errorf("WakeURL = %q", e.WakeURL)
 	}
 	if len(e.ChatWebhookURLs) != 2 || e.ChatWebhookURLs[0] != "https://a" || e.ChatWebhookURLs[1] != "https://b" {

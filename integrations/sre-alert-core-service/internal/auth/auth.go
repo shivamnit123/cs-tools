@@ -54,14 +54,9 @@ type User struct {
 	ExpiresAt       time.Time  `db:"expires_at"`
 }
 
-// IsExpired reports whether ExpiresAt is set and in the past relative to now. Cosmos DB for
-// Cassandra round-trips an unset (NULL) timestamp as the Unix epoch rather than Go's true zero
-// time.Time, so anything at or before the epoch is treated as unset too.
+// IsExpired reports whether ExpiresAt is set and in the past relative to now.
 func (u User) IsExpired(now time.Time) bool {
-	if u.ExpiresAt.IsZero() || !u.ExpiresAt.After(time.Unix(0, 0)) {
-		return false
-	}
-	return now.After(u.ExpiresAt)
+	return !u.ExpiresAt.IsZero() && now.After(u.ExpiresAt)
 }
 
 // GenerateSalt returns SaltLen random bytes for a new user.

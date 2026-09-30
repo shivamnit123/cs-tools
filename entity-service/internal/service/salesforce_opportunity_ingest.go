@@ -102,7 +102,7 @@ func (s *salesforceEventService) RetryOpportunityIngest(ctx context.Context, opp
 	if !s.opportunity.enabled() {
 		return errOpportunityIngestDisabled
 	}
-	return s.ingestOpportunity(ctx, opportunitySfID, domain.SalesforceEventUpdated)
+	return s.ingestOpportunity(ctx, opportunitySfID, domain.SalesforceEventUpdated, true)
 }
 
 // handleOpportunityEvent is the Opportunity branch of HandleEvent.
@@ -116,7 +116,7 @@ func (s *salesforceEventService) handleOpportunityEvent(ctx context.Context, req
 
 	switch req.EventType {
 	case domain.SalesforceEventCreated, domain.SalesforceEventUpdated, domain.SalesforceEventRestored:
-		return s.ingestOpportunity(ctx, req.ReferenceID, req.EventType)
+		return s.ingestOpportunity(ctx, req.ReferenceID, req.EventType, true)
 	case domain.SalesforceEventDeleted:
 		return s.deleteOpportunity(ctx, req.ReferenceID)
 	case domain.SalesforceEventUndefined:
@@ -132,8 +132,9 @@ func (s *salesforceEventService) handleOpportunityEvent(ctx context.Context, req
 // Salesforce id, and a replay whose LastModifiedDate is not newer than the
 // ledger's is skipped. Sales Entity does not return lastModifiedDate for
 // opportunities yet, so until it does the guard is skipped (with a warning)
-// and the upsert simply runs again.
-func (s *salesforceEventService) ingestOpportunity(ctx context.Context, sfID, eventType string) error {
+// and the upsert simply runs again. guard=false turns the duplicate guard
+// off, for ensureOpportunity's write of a row known to be missing.
+func (s *salesforceEventService) ingestOpportunity(ctx context.Context, sfID, eventType string, guard bool) error {
 	if s.support.States == nil {
 		return errors.New("salesforce: salesforce_ingest_state ledger is not configured")
 	}
@@ -147,12 +148,19 @@ func (s *salesforceEventService) ingestOpportunity(ctx context.Context, sfID, ev
 		sfID = strings.TrimSpace(opp.ID)
 	}
 
-	skip, eventModifiedOn, err := shouldSkipIngest(ctx, s.support.States, domain.SalesforceIngestEntityOpportunity, sfID, eventType, opp.LastModifiedDate)
-	if err != nil {
-		return err
+	eventModifiedOn, ok := parseSalesforceLastModified(opp.LastModifiedDate)
+	if !ok {
+		eventModifiedOn = time.Now().UTC()
 	}
-	if skip {
-		return nil
+	if guard {
+		var skip bool
+		skip, eventModifiedOn, err = shouldSkipIngest(ctx, s.support.States, domain.SalesforceIngestEntityOpportunity, sfID, eventType, opp.LastModifiedDate)
+		if err != nil {
+			return err
+		}
+		if skip {
+			return nil
+		}
 	}
 	state := domain.UpsertSalesforceIngestStateRequest{
 		Entity:          domain.SalesforceIngestEntityOpportunity,
@@ -192,7 +200,8 @@ func (s *salesforceEventService) ingestOpportunity(ctx context.Context, sfID, ev
 // deleteOpportunity is DELETED: a hard delete by sf_id, as ServiceNow plus
 // csm-sync-service do today. The foreign keys cascade the line items and the
 // project links and null out the invoices. There is nothing to fetch — the
-// record is gone from Salesforce — so the ledger version is the current time.
+// record is gone from Salesforce — so the ledger version is the current time,
+// or the recorded version when that is later (deletedEventVersion).
 //
 // The ingest stores the 18-character Id Sales Entity returns, so a
 // 15-character referenceId is widened to that form first: the delete, the
@@ -200,10 +209,14 @@ func (s *salesforceEventService) ingestOpportunity(ctx context.Context, sfID, ev
 // ingest used, instead of the delete matching no row and being acknowledged.
 func (s *salesforceEventService) deleteOpportunity(ctx context.Context, sfID string) error {
 	sfID = salesforceID18(sfID)
+	modifiedOn, err := s.deletedEventVersion(ctx, domain.SalesforceIngestEntityOpportunity, sfID)
+	if err != nil {
+		return err
+	}
 	state := domain.UpsertSalesforceIngestStateRequest{
 		Entity:          domain.SalesforceIngestEntityOpportunity,
 		SfID:            sfID,
-		EventModifiedOn: time.Now().UTC(),
+		EventModifiedOn: modifiedOn,
 		EventType:       domain.SalesforceEventDeleted,
 		Status:          domain.SalesforceIngestSucceeded,
 	}

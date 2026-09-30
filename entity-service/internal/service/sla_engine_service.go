@@ -263,8 +263,10 @@ func (s *slaEngineService) CompleteWorkaroundClock(ctx context.Context, caseID s
 //   - CaseStateAwaitingInfo/CaseStateSolutionProposed: pause both
 //     workaround and resolution -- the case is waiting on the customer, not
 //     actively being worked.
-//   - CaseStateClosed: resume then complete resolution (claims 100%, same
-//     as CompleteResponseClock does for "response"); workaround is only
+//   - CaseStateClosed: resume then complete resolution (claims its real
+//     elapsed percentage at completion time, same as CompleteResponseClock
+//     does for "response" -- see SLAEngineRepository.CompleteClock's own doc
+//     comment); workaround is only
 //     paused, never completed -- ported unchanged from the old, deleted
 //     design's own documented gap: there is no "workaround provided"
 //     completion signal wired into this hook (see this engine's delivering

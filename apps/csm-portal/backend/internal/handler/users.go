@@ -460,6 +460,10 @@ func (h *UsersHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if requestsInternalUserType(req.Roles) && !isWso2Email(req.Email) {
+		writeError(w, http.StatusBadRequest, "an internal-type user must have a "+wso2EmailDomain+" email address")
+		return
+	}
 
 	result, err := h.entity.CreateUser(r.Context(), body)
 	if err != nil {

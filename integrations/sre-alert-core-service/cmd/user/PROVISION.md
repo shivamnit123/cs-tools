@@ -1,16 +1,12 @@
 # Internal API users
 
-`internal/auth` provides PBKDF2-hashed (10000 iterations, random salt) service-account credentials backed by the `alertintegration.integration_users` Cassandra table, plus an `auth.RequireAuth` middleware. `/alertz` is gated by `RequireAuth`: `alert-ingestion-service`'s wake-up call authenticates as an `integration_users` account (see `internal/corewake` in that repo). `/healthz` and `/livez` stay open for probes.
+`internal/auth` provides PBKDF2-hashed (10000 iterations, random salt) service-account credentials backed by the `alertintegration.integration_users` Cassandra table, plus an `auth.RequireAuth` middleware. It is not currently wired into any route: `/alertz` is reachable via a project-level exposure (gateway/network scoping) rather than a per-caller secret, so no route in this service enforces it today. Use `auth.RequireAuth` if a future endpoint needs per-caller authentication.
 
 Secrets are never stored in plaintext; only the PBKDF2 hash and salt live in Cassandra. Each row also tracks who provisioned it, when it was last modified, when its secret was last rotated, and an optional expiry, so accounts behave closer to real identity records rather than a bare credential pair. There's no admin API or startup seeding, so accounts are managed one at a time with `cmd/user`, run against the same Cassandra instance and `CASSANDRA_*` env vars the server itself uses.
 
 ## Upgrading from the old schema
 
-If your local/dev Cassandra already has an `integration_users` table from before this change, drop and recreate it from `schema.cql` rather than trying to `ALTER TABLE` it in by hand; the new columns (`id`, `created_by`, `updated_at`, `secret_rotated_at`, `last_used_at`, `expires_at`) aren't backfilled.
-
-## Used by
-
-`alert-ingestion-service`'s `corewake.Client` authenticates its `/alertz` wake-up call as an `integration_users` account. Provision/rotate it here with `go run ./cmd/user create -username webhook-integration-user`, then set the printed secret as `ALERT_CORE_WAKE_SECRET` (and the username as `ALERT_CORE_WAKE_USERNAME`) in ingestion-service's deployment env. See that repo's `.env.example` and README.
+If your local/dev Cassandra already has an `integration_users` table from before this change, drop and recreate it from `schema.cql` rather than trying to `ALTER TABLE` it in by hand; the new columns (`id`, `created_by`, `updated_at`, `secret_rotated_at`, `last_used_at`, `expires_at`) aren't backfilled. This has no practical impact today since the only row anyone has created so far (`webhook-integration-user`) isn't used by any route yet.
 
 ## cmd/user
 

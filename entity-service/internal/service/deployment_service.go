@@ -233,6 +233,21 @@ func (s *deploymentService) resolveActorEmail(ctx context.Context) (string, erro
 
 // SearchDeployments implements DeploymentService.
 func (s *deploymentService) SearchDeployments(ctx context.Context, req domain.SearchDeploymentsRequest) (domain.SearchDeploymentsResponse, error) {
+	// DATA_SOURCE=postgres-servicenow-dual-write reads deployments from
+	// ServiceNow, not the Postgres mirror -- Postgres only ever receives
+	// deployments/deployed products created going forward through this
+	// service's own SN-first CreateDeployment path (see that method's own
+	// doc comment); it was never backfilled with ServiceNow's existing
+	// catalog, so a deployment created before dual-write launched (or
+	// synced from elsewhere) has no Postgres row at all, and one that does
+	// exist there is still missing every deployed product ServiceNow
+	// already knows about that wasn't itself created through this same
+	// path. ServiceNow remains complete and authoritative for this read;
+	// s.snMirror is non-nil only under dual-write (see NewDeploymentServiceWithSNWriteback).
+	if s.snMirror != nil {
+		return s.snMirror.SearchDeployments(ctx, req)
+	}
+
 	if err := normalizePagination(&req.Pagination); err != nil {
 		return domain.SearchDeploymentsResponse{}, err
 	}

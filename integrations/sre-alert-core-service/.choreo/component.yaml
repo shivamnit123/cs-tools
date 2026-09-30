@@ -17,14 +17,14 @@
 schemaVersion: 1.2
 
 endpoints:
-  - name: alertz
-    displayName: Alertz
+  - name: alert
+    displayName: Alert
     service:
-      basePath: /alertz
+      basePath: /alert
       port: 8080
     type: REST
     networkVisibilities:
-      - Project
+      - Public
   - name: healthz
     displayName: Alert Healthz
     service:

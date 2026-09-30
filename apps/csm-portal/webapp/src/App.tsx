@@ -116,6 +116,8 @@ import CsmKBArticleHistoryDetailPage from "@features/csm-kb-articles/pages/CsmKB
 import CsmKBReviewQueuePage from "@features/csm-kb-articles/pages/CsmKBReviewQueuePage";
 import CsmKBAdminPage from "@features/csm-kb-articles/pages/CsmKBAdminPage";
 import RouteGuard from "@features/spl/pages/RouteGuard";
+import CasesPage from "@features/spl/cases/pages/CasesPage";
+import CaseDetailPage from "@features/spl/cases/pages/CaseDetailPage";
 import AccountsPage from "@features/spl/accounts/pages/AccountsPage";
 import AccountDetailPage from "@features/spl/accounts/pages/AccountDetailPage";
 import ProjectsPage from "@features/spl/projects/pages/ProjectsPage";
@@ -128,8 +130,6 @@ import UserScanPage from "@features/spl/user-scan/pages/UserScanPage";
 import UsageMetricsPage from "@features/spl/usage-metrics/pages/UsageMetricsPage";
 import CustomerHealthDashboardPage from "@features/spl/customer-health/pages/CustomerHealthDashboardPage";
 import CustomerHealthDetailPage from "@features/spl/customer-health/pages/CustomerHealthDetailPage";
-// Cases lands in its own follow-up PR (feat/spl-merge-2-cases) -- see this
-// PR's own description for why this port was split by domain.
 
 /**
  * Landing for `/`. Defers to AuthGuard's post-login deep-link restore when a
@@ -162,12 +162,10 @@ function RootLanding(): JSX.Element | null {
     Boolean(searchParams.get(key)?.trim()),
   );
   // The Sales/SA view has no dashboard (SPL never had one) — its landing
-  // page is Cases, same as the standalone app's own index redirect (see
-  // usePortalView.ts). Cases itself lands in a follow-up PR
-  // (feat/spl-merge-2-cases); until it merges, Accounts is this view's
-  // landing page instead.
+  // page is Cases, same as the standalone app's own index redirect. See
+  // usePortalView.ts.
   const view = usePortalView();
-  const landing = view === "sales-sa" ? "/spl/accounts" : "/dashboard";
+  const landing = view === "sales-sa" ? "/spl/cases" : "/dashboard";
   return pending || hasDeepLinkSearch ? null : <Navigate to={landing} replace />;
 }
 
@@ -656,11 +654,11 @@ export default function App(): JSX.Element {
                       apps/support-portal-lite/webapp. RouteGuard is the
                       real enforcement point (an audience-gate 403, not just
                       a hidden nav entry) and also mounts
-                      PermissionProvider for every screen below it.
-                      Cases lands in its own follow-up PR -- this port was
-                      split by domain to stay under CodeRabbit's 100-file
-                      review limit. */}
+                      PermissionProvider for every screen below it. */}
                   <Route path="spl" element={<RouteGuard />}>
+                    <Route path="cases" element={<CasesPage />} />
+                    <Route path="cases/:caseId" element={<CaseDetailPage />} />
+
                     {/* AccountsPage reads the path leaf itself to decide
                         all-accounts vs my-accounts — same component, two
                         routes. Only "accounts" has a csmNavItems.ts entry;

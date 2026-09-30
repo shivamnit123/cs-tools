@@ -80,6 +80,9 @@ const (
 	// same reasoning as TypeSLAClockRegister above -- not an email/Chat
 	// trigger, so no Recipients field.
 	TypeKBArticlePublished Type = "kb.article_published"
+	// TypeProjectContactRegistered is published when a membership moves into
+	// REGISTERED; csm-notification-service sends the Welcome email.
+	TypeProjectContactRegistered Type = "project_contact.registered"
 )
 
 // Envelope is the wire shape of every record on the case-events topic.
@@ -345,4 +348,18 @@ type ProjectContactInvitedPayload struct {
 	// so the wire shape is unchanged for them. Mirror any change here in
 	// csm-notification-service's own copy of this struct.
 	Resend bool `json:"isResend,omitempty"`
+}
+
+// ProjectContactRegisteredPayload is the payload of TypeProjectContactRegistered.
+// csm-notification-service decodes it strictly: keep both copies identical.
+type ProjectContactRegisteredPayload struct {
+	MembershipSfID    string `json:"membershipSfId"`
+	ContactSfID       string `json:"contactSfId"`
+	Email             string `json:"email"`
+	GivenName         string `json:"givenName"`
+	FamilyName        string `json:"familyName"`
+	ProjectName       string `json:"projectName"`
+	ProjectKey        string `json:"projectKey"`
+	IsIntegrationUser bool   `json:"isIntegrationUser,omitempty"`
+	EventModifiedOn   string `json:"eventModifiedOn,omitempty"`
 }

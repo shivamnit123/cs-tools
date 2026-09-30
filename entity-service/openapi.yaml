@@ -40,6 +40,26 @@ paths:
         resulting state is INVITED or RE-INVITED; DELETED marks the
         project_contact DEACTIVATED (never deletes). Entity Contact, UPDATED only:
         re-runs the membership upsert for each of the contact's memberships.
+        Entity Project__c, only when CSM_MIGRATION_SALESFORCE_PROJECT_INGEST_ENABLED=true:
+        CREATED/UPDATED/RESTORED fetch the project (POST /projects/search) and
+        update the Salesforce-owned project columns of the row found by sf_id or
+        else by key; the ingest is update-only (a project CSM does not have is
+        recorded FAILED and re-run by the delayed-retry job) unless
+        CSM_MIGRATION_SALESFORCE_PROJECT_INSERT_ENABLED=true also lets it insert;
+        a project without Project_Key__c is a 204 recorded FAILED; DELETED sets
+        project.is_active false (RESTORED sets it true).
+        Entity Linked_Opportunity__c (also accepted as Linked_Opportunity), only when
+        CSM_MIGRATION_SALESFORCE_OPPORTUNITY_INGEST_ENABLED=true: CREATED/UPDATED/RESTORED
+        fetch the link (POST /linked-opportunities/search), resolve its opportunity
+        and project, and upsert sf_opportunity_link by link_sf_id; DELETED
+        hard-deletes by link_sf_id.
+        Entity Invoice__c (also accepted as Invoice), only when
+        CSM_MIGRATION_SALESFORCE_OPPORTUNITY_INGEST_ENABLED=true: CREATED/UPDATED/RESTORED
+        fetch the invoice (POST /invoices/search), ingest its opportunity first when
+        missing, and upsert sf_invoice by sf_id; DELETED hard-deletes by sf_id.
+        Entity OpportunityLineItem, under the same flag, does the same for one
+        sf_opportunity_product row (POST /opportunity-line-items/search, keyed on
+        line_item_sf_id).
         Every other entity is acknowledged with 204 and ignored. A replay whose
         Salesforce lastModifiedDate is not newer than the recorded DATABASE step
         is a 204 no-op, so the customer portal and the reconcile job can replay
@@ -86,11 +106,70 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /salesforce/accounts/{sfId}/refresh-partners:
+    post:
+      summary: >-
+        Re-read one account's partners from Salesforce (REST sales-entity-service
+        POST /customer-search with includePartners) and make its stored partner
+        links in account_relationship equal to them: a forward "Is Partner Of"
+        row (partner to customer) and its reverse "Is Customer Of" mirror per
+        partner, missing partner accounts ingested first, rows of every other
+        label untouched. The same refresh runs after Account events and after
+        partner-contact membership events. Internal callers only
+        (AUTH_INTERNAL_CLIENT_IDS). Registered only when
+        CSM_MIGRATION_SALESFORCE_PARTNER_INGEST_ENABLED=true, DATA_SOURCE=postgres
+        and REST sales-entity-service config is present; 404 otherwise.
+      operationId: refreshSalesforceAccountPartners
+      parameters:
+        - name: sfId
+          in: path
+          required: true
+          description: Salesforce Account Id of the customer (15 or 18 characters).
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The partner set now stored for the account.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SalesforcePartnerRefreshResult'
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is not an internal service.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: Not found (a partner or the account is not in CSM and the Account ingest is off).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "503":
+          description: Salesforce is temporarily unavailable, or sales-entity-service did not return the partner list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /onboarding-steps/search:
     post:
       summary: >-
         Search the onboarding status ledger (onboarding_step): one row per
-        membership per step (IDENTITY, DATABASE, EMAIL, REGISTRATION), newest
+        membership per step (IDENTITY, DATABASE, EMAIL, REGISTRATION, WELCOME_EMAIL), newest
         first. Backs the onboarding dashboard. Has no ServiceNow equivalent —
         always backed by Postgres; 404 without a pool.
       operationId: searchOnboardingSteps
@@ -2035,6 +2114,10 @@ paths:
         via `user_role` in the same transaction. Postgres-only — always
         404s on the ServiceNow data source. The acting caller is resolved
         from `x-user-id-token` and stamped as `createdBy`/`updatedBy`.
+        `roles` also decides `userType`, since `recompute_user_type`'s trigger
+        derives it from role membership rather than a plain settable column —
+        granting `admin`/`internal` resolves to INTERNAL and is rejected with
+        400 unless `email` is a `@wso2.com` address.
       operationId: createUser
       tags: [Users]
       requestBody:
@@ -2051,7 +2134,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/User'
         '400':
-          description: Bad request — missing/invalid email, or neither firstName nor lastName supplied.
+          description: >
+            Bad request — missing/invalid email, neither firstName nor
+            lastName supplied, or roles requests an internal-resolving role
+            (admin/internal) for a non-@wso2.com email.
           content:
             application/json:
               schema:
@@ -3604,6 +3690,49 @@ paths:
                 $ref: '#/components/schemas/SearchProductVersionsResponse'
         "400":
           description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /products/github-repo:
+    get:
+      summary: Get the GitHub repository mapped to a product.
+      description: >
+        Resolves a case product name against the active product_repo_mapping
+        rows: an exact product name first, then an exact abbreviation, then the
+        longest product name followed by a space (so a versioned name such as
+        "<product> 6.0.0" resolves to "<product>"). Matching is case-insensitive.
+        Registered only when DATA_SOURCE is postgres.
+      operationId: getProductRepoMapping
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Product name from the case, with or without a version.
+      responses:
+        "200":
+          description: The mapped repository.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductRepoMapping'
+        "400":
+          description: name is missing or blank.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: No GitHub repository is mapped for this product.
           content:
             application/json:
               schema:
@@ -7976,6 +8105,120 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /outage-notifications/sweep:
+    post:
+      summary: Evaluate which internal-stakeholder outage emails are due.
+      description: >-
+        Postgres data source only. Backs the `outage_internal_notification`
+        sub-cron in operations/csm-scheduled-tasks, which renders and sends
+        the emails this returns.
+
+
+        The port of ServiceNow's `Internal Stakeholders Email Notification -
+        Outage Communication`. A sweep rather than a record trigger because
+        nothing in this stack writes `outage` — csm-sync-service mirrors it in
+        from ServiceNow, so there is no local write to react to.
+
+
+        POST rather than GET because it is not read-only: each decision is
+        recorded as sent BEFORE it is returned, so the same sweep run twice
+        does not report the same email twice. The consequence is deliberate —
+        a decision the caller fails to deliver is lost rather than retried,
+        because a duplicate outage notice to the whole internal audience is
+        worse than a missed one.
+
+
+        Internal callers only: a sweep is estate-wide by definition and has no
+        project or account to scope to.
+      operationId: sweepOutageNotifications
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+          description: Maximum outages to evaluate in this sweep.
+      responses:
+        "200":
+          description: >-
+            The emails to send. An empty `decisions` list is the normal
+            steady state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutageNotificationSweepResponse'
+        "400":
+          description: Bad request — limit is not an integer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is not an internal service.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+  /outages/{id}/notification-state:
+    get:
+      summary: What has already been sent for one outage.
+      description: >-
+        Postgres data source only. Operational visibility, mainly for
+        answering why an outage did or did not produce an email.
+
+
+        `seededFromSync` distinguishes a phase this service earned by sending
+        an email from one seeded out of ServiceNow's own mirrored value at
+        cutover — which is why an outage can be `DECLARED` with no
+        `declaredOn`.
+      operationId: getOutageNotificationState
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The outage's notification state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutageNotificationState'
+        "400":
+          description: Bad request — the id is not a UUID.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is not an internal service.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: This outage has never been evaluated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /outages/{id}/communications:
     post:
       summary: >-
@@ -10900,7 +11143,8 @@ components:
       description: >-
         At least one of firstName/lastName is required. userType is never
         accepted here -- it is derived by the database from role membership.
-        Postgres-only.
+        Granting a role that resolves to userType INTERNAL (admin/internal)
+        for a non-@wso2.com email is rejected with 400. Postgres-only.
 
     SNUser:
       type: object
@@ -12004,6 +12248,24 @@ components:
           type: integer
         hasMore:
           type: boolean
+
+    ProductRepoMapping:
+      type: object
+      required: [productName, owner, repository, githubLabel]
+      properties:
+        productName:
+          type: string
+        abbreviation:
+          type: string
+          description: Short code the case payload may use instead of the product name. Omitted when unset.
+        owner:
+          type: string
+          description: GitHub organisation that owns the repository.
+        repository:
+          type: string
+        githubLabel:
+          type: string
+          description: Product label applied to issues filed in this repository.
 
     SNProduct:
       description: Product returned by the ServiceNow data source. Timestamp fields are absent; class is a ServiceNow label (e.g. "Software Model").
@@ -17286,15 +17548,39 @@ components:
           type: string
           pattern: '.*\S.*'
           description: >-
-            Salesforce sObject name. Account is always processed.
-            Project_Contact__c (also accepted as Project_Contact) and Contact
-            are processed only when CSM_MIGRATION_SALESFORCE_MEMBERSHIP_INGEST_ENABLED is
-            true; otherwise, like every other value, they are acknowledged
-            with 204 and ignored.
+            Salesforce sObject name. Each family is processed only when its
+            flag is true; otherwise, like every other value, it is acknowledged
+            with 204 and ignored. Account: CSM_MIGRATION_SALESFORCE_ACCOUNT_INGEST_ENABLED.
+            Project_Contact__c (also accepted as Project_Contact) and Contact:
+            CSM_MIGRATION_SALESFORCE_MEMBERSHIP_INGEST_ENABLED. Project__c:
+            CSM_MIGRATION_SALESFORCE_PROJECT_INGEST_ENABLED (update-only; inserts
+            also need CSM_MIGRATION_SALESFORCE_PROJECT_INSERT_ENABLED). Opportunity,
+            Linked_Opportunity__c (also accepted as Linked_Opportunity), Invoice__c
+            (also accepted as Invoice) and OpportunityLineItem:
+            CSM_MIGRATION_SALESFORCE_OPPORTUNITY_INGEST_ENABLED.
         referenceId:
           type: string
           pattern: '.*\S.*'
           description: Salesforce record Id.
+
+    SalesforcePartnerRefreshResult:
+      type: object
+      required: [customerSfId, partnerSfIds, added, removed]
+      properties:
+        customerSfId:
+          type: string
+          description: The customer's Salesforce Account Id as Salesforce spells it (18 characters).
+        partnerSfIds:
+          type: array
+          items:
+            type: string
+          description: The partner accounts Salesforce lists now, and so the ones stored.
+        added:
+          type: integer
+          description: account_relationship rows inserted (a new partner is two rows, forward and reverse).
+        removed:
+          type: integer
+          description: account_relationship rows deleted.
 
     ErrorResponse:
       type: object
@@ -19930,6 +20216,77 @@ components:
         additional:
           type: integer
 
+    OutageNotificationSweepResponse:
+      type: object
+      properties:
+        evaluated:
+          type: integer
+          description: Outages considered in this sweep.
+        decisions:
+          type: array
+          description: The emails to send, already recorded as sent.
+          items:
+            $ref: '#/components/schemas/OutageNotificationDecision'
+        errors:
+          type: object
+          additionalProperties:
+            type: string
+          description: >-
+            Keyed by outage id. An outage whose send could not be recorded is
+            reported here and deliberately omitted from `decisions` — nothing
+            is emailed without a trace of having been emailed.
+    OutageNotificationDecision:
+      type: object
+      properties:
+        outageId:
+          type: string
+          format: uuid
+        number:
+          type: string
+        kind:
+          type: string
+          enum: [DECLARED, RESOLVED, UPDATE]
+        reason:
+          type: string
+          description: >-
+            The branch that selected this email, in the ServiceNow flow's own
+            vocabulary, so a log line can be matched against the original.
+        subject:
+          type: string
+        body:
+          type: string
+          description: >-
+            A fixed sentence carrying no outage detail, reproducing the
+            ServiceNow original exactly.
+    OutageNotificationState:
+      type: object
+      properties:
+        outageId:
+          type: string
+          format: uuid
+        phase:
+          type: string
+          enum: [NONE, DECLARED, RESOLVED]
+          description: NONE is a real state — no email has gone out yet.
+        declaredOn:
+          type: string
+          format: date-time
+        resolvedOn:
+          type: string
+          format: date-time
+        lastUpdateOn:
+          type: string
+          format: date-time
+        updateCount:
+          type: integer
+          description: >-
+            The update arm advances no phase and can fire repeatedly, so its
+            noisiness is tracked here rather than in the state machine.
+        seededFromSync:
+          type: boolean
+          description: >-
+            True when `phase` came from ServiceNow's mirrored value rather
+            than from an email this service sent.
     OutageDetail:
       allOf:
         - $ref: '#/components/schemas/Outage'
@@ -22098,8 +22455,9 @@ components:
         write done by the Salesforce membership ingest; IDENTITY is the Asgardeo
         user provisioned by csm-notification-service via the SCIM service; EMAIL
         the invitation email; REGISTRATION the member's first sign-in, recorded
-        by the customer portal backend.
-      enum: [IDENTITY, DATABASE, EMAIL, REGISTRATION]
+        by the customer portal backend; WELCOME_EMAIL the Welcome email sent
+        by csm-notification-service after registration.
+      enum: [IDENTITY, DATABASE, EMAIL, REGISTRATION, WELCOME_EMAIL]
 
     OnboardingStepStatus:
       type: string

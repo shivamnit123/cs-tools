@@ -38,7 +38,6 @@ import (
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/dashboard"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/directory"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/entity"
-	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/githubissue"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/googledrive"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/handler"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
@@ -57,7 +56,6 @@ func main() {
 	middleware.ConfigureLogger()
 
 	dashboard.SetActive(loadDashboards())
-	githubissue.SetActive(loadGithubIssueRepoOptions())
 
 	// Reference data is resolved once, here, and then only ever read from
 	// memory: the team registry (key <-> display name <-> backing group id <->
@@ -105,7 +103,6 @@ func main() {
 		caseHandler.WithEngineeringClient(engineeringEntityClient)
 		slog.Info("GitHub issues are created through the engineering entity service")
 	}
-	metadataHandler := handler.NewMetadataHandler()
 	accountHandler := handler.NewAccountHandler(customerEntityClient)
 	projectHandler := handler.NewProjectHandler(customerEntityClient)
 	teamHandler := handler.NewTeamHandler(customerEntityClient)
@@ -370,7 +367,6 @@ func main() {
 	route("POST /call-requests/search", handler.PermView, caseHandler.SearchAllCallRequests)
 	route("PATCH /cases/{caseId}/call-requests/{callRequestId}", handler.PermWrite, caseHandler.PatchCallRequest)
 	route("POST /cases/{id}/github-issues", handler.PermWrite, caseHandler.CreateCaseGithubIssue)
-	route("GET /metadata", handler.PermView, metadataHandler.GetMetadata)
 	route("POST /cases/{id}/tags", handler.PermWrite, caseHandler.AddCaseTag)
 	route("DELETE /cases/{id}/tags/{tagId}", handler.PermWrite, caseHandler.RemoveCaseTag)
 	route("POST /tags/search", handler.PermView, caseHandler.SearchTags)
@@ -442,6 +438,7 @@ func main() {
 	}
 	route("PATCH /projects/{id}", handler.PermWrite, projectHandler.UpdateProject)
 	route("POST /products/search", handler.PermView, productHandler.SearchProducts)
+	route("GET /products/github-repo", handler.PermView, productHandler.GetProductRepoMapping)
 	route("POST /products/{id}/versions/search", handler.PermView, productHandler.SearchProductVersions)
 	route("POST /deployments", handler.PermWrite, deploymentHandler.PostDeployment)
 	route("POST /kb-articles", handler.PermWrite, kbArticleHandler.CreateKBArticle)
@@ -808,28 +805,6 @@ func loadDashboards() *dashboard.Registry {
 	}
 	slog.Info("loaded dashboard definitions", "dir", dir, "presetsFile", presetsFile, "count", len(registry.Dashboards()), "hotReload", hotReload)
 	return registry
-}
-
-// loadGithubIssueRepoOptions resolves the "Open Git issue" dialog's
-// repository catalogue from GITHUB_ISSUE_REPO_OPTIONS (a JSON array — see
-// githubissue.ParseRepoOptions for the shape and validation) and exits the
-// process on any failure to parse it.
-//
-// This used to be a hardcoded array in the frontend, which is how a real case
-// filed with "Asgardeo" selected landed in the wrong GitHub repository: the
-// owner/repo mapping lived in code no config reviewer would think to check.
-// Fatal on malformed content, same rationale as loadDashboards: an operator
-// error here should stop the deploy, not silently ship an empty or
-// half-populated dropdown. Unset is legal and yields no options — a
-// deployment that has not configured this yet must still start.
-func loadGithubIssueRepoOptions() []githubissue.RepoOption {
-	options, err := githubissue.ParseRepoOptions(os.Getenv("GITHUB_ISSUE_REPO_OPTIONS"))
-	if err != nil {
-		slog.Error("invalid GITHUB_ISSUE_REPO_OPTIONS", "err", err)
-		os.Exit(1)
-	}
-	slog.Info("loaded github issue repo options", "count", len(options))
-	return options
 }
 
 // loadDirectory resolves the reference catalogues from environment

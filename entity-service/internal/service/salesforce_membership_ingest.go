@@ -125,6 +125,9 @@ func (s *salesforceEventService) ingestMembership(ctx context.Context, membershi
 		return &apierror.ServiceUnavailableError{Msg: "sales/sales-entity-service project contact " + membershipSfID + " has no linked project"}
 	}
 	contactSfID := strings.TrimSpace(derefString(pc.Contact.ID))
+	// A partner contact's membership refreshes the project account's partner
+	// links on every exit, duplicate or not (salesforce_partner_ingest.go).
+	defer s.refreshPartnersForMembership(ctx, membershipSfID, pc)
 	if known != nil && !strings.EqualFold(strings.TrimSpace(derefString(known.ID)), contactSfID) {
 		// Not this membership's contact as spelled here (a 15/18-character
 		// Id pair, or Salesforce moved it between the two reads): read the
@@ -205,6 +208,9 @@ func (s *salesforceEventService) ingestMembership(ctx context.Context, membershi
 		UpdatedBy:       domain.SalesforceSyncActor,
 	}
 	res, err := s.membership.Memberships.Upsert(ctx, in, step)
+	if err != nil && s.ensureMissingProjectForMembership(ctx, err, membershipSfID, in.ProjectSfID) {
+		res, err = s.membership.Memberships.Upsert(ctx, in, step)
+	}
 	if err != nil {
 		s.recordDatabaseStepFailed(ctx, step, err)
 		return err
@@ -241,7 +247,48 @@ func (s *salesforceEventService) ingestMembership(ctx context.Context, membershi
 		slog.InfoContext(ctx, "salesforce: membership already in this state, not re-publishing project_contact.invited",
 			"membershipSfId", membershipSfID, "state", in.State)
 	}
+	// Welcome only on INVITED/RE-INVITED -> REGISTERED: echoes, replays and
+	// backfilled rows (created already REGISTERED) stay silent.
+	if strings.EqualFold(in.State, domain.MembershipStateRegistered) && !res.CreatedProjectContact && wasInvitedState(res.PreviousState) {
+		s.publishProjectContactRegistered(ctx, in, pc, eventModifiedOn, hasModified)
+	}
 	return nil
+}
+
+func wasInvitedState(state string) bool {
+	return strings.EqualFold(state, domain.MembershipStateInvited) || strings.EqualFold(state, domain.MembershipStateReInvited)
+}
+
+// publishProjectContactRegistered emits project_contact.registered for the
+// Welcome email. Failures are logged, like publishProjectContactInvited.
+func (s *salesforceEventService) publishProjectContactRegistered(ctx context.Context, in domain.SalesforceMembershipUpsert, pc salesentity.ProjectContact, eventModifiedOn time.Time, hasModified bool) {
+	if s.membership.Publisher == nil {
+		return
+	}
+	modifiedOn := ""
+	if hasModified {
+		modifiedOn = eventModifiedOn.UTC().Format(time.RFC3339Nano)
+	}
+	payload, err := json.Marshal(events.ProjectContactRegisteredPayload{
+		MembershipSfID:    in.MembershipSfID,
+		ContactSfID:       in.ContactSfID,
+		Email:             in.Email,
+		GivenName:         in.ContactFirstName,
+		FamilyName:        in.ContactLastName,
+		ProjectName:       strings.TrimSpace(derefString(pc.Subscription.Name)),
+		ProjectKey:        in.ProjectKey,
+		IsIntegrationUser: in.IsCsIntegrationUser,
+		EventModifiedOn:   modifiedOn,
+	})
+	if err != nil {
+		slog.ErrorContext(ctx, "salesforce: encode project_contact.registered payload", "membershipSfId", in.MembershipSfID, "err", err)
+		return
+	}
+	pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), publishInvitedTimeout)
+	defer cancel()
+	if err := s.membership.Publisher.Publish(pubCtx, events.TypeProjectContactRegistered, in.MembershipSfID, payload); err != nil {
+		slog.ErrorContext(ctx, "salesforce: publish project_contact.registered", "membershipSfId", in.MembershipSfID, "err", err)
+	}
 }
 
 // recordDatabaseStepFailed writes DATABASE=FAILED best-effort so the

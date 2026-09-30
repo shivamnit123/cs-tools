@@ -1,13 +1,12 @@
 module sre-alert-ingestion-service
 
-go 1.26.0
+go 1.25.5
 
 require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/caarlos0/env/v11 v11.4.1
 	github.com/cenkalti/backoff/v4 v4.3.0
 	github.com/gocql/gocql v1.7.0
-	golang.org/x/crypto v0.57.0
 )
 
 require (

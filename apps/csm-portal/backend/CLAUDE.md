@@ -39,10 +39,27 @@ caller. `UsersHandler.CreateUser` (`internal/handler/users.go`) validates `roles
 `Directory.IsValidRole` (the same startup-resolved `CSM_USER_ROLES` allow-list `POST /roles/search`
 serves) before forwarding the request body unchanged to the entity service's own `POST /users` —
 entity-service deliberately does not validate role names itself (see that repo's own `domain.UserRole`
-doc comment), so this is the one place that does. `roles` is optional and currently unused by the
-frontend (no role-picker UI yet, since there is no Asgardeo-backed way to browse/assign roles at
-account-creation time today) — the field exists end-to-end and works if sent, it's just not wired
-into the Add User form yet.
+doc comment), so this is the one place that does. `roles` is optional; the Add User form's "User type"
+selector is the one caller-facing use of it today — it sends exactly one of `["internal"]`/`["external"]`,
+since entity-service derives `user_type` from role membership rather than a plain settable column (see
+that repo's own `recompute_user_type` trigger, migration 0011). There is still no Asgardeo-backed way
+to browse/assign a fuller role set at account-creation time, so nothing beyond that one required choice
+is exposed here.
+
+**Constraint: an internal-type user must have a `@wso2.com` email.** Found live: the Add User form sent
+no `roles` at all, so every user it created resolved to `user_type = NOT_AVAILABLE` (the trigger's
+fallback for "no matching role, not a system user") — a real, existing data-quality gap (128 such users
+in staging at the time this was checked), not a hypothetical one. Fixing that by wiring up a type
+selector raised the obvious next risk: nothing stopped an admin from granting `internal`/`admin` (both
+resolve to `user_type = INTERNAL`) to a non-WSO2 address. `requestsInternalUserType`
+(`internal/handler/user_external_account.go`, next to `wso2EmailDomain`/`isWso2Email`) checks `roles`
+case-insensitively against that same two-name list and rejects the request with 400 before forwarding
+to entity-service if the email isn't `@wso2.com` — a fast, friendly failure. **This is not the real
+enforcement boundary**: entity-service's own `userService.CreateUser` (`user_service.go`) runs the
+identical check against `req.Roles`/`req.Email` and is what actually protects the database, since
+`POST /users` is entity-service's own route and this backend is not its only conceivable caller. The
+two lists (`internalUserTypeRoles` here, its unexported twin there) are kept in sync by hand, the same
+way `wso2EmailDomain` itself already is between the two repos.
 
 ## Security Center access (PermViewSecurityCenter)
 
@@ -157,7 +174,7 @@ Each upstream service has its own client package under `internal/`:
 
 | Package | Upstream | Notes |
 |---------|----------|-------|
-| `entity` | Multiple entity services (see below) | Hosts `CustomerEntityClient` (this repo's entity-service; most case/account/project endpoints, raw `[]byte` passthrough) and `EngineeringEntityClient` (a separate internal engineering entity service; `CreateGitIssue`, typed request/response, plus `Health(ctx)` backing `GET /health/dependencies` — see "Health endpoints" above). `EngineeringEntityClient` is constructed in `cmd/server/main.go` only when `ENGINEERING_ENTITY_BASE_URL` is set, and then `CaseHandler.CreateCaseGithubIssue` uses it (via `WithEngineeringClient`) instead of the entity service: the target must be a `GITHUB_ISSUE_REPO_OPTIONS` entry, and unlike the entity service's version it does not write the issue URL back to the case or tag a regression |
+| `entity` | Multiple entity services (see below) | Hosts `CustomerEntityClient` (this repo's entity-service; most case/account/project endpoints, raw `[]byte` passthrough) and `EngineeringEntityClient` (a separate internal engineering entity service; `CreateGitIssue`, typed request/response, plus `Health(ctx)` backing `GET /health/dependencies` — see "Health endpoints" above). `EngineeringEntityClient` is constructed in `cmd/server/main.go` only when `ENGINEERING_ENTITY_BASE_URL` is set, and then `CaseHandler.CreateCaseGithubIssue` uses it (via `WithEngineeringClient`) instead of the entity service: the target is the case product's `product_repo_mapping` row (looked up through the entity service's `GET /products/github-repo`; `repoOverride` is ignored), and after filing it writes the issue URL to the case as a best-effort work note |
 | `scim` | SCIM service | User/group lookups. Two orgs: `SearchUser` queries the "internal" org (WSO2 staff — phone number, last password update). `SearchExternalUser` queries the "external" org (customer/partner contacts — existence + lock status, mirroring `infra-operations/operations/asgardeo-user-check`'s `{exists, locked}` contract). `GetUser` calls the latter only when the entity response's `userType` isn't `internal`, and treats a lookup failure as best-effort — logged, response returned unchanged, never a failed request |
 | `updates` | Updates service | Product update levels; returns typed structs (not raw passthrough) |
 | `csmnotification` | `integrations/csm-notification-service` | Health check only today (`Health(ctx)`, backing `GET /health/dependencies` — see "Health endpoints" below). Optional: unconfigured (`CSM_NOTIFICATION_SERVICE_BASE_URL` unset) means this dependency reports `not_configured` |

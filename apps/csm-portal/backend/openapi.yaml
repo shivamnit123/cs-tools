@@ -1920,10 +1920,14 @@ paths:
       summary: Create a new user.
       description: >
         Inserts a new platform user. Admin-only — every other portal role gets
-        403. Postgres data source only. roles is optional and currently unused
-        by the CSM portal frontend (no UI to pick a role yet); each name, if
+        403. Postgres data source only. roles is optional; each name, if
         supplied, is checked against the same configured role allow-list
-        POST /roles/search serves.
+        POST /roles/search serves. The CSM portal's Add User form sends exactly
+        one of "internal"/"external" here to set the new user's type — entity-
+        service derives user_type from role membership, so this is the only way
+        to set it. Granting "internal" or "admin" for an email that is not
+        @wso2.com is rejected with 400: an internal-type user must have a
+        wso2.com address.
       operationId: postUsers
       requestBody:
         required: true
@@ -1939,7 +1943,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/User'
         "400":
-          description: Bad request — missing/invalid email, neither firstName nor lastName supplied, or an unrecognized role.
+          description: >-
+            Bad request — missing/invalid email, neither firstName nor lastName
+            supplied, an unrecognized role, or roles requests an
+            internal-resolving role (admin/internal) for a non-@wso2.com email.
           content:
             application/json:
               schema:
@@ -4485,6 +4492,59 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorPayload'
 
+  /products/github-repo:
+    get:
+      summary: Look up the GitHub repository for a product.
+      description: |
+        Resolves a case product name to the repository an internal GitHub issue
+        is filed in. An exact product name wins, then an abbreviation, then the
+        longest product name that is a prefix of `name` followed by a space.
+      operationId: getProductGithubRepo
+      parameters:
+        - name: name
+          in: query
+          required: true
+          description: Catalogue product name, abbreviation, or versioned display name.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The repository mapped to the product.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductRepoMapping'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: No GitHub repository is mapped for this product.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
   /products/{id}/versions/search:
     post:
       summary: Search versions for a specific product.
@@ -4796,9 +4856,10 @@ paths:
       description: |
         By default the request is forwarded to the entity service (ServiceNow data source only).
         When the backend is configured with an engineering entity service, the issue is filed
-        through it instead: `repoOverride` is then required and must be one of the configured
-        repository options (otherwise `400`), `reason` is ignored, and the case's work notes are
-        not updated.
+        through it. The repository and product label are resolved from the case product via
+        product_repo_mapping (`GET /products/github-repo`). A product with no mapping returns
+        `400`. `repoOverride` is ignored. `reason` "migration" adds the Affected/Migration label,
+        and a work note with the issue URL is written on the case.
       operationId: createCaseGithubIssue
       security:
         - bearerAuth: []
@@ -4855,60 +4916,6 @@ paths:
                 $ref: '#/components/schemas/ErrorPayload'
         "500":
           description: Internal server error.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorPayload'
-
-  /metadata:
-    get:
-      summary: Get the portal's config-driven metadata bag.
-      description: >
-        Returns a single growable bag of reference/config data the webapp
-        fetches once, rather than a dedicated endpoint per field.
-        `githubIssueRepoOptions` is the first field: for each option, its
-        dropdown value/display label plus the actual GitHub owner/repo an issue filed
-        against it is created in, resolved once at process startup from
-        GITHUB_ISSUE_REPO_OPTIONS and held in memory; not user-configurable at
-        runtime. A deployment with that unset returns an empty array, not an
-        error. Independent of the `reason`-based repo selection on
-        POST /cases/{id}/github-issues above — this backs a different,
-        user-facing repo picker. More fields are expected to be added here
-        over time.
-      operationId: getMetadata
-      responses:
-        "200":
-          description: Ok
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/MetadataResponse'
-        "400":
-          description: BadRequest
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorPayload'
-        "401":
-          description: Unauthorized
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorPayload'
-        "403":
-          description: Forbidden
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorPayload'
-        "404":
-          description: NotFound
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorPayload'
-        "500":
-          description: InternalServerError
           content:
             application/json:
               schema:
@@ -13876,51 +13883,6 @@ components:
             no-op — this backend only forwards it, exactly like
             inlineDrilldown.
 
-    MetadataResponse:
-      type: object
-      required:
-        - githubIssueRepoOptions
-      properties:
-        githubIssueRepoOptions:
-          type: array
-          description: >
-            The "Open Git issue" dialog's repository dropdown options, from
-            GITHUB_ISSUE_REPO_OPTIONS. Empty when that variable is unset — not
-            an error.
-          items:
-            $ref: '#/components/schemas/GithubIssueRepoOption'
-
-    GithubIssueRepoOption:
-      type: object
-      required:
-        - value
-        - displayLabel
-        - owner
-        - repo
-        - githubLabel
-      properties:
-        value:
-          type: string
-          description: >
-            Opaque dropdown selection key. Not itself a repo name — owner/repo
-            below carry the actual destination.
-        displayLabel:
-          type: string
-          description: Human-readable option text shown in the dropdown.
-        owner:
-          type: string
-          description: GitHub organization/owner an issue filed against this option is created in.
-        repo:
-          type: string
-          description: GitHub repository name an issue filed against this option is created in.
-        githubLabel:
-          type: string
-          description: >
-            The real GitHub issue label that should eventually be applied to
-            an issue filed against this option — distinct from displayLabel,
-            which is dropdown text only. Stored and served here only; not yet
-            applied anywhere.
-
     DashboardListItem:
       type: object
       properties:
@@ -15185,7 +15147,10 @@ components:
             type: string
           description: >-
             Role names to grant. Optional; omit or leave empty to create the
-            user with no roles. Not currently exposed in the CSM portal UI.
+            user with no roles. The Add User form sends exactly one of
+            "internal"/"external" here to set the new user's type (see
+            entity-service's own recompute_user_type trigger) — "internal" or
+            "admin" is rejected for a non-@wso2.com email.
       description: At least one of firstName/lastName is required.
 
     AccountSearchPayload:
@@ -16138,6 +16103,20 @@ components:
           type: integer
         hasMore:
           type: boolean
+
+    ProductRepoMapping:
+      type: object
+      properties:
+        productName:
+          type: string
+        abbreviation:
+          type: string
+        owner:
+          type: string
+        repository:
+          type: string
+        githubLabel:
+          type: string
 
     Product:
       description: >

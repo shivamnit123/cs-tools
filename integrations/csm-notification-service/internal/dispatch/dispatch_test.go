@@ -36,6 +36,7 @@ type sentEmail struct {
 	from        string
 	to          []string
 	bcc         []string
+	replyTo     []string
 	subject     string
 	htmlBody    string
 	attachments []notifications.EmailAttachment
@@ -73,7 +74,7 @@ func (m *mockEmailSender) SendEmailFrom(ctx context.Context, from string, to, cc
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.calls = append(m.calls, sentEmail{from: from, to: to, bcc: bcc, subject: subject, htmlBody: htmlBody, attachments: attachments})
+	m.calls = append(m.calls, sentEmail{from: from, to: to, bcc: bcc, replyTo: replyTo, subject: subject, htmlBody: htmlBody, attachments: attachments})
 	if m.onSend != nil {
 		m.onSend()
 	}

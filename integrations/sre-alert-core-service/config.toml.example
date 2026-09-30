@@ -50,9 +50,7 @@ http_timeout = "10s"
 # How often the poller retries incidents whose CSM/Chat notification still hasn't succeeded.
 retry_sweep_interval = "30s"
 # Bounds how many failed CreateIncident attempts before an incident is marked permanently failed.
-# Sized against a 6h max CSM outage assumption: with csm_retry_base_delay/multiplier/max_delay
-# below, 13 attempts spans ~8h of retries (6h + ~33% margin) before giving up.
-max_csm_attempts = 13
+max_csm_attempts = 20
 # How long a resolved service-label -> CMDB-service-id mapping is reused before a fresh lookup.
 service_cache_ttl = "15m"
 # Throttles how often a confirmed incident's status is re-checked against CSM during a storm.

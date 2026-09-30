@@ -991,3 +991,70 @@ func (f *fakeStepRepo) ListMissingParentFailures(_ context.Context, _ time.Durat
 	}
 	return out, nil
 }
+
+// TestMembershipIngest_RegisteredTransitionPublishesWelcome: only a move from
+// INVITED/RE-INVITED into REGISTERED publishes project_contact.registered.
+func TestMembershipIngest_RegisteredTransitionPublishesWelcome(t *testing.T) {
+	cases := map[string]struct {
+		existed  bool
+		previous string
+		want     int
+	}{
+		"invited to registered":     {existed: true, previous: "INVITED", want: 1},
+		"re-invited to registered":  {existed: true, previous: "RE-INVITED", want: 1},
+		"echo of registered":        {existed: true, previous: "REGISTERED", want: 0},
+		"deactivated to registered": {existed: true, previous: "DEACTIVATED", want: 0},
+		"backfilled as registered":  {existed: false, want: 0},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := newIngestHarness(sampleProjectContact("REGISTERED", "Portal user"), sampleContact(), true)
+			h.repo.rowAlreadyExisted = tc.existed
+			h.repo.previousState = tc.previous
+			if err := h.svc.HandleEvent(context.Background(), membershipEvent("UPDATED", "Project_Contact__c")); err != nil {
+				t.Fatalf("HandleEvent: %v", err)
+			}
+			if len(h.pub.published) != tc.want {
+				t.Fatalf("published = %d, want %d", len(h.pub.published), tc.want)
+			}
+			if tc.want == 0 {
+				return
+			}
+			env := h.pub.published[0]
+			if env.Type != events.TypeProjectContactRegistered || env.EntityID != testMembershipID {
+				t.Errorf("envelope = %s %s", env.Type, env.EntityID)
+			}
+			var p events.ProjectContactRegisteredPayload
+			if err := json.Unmarshal(env.Payload, &p); err != nil {
+				t.Fatal(err)
+			}
+			if p.MembershipSfID != testMembershipID || p.ContactSfID != testContactID || p.Email != "jane@acme.com" ||
+				p.GivenName != "Jane" || p.FamilyName != "Doe" || p.ProjectName != "Acme Prod" || p.ProjectKey != "ACMEPROD" || p.EventModifiedOn == "" {
+				t.Errorf("payload = %+v", p)
+			}
+		})
+	}
+}
+
+// TestMembershipIngest_ReplayOfRegisteredVersionDoesNotPublish: the duplicate
+// guard drops a replay before any publish.
+func TestMembershipIngest_ReplayOfRegisteredVersionDoesNotPublish(t *testing.T) {
+	h := newIngestHarness(sampleProjectContact("REGISTERED", "Portal user"), sampleContact(), true)
+	h.repo.rowAlreadyExisted = true
+	h.repo.previousState = "INVITED"
+	if err := h.svc.HandleEvent(context.Background(), membershipEvent("UPDATED", "Project_Contact__c")); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.pub.published) != 1 {
+		t.Fatalf("published = %d, want 1 for the transition", len(h.pub.published))
+	}
+	h.steps.existing = []domain.OnboardingStep{{
+		MembershipSfID: testMembershipID, Step: domain.OnboardingStepDatabase, Status: domain.OnboardingStepSucceeded, EventModifiedOn: h.repo.steps[0].EventModifiedOn,
+	}}
+	if err := h.svc.HandleEvent(context.Background(), membershipEvent("UPDATED", "Project_Contact__c")); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.pub.published) != 1 {
+		t.Errorf("published = %d after a replay, want still 1", len(h.pub.published))
+	}
+}

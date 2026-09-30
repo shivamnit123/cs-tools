@@ -301,6 +301,22 @@ func Validate(entityID string, t Type, raw json.RawMessage) error {
 				return fmt.Errorf("events: eventModifiedOn %q is not RFC 3339: %w", p.EventModifiedOn, err)
 			}
 		}
+	case TypeProjectContactRegistered:
+		var p ProjectContactRegisteredPayload
+		if err := decodeStrict(raw, &p); err != nil {
+			return err
+		}
+		if p.MembershipSfID == "" || !emailPattern.MatchString(p.Email) {
+			return fmt.Errorf("events: missing or invalid required field for %s", t)
+		}
+		if p.MembershipSfID != entityID {
+			return fmt.Errorf("events: payload membershipSfId %q does not match entityId %q", p.MembershipSfID, entityID)
+		}
+		if p.EventModifiedOn != "" {
+			if _, err := time.Parse(time.RFC3339Nano, p.EventModifiedOn); err != nil {
+				return fmt.Errorf("events: eventModifiedOn %q is not RFC 3339: %w", p.EventModifiedOn, err)
+			}
+		}
 	default:
 		return fmt.Errorf("events: unknown event type %q", t)
 	}

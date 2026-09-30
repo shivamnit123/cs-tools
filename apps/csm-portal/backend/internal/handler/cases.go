@@ -85,6 +85,9 @@ type entityCaseClient interface {
 	SearchFeedback(ctx context.Context, body []byte) ([]byte, error)
 	AggregateFeedback(ctx context.Context, body []byte) ([]byte, error)
 	GetCase(ctx context.Context, caseID string) ([]byte, error)
+	// GetProductRepoMapping calls GET /products/github-repo?name= on the
+	// entity service. The response is the GitHub repository for that product.
+	GetProductRepoMapping(ctx context.Context, name string) ([]byte, error)
 	CreateCaseAttachment(ctx context.Context, body []byte) ([]byte, error)
 	SearchCaseAttachments(ctx context.Context, body []byte) ([]byte, error)
 	GetCaseAttachmentContent(ctx context.Context, attachmentID string) ([]byte, string, error)

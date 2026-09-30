@@ -46,6 +46,8 @@ import (
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/ledger"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/notify"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/opencases"
+	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/outagenotify"
+	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/outagenotifytask"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/registry"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/stalecases"
 )
@@ -101,6 +103,21 @@ func main() {
 	})
 	if err != nil {
 		slog.Error("failed to construct entity-service case-search client", "err", err)
+		os.Exit(1)
+	}
+
+	// Outage internal-stakeholder notification. Its own narrow client: the
+	// sweep is a completely different question from case search or the
+	// query-hour recompute, and shares no endpoint with either.
+	outageNotifyClient, err := outagenotify.NewClient(outagenotify.Config{
+		BaseURL:      entityServiceBaseURL,
+		TokenURL:     oauthTokenURL,
+		ClientID:     oauthClientID,
+		ClientSecret: oauthClientSecret,
+		Scopes:       entityServiceScopes,
+	})
+	if err != nil {
+		slog.Error("failed to construct entity-service outage-notification client", "err", err)
 		os.Exit(1)
 	}
 
@@ -224,6 +241,9 @@ func main() {
 	const housekeepingTaskName = "housekeeping_cleanup"
 	housekeepingTo, housekeepingCc := recipientsFor(recipientOverrides, housekeepingTaskName)
 
+	const outageNotifyTaskName = "outage_internal_notification"
+	outageNotifyTo, outageNotifyCc := recipientsFor(recipientOverrides, outageNotifyTaskName)
+
 	const staleCasesTaskName = "stale_cases_report"
 	staleCasesTo, staleCasesCc := recipientsFor(recipientOverrides, staleCasesTaskName)
 	// Fixed, not env-configurable — unlike HOUSEKEEPING_RETENTION_DAYS, there's
@@ -300,6 +320,30 @@ func main() {
 			Handler:  announcementpublish.PublishDue(announcementPublishClient),
 			To:       publishScheduledAnnouncementsTo,
 			Cc:       publishScheduledAnnouncementsCc,
+		},
+		// The internal-stakeholder outage notice.
+		//
+		// Every 5 minutes, not hourly: an outage declaration that arrives an
+		// hour late has missed the event it is announcing. The sweep is cheap
+		// — only outages opted into notification and not yet resolved — so the
+		// cadence costs little.
+		//
+		// SUB_CRON_RECIPIENTS here is the REPORT AUDIENCE, not failure alerts:
+		// an empty `to` skips the sweep entirely, which matters because
+		// sweeping marks decisions as sent and would consume notices nobody
+		// receives.
+		//
+		// NOT yet a paired ServiceNow deactivation. Registering this is a
+		// paired change with turning off `Internal Stakeholders Email
+		// Notification - Outage Communication`, per the double-fire rule.
+		{
+			Name:     outageNotifyTaskName,
+			Schedule: scheduleFor(scheduleOverrides, outageNotifyTaskName, "*/5 * * * *"),
+			Handler: outagenotifytask.SendNotices(
+				outageNotifyClient, emailClient, outageNotifyTo, outageNotifyCc, alertsEnabled,
+			),
+			To: outageNotifyTo,
+			Cc: outageNotifyCc,
 		},
 	}
 

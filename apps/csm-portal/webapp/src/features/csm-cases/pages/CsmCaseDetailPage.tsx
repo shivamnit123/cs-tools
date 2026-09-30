@@ -3312,7 +3312,7 @@ export default function CsmCaseDetailPage(): JSX.Element {
           defaultTitle={c.subject}
           defaultDescription={c.description}
           showRepoField={isCloudSupportSubscription(caseProject?.subscriptionType)}
-          productName={c.product}
+          productName={c.productCatalogueName || c.product}
           onboardingInProgress={caseProject?.onboardingStatus === "In-Progress"}
           projectStatusPending={Boolean(c.projectId) && caseProject === undefined && !isCaseProjectError}
           projectStatusFailed={Boolean(c.projectId) && isCaseProjectError}

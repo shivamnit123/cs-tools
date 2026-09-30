@@ -4,6 +4,13 @@ Go HTTP server (`net/http`, standard library only) that owns all core CS-platfor
 
 ## Architecture
 
+> **`cmd/` holds exactly one directory: `cmd/api`.** Never add a second
+> `package main` there — Choreo's build picks this service's main package from
+> `cmd/`, and a second directory fails the pipeline. It also drags dev-only
+> code into everything `go build ./...`, `go vet` and gosec walk. Put one-off
+> verification tooling in an env-var-guarded `TestServe*Harness` in
+> `internal/server/`, or in `scripts/`, or keep it out of the repo.
+
 Strict four-layer stack — no shortcuts across layers:
 
 ```
@@ -52,7 +59,10 @@ The server loads `.env` automatically on startup (silently ignored if absent). P
 | `CSM_MIGRATION_MEMBERSHIP_REGISTRATION_ENABLED` | no | `false` | Must be `"true"` for `POST /users/me/memberships/register` to be registered at all (see "Membership registration" below). Off = the route 404s and nothing on that path can write to Salesforce |
 | `CSM_MIGRATION_SALESFORCE_MEMBERSHIP_INGEST_ENABLED` | no | `false` | Must be `"true"` for `POST /salesforce/events` to act on `Project_Contact__c`/`Contact` envelopes, the Contact writer included (see "Salesforce membership ingest" and "The Contact writer" below). The Account branch is unaffected |
 | `CSM_MIGRATION_SALESFORCE_ACCOUNT_INGEST_ENABLED` | no | `false` | Must be `"true"` for `POST /salesforce/events` to act on `Account` envelopes; off, they are acknowledged and ignored. Keep it off while the ServiceNow sync still writes `account`. The upsert resolves the row by `sf_id` (not unique since migration 0095), then links a same-`number` row with no `sf_id`, then inserts; the SE-1 columns are kept when Salesforce sends none; see "Salesforce Account ingest" for the full column set |
-| `CSM_MIGRATION_SALESFORCE_OPPORTUNITY_INGEST_ENABLED` | no | `false` | Must be `"true"` for `POST /salesforce/events` to act on `Opportunity` envelopes (`sf_opportunity` plus its `sf_opportunity_product` line items, see "Salesforce Opportunity ingest" below); off, they are acknowledged and ignored. Keep it off while csm-sync-service still copies these tables from ServiceNow: the two writers use different row ids and `sf_id` is not unique, so both on means duplicate rows |
+| `CSM_MIGRATION_SALESFORCE_OPPORTUNITY_INGEST_ENABLED` | no | `false` | Must be `"true"` for `POST /salesforce/events` to act on `Opportunity` envelopes (`sf_opportunity` plus its `sf_opportunity_product` line items, see "Salesforce Opportunity ingest" below) and `Linked_Opportunity__c`, `Invoice__c` and standalone `OpportunityLineItem` envelopes (`sf_opportunity_link`, `sf_invoice`, `sf_opportunity_product`); off, they are acknowledged and ignored. Keep it off while csm-sync-service still copies these tables from ServiceNow: the two writers use different row ids and `sf_id` is not unique, so both on means duplicate rows |
+| `CSM_MIGRATION_SALESFORCE_PROJECT_INGEST_ENABLED` | no | `false` | Must be `"true"` for `POST /salesforce/events` to act on `Project__c` envelopes (see "Salesforce Project ingest" below); off, they are acknowledged and ignored. Update-only unless the insert switch is on too |
+| `CSM_MIGRATION_SALESFORCE_PROJECT_INSERT_ENABLED` | no | `false` | With the project flag on, lets the Project ingest and `EnsureProject` insert projects CSM does not have. Keep it off while csm-sync-service still inserts `project` rows (different id schemes and a UNIQUE `key`: its insert would fail forever); turn it on at cutover |
+| `CSM_MIGRATION_SALESFORCE_PARTNER_INGEST_ENABLED` | no | `false` | Must be `"true"` for the partner-link refresh (`account_relationship` "Is Partner Of" / "Is Customer Of") to run after Account events and partner-contact membership events, and for `POST /salesforce/accounts/{sfId}/refresh-partners` to be registered (see "Salesforce partner relationships" below). Keep it off while csm-sync-service still copies `account_relationship` from ServiceNow |
 | `SALESFORCE_INGEST_RETRY_INTERVAL` | no | `5m` | How often the Salesforce ingest retry worker re-runs memberships whose DATABASE step FAILED because their project or account was not in CSM yet, and how old such a failure must be before it is re-run (see "Salesforce ingest ledger and the delayed-retry job" below). `0` disables the job, and so does an unparseable or negative value (logged as a warning; it fails closed rather than falling back to `5m`). Only runs when `CSM_MIGRATION_SALESFORCE_MEMBERSHIP_INGEST_ENABLED=true` |
 | `CSM_MIGRATION_PORTAL_WRITES_ENABLED` | no | `false` | Must be `"true"` to register the four portal-driven membership write routes under `/projects/{id}/contacts` (see "Portal-driven membership writes" below). Also needs `DATA_SOURCE=postgres`, a pool, and the full `SALES_ENTITY_*` set (`Config.HasPortalMembershipWrites`). Off means the routes are **not registered at all**, not 403 |
 
@@ -375,6 +385,9 @@ publishes) while still suppressing the portal's own echo (RE-INVITED →
 RE-INVITED is unchanged, so it does not). Do not put the insert-only condition
 back.
 
+`project_contact.registered` (`events.ProjectContactRegisteredPayload`) is published the same way, only on an
+existing row moving INVITED / RE-INVITED → REGISTERED; csm-notification-service sends the Welcome email (step `WELCOME_EMAIL`).
+
 **Schema prerequisite**: the `sf_id` columns on `"user"`, `account_contact`
 and `project_contact` come from the csm-sync migration 0076, which is not in
 this repo's `migrations/`; the ingest fails at the first `SELECT ... sf_id`
@@ -516,10 +529,13 @@ hour at the default. FAILED ledger rows are read the same way
 (`SalesforceIngestStateRepository.ListMissingParentFailures`, which applies the
 registered-retrier, missing-parent and attempt-cap filters in SQL before the batch
 limit, so a backlog of rows the job would skip cannot starve eligible ones) and handed to
-`EntityRetriers[entity]`; `opportunity` registers one (`RetryOpportunityIngest`) when
-`CSM_MIGRATION_SALESFORCE_OPPORTUNITY_INGEST_ENABLED=true`, and `contact` always
+`EntityRetriers[entity]`; `opportunity`, `linked_opportunity`, `invoice` and `opportunity_line_item` register one each
+(`RetryOpportunityIngest`, `RetryLinkedOpportunityIngest`, `RetryInvoiceIngest`, `RetryOpportunityLineItemIngest`) when `CSM_MIGRATION_SALESFORCE_OPPORTUNITY_INGEST_ENABLED=true`, `project` one
+(`RetryProjectIngest`) when `CSM_MIGRATION_SALESFORCE_PROJECT_INGEST_ENABLED=true`, and `contact` always
 registers one (`RetryContactIngest`: the whole Contact writer as UPDATED, fan-out
-included; it runs under the membership flag the job already requires). Other
+included; it runs under the membership flag the job already requires), and
+`account_partners` registers one (`RetryPartnerRefresh`) when
+`CSM_MIGRATION_SALESFORCE_PARTNER_INGEST_ENABLED=true`. Other
 entities are only counted (the Account ingest records FAILED rows but has no parent to wait for, so it
 registers none).
 
@@ -557,7 +573,7 @@ acknowledged and ignored). Code: `internal/service/salesforce_opportunity_ingest
   `product_sf_id`, `classification`, `environment`, `total_price`. **Never written:**
   `development_support_hours`, `engagement_code`. With duplicate `sf_opportunity` rows
   for one `sf_id`, the oldest owns the line items. Standalone `OpportunityLineItem`
-  events need a Sales Entity endpoint that does not exist yet and are still ignored.
+  events are handled too (see "Standalone OpportunityLineItem" below).
 - **DELETED:** hard delete `sf_opportunity WHERE sf_id = $1` (FKs cascade line items
   and project links, null invoices) plus a DELETED ledger row, in one transaction;
   a never-ingested opportunity is acknowledged and logged.
@@ -569,6 +585,142 @@ acknowledged and ignored). Code: `internal/service/salesforce_opportunity_ingest
 - **Duplicate guard:** the REST Sales Entity does not return `lastModifiedDate` for
   opportunities yet, so today the guard is skipped with a warning and the idempotent
   upsert runs on every event; it starts working once Sales Entity sends the field.
+- **`Linked_Opportunity__c`** (also `Linked_Opportunity`), same flag:
+  `internal/service/salesforce_linked_opportunity_ingest.go` (`WithLinkedOpportunityIngest`),
+  `internal/repository/sf_opportunity_link_repo.go`, `GetLinkedOpportunity` on
+  `POST /linked-opportunities/search`. CREATED/UPDATED/RESTORED: guard with entity
+  `linked_opportunity`, resolve the opportunity through the shared `ensureOpportunity`
+  (see "Invoice__c" below; the script's `_initOpportunity`), the project through
+  `EnsureProject` (missing project with inserts off = `NotFoundError`, re-run by the retry
+  job, which registers `RetryLinkedOpportunityIngest`), then upsert `sf_opportunity_link` by
+  `link_sf_id` under lock `"sf-opportunity-link:"+id`: `number` (= Name), `opportunity_id`,
+  `project_id`, `sync_time_stamp`. A link without a project or opportunity id is recorded
+  FAILED and acknowledged. DELETED: hard delete by the 18-character `link_sf_id` plus a
+  DELETED ledger row; a never-ingested link is acknowledged.
+
+## Salesforce Project ingest
+
+`POST /salesforce/events` acts on `Project__c` envelopes when
+`CSM_MIGRATION_SALESFORCE_PROJECT_INGEST_ENABLED=true` (off by default: acknowledged and
+ignored). Code: `internal/service/salesforce_project_ingest.go` (`WithProjectIngest` in
+`routes.go`), `internal/repository/salesforce_project_repo.go`, `GetProject` in
+`internal/salesentity/project.go`. Plan: `docs/customer-onboarding/SALESFORCE_SYNC_PLAN.md` §6.
+
+- **CREATED / UPDATED / RESTORED:** `POST /projects/search {id, limit: 1}` (empty result =
+  `ServiceUnavailableError`), `shouldSkipIngest` with entity `project` (Sales Entity sends
+  `lastModifiedDate`, so the guard works), `EnsureAccount(customerId)`, `project_type_id` by
+  exact `project_type.name` (unknown label = NULL + warning; types are never created), then
+  one transaction: advisory lock `"project-sf:"+sfId`, resolve the row by `sf_id`, else by
+  `key` (the `sf_id` is stamped on a key match), update, ledger row.
+- **Written (only):** `sf_id`, `key`, `name`, `account_id` (kept when Salesforce names no
+  account), `start_date`, `end_date`, `description`, `project_type_id`,
+  `compliance_violation_date`, `onboarding_go_live_date` (`Go_Live_Date__c`: CSM owns it and
+  writes it to Salesforce, decision D4, so this mirrors it back), plus `updated_on`/`updated_by`.
+  Closure states, `wso2_closure_state`, hour counters, onboarding fields, credentials,
+  `number`, `is_active` are never in the UPDATE (`TestSalesforceProjectSQL_ColumnList`).
+- **Update-only by default:** with `CSM_MIGRATION_SALESFORCE_PROJECT_INSERT_ENABLED` off a
+  project CSM does not have is `NotFoundError` "project not found for sfId ..." plus a FAILED
+  ledger row, which the delayed-retry job re-runs. On, it is inserted with
+  `gen_random_uuid()` and `is_active = TRUE`.
+- **Empty `Project_Key__c` (decision D5):** refused: FAILED ledger row with the reason,
+  event acknowledged (no retry can fix it).
+- **DELETED:** `is_active = FALSE` on every row with the (18-character) `sf_id` plus a DELETED
+  ledger row. RESTORED, or any upsert whose previous ledger row is a successful DELETED (or a
+  failed RESTORED), sets `is_active = TRUE` again, in a separate statement touching only
+  rows where it is FALSE.
+- **`EnsureProject(sfId)`:** lookup by `sf_id` (`SalesforceIngestSupport.Projects`,
+  flag-independent); when missing and the project flag and insert switch are both on, the
+  project is fetched and upserted first. Otherwise `NotFoundError`. The membership ingest
+  calls it when its upsert fails with "project not found" and retries the membership once;
+  with inserts off it keeps the original error for the retry job.
+
+### Invoice__c (same flag)
+
+`Invoice__c` (also accepted as `Invoice`) envelopes are handled under
+`CSM_MIGRATION_SALESFORCE_OPPORTUNITY_INGEST_ENABLED` too. Code:
+`internal/service/salesforce_invoice_ingest.go` (`WithInvoiceIngest`),
+`internal/repository/sf_invoice_repo.go`, `GetInvoice` in `internal/salesentity/invoice.go`,
+and `ensureOpportunity` in `internal/service/salesforce_opportunity_ensure.go` (shared by
+the linked-opportunity, invoice and line-item families).
+
+- **CREATED / UPDATED / RESTORED:** `POST /invoices/search {id, limit: 1}` (empty =
+  retryable), guard on entity `invoice` (Sales Entity sends `lastModifiedDate`), then
+  `ensureOpportunity(opportunityId)` — look up `sf_opportunity` by `sf_id`, and when
+  missing run the Opportunity branch inline (which ensures the account) **without the
+  duplicate guard**, as `EnsureAccount` and `EnsureProject` do: a missing row means the
+  ledger's "already written" is stale (a cascade or an out-of-band delete), so the
+  opportunity is re-ingested at its current version — then one
+  transaction under `"sf-invoice:"+sfId`: update every `sf_invoice` row with the `sf_id`,
+  else insert, plus the SUCCEEDED ledger row. Every data column is written (`name`,
+  `description`, `classification` — VARCHAR(40), truncated with a warning —
+  `opportunity_id`, `invoiced_amount`, `invoice_date`, `invoiced_due_date`,
+  `original_invoice_due_date` = `originalInvoiceDueDate ?? dueDate`, `invoiced_paid_date`,
+  `service_start_date`, `service_end_date`, `sync_time_stamp`). An invoice with no
+  `opportunityId` is written with a NULL `opportunity_id` and a warning. Auto-created
+  invoices are included (the standalone search does not filter them).
+- **DELETED:** hard delete by `sf_id` (widened to 18 characters) plus a DELETED ledger
+  row; a never-ingested invoice is acknowledged.
+- **Never from the Opportunity event:** the invoices embedded in an Opportunity lack the
+  invoice date, the parent id and the original due date, and leave out auto-created
+  invoices, so they are ignored (plan §7).
+- **Retry:** `invoice` registers `RetryInvoiceIngest` with the delayed-retry job when the
+  flag is on; a missing account under the inline Opportunity ingest fails with the
+  "account not found ..." prefix it matches.
+
+### Standalone OpportunityLineItem (same flag)
+
+`OpportunityLineItem` envelopes are handled under
+`CSM_MIGRATION_SALESFORCE_OPPORTUNITY_INGEST_ENABLED` too. Code:
+`internal/service/salesforce_opportunity_line_item_ingest.go` (`WithOpportunityLineItemIngest`),
+`internal/repository/sf_opportunity_line_item_repo.go`, `GetOpportunityLineItem` in
+`internal/salesentity/opportunity_line_item.go`.
+
+- **CREATED / UPDATED / RESTORED:** `POST /opportunity-line-items/search {id, limit: 1}`
+  (empty = retryable; no `opportunityId` = retryable), guard on entity
+  `opportunity_line_item`, `ensureOpportunity(opportunityId)`, then one transaction under
+  the **parent opportunity's** lock `"sf-opportunity:"+opportunitySfId` (the lock the
+  derived set replace holds, so the two paths cannot both insert one line item) that runs
+  the derived path's own UPDATE-by-`line_item_sf_id`-else-INSERT with the same mapping
+  (`mapSalesEntityLineItem`) plus the ledger row. `development_support_hours` and
+  `engagement_code` are never written.
+- **DELETED:** hard delete by `line_item_sf_id` (18 characters), under the owning
+  opportunity's lock when the row is stored; a never-ingested line item is acknowledged.
+- **Retry:** `opportunity_line_item` registers `RetryOpportunityLineItemIngest` when the
+  flag is on.
+
+## Salesforce partner relationships
+
+The partner links in `account_relationship` ("partner **Is Partner Of** customer",
+read by the invitation validator through `AccountPartnerRepository`) are refreshed
+from Salesforce when `CSM_MIGRATION_SALESFORCE_PARTNER_INGEST_ENABLED=true` (off by
+default). Code: `RefreshPartners` in `internal/service/salesforce_partner_ingest.go`
+(attached with `WithPartnerIngest` in `routes.go`),
+`internal/repository/account_partner_write_repo.go`, `GetCustomerPartners` in
+`internal/salesentity/partners.go`. Plan: `docs/customer-onboarding/SALESFORCE_SYNC_PLAN.md`
+§4 and decision D8 (store a copy).
+
+- **Read:** `POST /customer-search {ids: [id], isRealTime: true, includePartners: true}`.
+  A response without the `partners` key (or with `null`) is a `ServiceUnavailableError`,
+  never "no partners": an older Sales Entity build must not wipe the stored links.
+- **Write:** `EnsureAccount` for the customer and every partner first (a missing one is
+  ingested when the Account ingest is on, else the refresh fails with "account not
+  found ..." before writing anything), then one transaction under the advisory lock
+  `"account-partners:"+customerSfId`: insert each missing forward row (`from` = partner,
+  `to` = customer, `Is Partner Of` / `Is Customer Of`, `is_reverse_relationship = false`)
+  and its mirror (`from` = customer, `to` = partner, labels swapped, `true`), delete the
+  forward and reverse partner rows whose partner left the set, and record a SUCCEEDED
+  ledger row with entity `account_partners` (sf_id = the customer). Rows of any other
+  label are never touched; `relationship_type_id` stays NULL (the reader matches labels).
+- **Callers, all behind the one flag:** every Account CREATED/UPDATED/RESTORED after the
+  upsert, including a replay the duplicate guard skipped (a partner change does not move
+  the account's `LastModifiedDate`; a failure fails the event so Service Bus redelivers
+  it); every membership event whose contact's account differs from the project's account
+  (best effort: logged and recorded FAILED, never failing the membership); the internal
+  route `POST /salesforce/accounts/{sfId}/refresh-partners` (internal callers only,
+  registered only with the flag on; answers the stored set); and the delayed-retry job
+  (`RetryPartnerRefresh` under `account_partners`).
+- **Not built yet:** the nightly sweep over every account (TODO in `RefreshPartners`); it
+  is the only way to catch a partner added in Salesforce with no related save.
 
 ## Membership registration (`POST /users/me/memberships/register`)
 
@@ -3949,6 +4101,22 @@ orphaned `"user"` row with no roles.
 The acting caller is resolved from `x-user-id-token` (`emailFromJWT`, the same helper `GetMe` uses)
 and stamped as `created_by`/`updated_by` — this service still has no notion of "admin" itself;
 restricting who may call this is `apps/csm-portal/backend`'s job (see that repo's own `CLAUDE.md`).
+
+**`userService.CreateUser` also rejects granting an internal-resolving role to a non-`@wso2.com`
+email.** `internalUserTypeRoles` (`user_service.go`, next to `emailRE`) is `["admin", "internal"]` —
+the same two names `recompute_user_type`'s trigger maps to `user_type = INTERNAL` — and
+`requestsInternalUserType` checks `req.Roles` against it case-insensitively before `repo.CreateUser`
+runs; a match with `req.Email` not ending in `wso2EmailDomain` (`@wso2.com`, the same constant
+`sn_case_service.go`'s `filterWso2Emails` already uses) is a `*apierror.ValidationError`. This is the
+real enforcement boundary for that rule: `apps/csm-portal/backend`'s own `UsersHandler.CreateUser` runs
+an identical, independently-maintained check for a fast 400 before ever reaching this service, but
+this one is what actually protects the database — `POST /users` is this service's own route, and
+nothing about role-name validation here should assume a single, trusted caller (see this file's own
+note on `domain.UserRole` not being validated against a fixed enum for the same reasoning). Found live:
+the CSM portal's Add User form sent no `roles` at all until it gained a type selector, so every user it
+created resolved to `user_type = NOT_AVAILABLE` — checked directly against staging before this shipped
+(128 such users). The type selector fixes that by granting `internal`/`external`; this check is what
+stops it from being pointed at the wrong email.
 
 ## SearchDeployments crashed on any page containing a NULL deployment.type
 

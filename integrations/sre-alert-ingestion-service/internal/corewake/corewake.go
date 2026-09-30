@@ -22,11 +22,8 @@ package corewake
 
 import (
 	"context"
-	"encoding/base64"
-	"fmt"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"sync"
 	"time"
 )
@@ -35,38 +32,21 @@ import (
 // while a call is in flight is coalesced into a single follow-up call, so a batch written
 // mid-call is never left waiting for alerts-core's backstop poll.
 type Client struct {
-	logger   *slog.Logger
-	url      string
-	secure   bool
-	username string
-	secret   string
-	http     *http.Client
-	mu       sync.Mutex
-	running  bool
-	pending  bool
-	idle     *sync.Cond
+	logger  *slog.Logger
+	url     string
+	http    *http.Client
+	mu      sync.Mutex
+	running bool
+	pending bool
+	idle    *sync.Cond
 }
 
-// New returns a Client. An empty url logs a warning and makes Wake a no-op (local dev). If url is
-// set but username/secret aren't, wake calls are sent unauthenticated (alerts-core will 401 them
-// if /alertz requires auth; the backstop poll still picks the alert up). Credentials are only ever
-// attached over https: a plain-http url sends the wake call unauthenticated rather than leak the
-// secret in cleartext.
-func New(logger *slog.Logger, wakeURL, username, secret string, timeout time.Duration) *Client {
-	secure := false
-	if wakeURL == "" {
+// New returns a Client. An empty url logs a warning and makes Wake a no-op (local dev).
+func New(logger *slog.Logger, url string, timeout time.Duration) *Client {
+	if url == "" {
 		logger.Warn("ALERT_CORE_WAKE_URL not set; alerts-core will pick alerts up on its own poll")
-	} else {
-		if parsed, err := url.Parse(wakeURL); err == nil && parsed.Scheme == "https" {
-			secure = true
-		}
-		if username == "" || secret == "" {
-			logger.Warn("ALERT_CORE_WAKE_USERNAME/ALERT_CORE_WAKE_SECRET not set; wake calls will be unauthenticated")
-		} else if !secure {
-			logger.Warn("ALERT_CORE_WAKE_URL is not https; wake calls will be sent unauthenticated to avoid leaking credentials over cleartext")
-		}
 	}
-	c := &Client{logger: logger, url: wakeURL, secure: secure, username: username, secret: secret, http: &http.Client{Timeout: timeout}}
+	c := &Client{logger: logger, url: url, http: &http.Client{Timeout: timeout}}
 	c.idle = sync.NewCond(&c.mu)
 	return c
 }
@@ -106,10 +86,6 @@ func (c *Client) send() {
 	if err != nil {
 		c.logger.Warn("alerts-core wake-up request invalid", "error", err)
 		return
-	}
-	if c.secure && c.username != "" && c.secret != "" {
-		token := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", c.username, c.secret)))
-		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {

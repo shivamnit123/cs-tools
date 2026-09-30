@@ -66,6 +66,11 @@ func (c *CustomerEntityClient) GetCase(ctx context.Context, caseID string) ([]by
 	return c.do(ctx, http.MethodGet, fmt.Sprintf("/cases/%s", url.PathEscape(caseID)), nil)
 }
 
+// GetProductRepoMapping calls GET /products/github-repo?name= on the entity service.
+func (c *CustomerEntityClient) GetProductRepoMapping(ctx context.Context, name string) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, "/products/github-repo?name="+url.QueryEscape(name), nil)
+}
+
 // PatchCase calls PATCH /cases/{id} on the entity service to update case state.
 // Response is returned as raw JSON; typed response structs are deferred.
 func (c *CustomerEntityClient) PatchCase(ctx context.Context, caseID string, body []byte) ([]byte, error) {

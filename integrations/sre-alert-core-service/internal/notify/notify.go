@@ -103,7 +103,7 @@ func DedupTag(fingerprint string, firstSeen time.Time) string {
 	return fmt.Sprintf("[fp:%s:%d]", fingerprint[:12], firstSeen.UnixMilli())
 }
 
-// NotifyCSM returns permanent=true only for a 400 (invalid payload, will never succeed). CSMAttempts >= 1 already counts current attempt; only first attempts fail open on search errors.
+// NotifyCSM returns permanent=true for non-retryable rejections (non-429 4xx). CSMAttempts >= 1 already counts current attempt; only first attempts fail open on search errors.
 func (n *Notifier) NotifyCSM(ctx context.Context, inc model.Incident) (incidentID, incidentNumber string, ok bool, permanent bool) {
 	tag := DedupTag(inc.Fingerprint, inc.FirstSeen)
 	if id, number, found, err := n.csm.SearchIncidentByCorrelationID(ctx, tag); err != nil {
@@ -143,11 +143,8 @@ func (n *Notifier) NotifyCSM(ctx context.Context, inc model.Incident) (incidentI
 
 	res, err := n.createIncidentWithRetry(ctx, tag, req)
 	if err != nil {
-		// Only 400 means the payload itself is invalid and will never succeed; everything else
-		// (401/403/404/409/429/5xx) is the kind of transient CSM-side condition maxCSMAttempts'
-		// 6h retry budget exists to survive, and must not be given up on after a single attempt.
 		var apiErr *apierror.Error
-		perm := errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusBadRequest
+		perm := errors.As(err, &apiErr) && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 && apiErr.StatusCode != http.StatusTooManyRequests
 		n.logger.Error("csm create incident failed", "incident_number", inc.IncidentNumber, "permanent", perm, "error", err)
 		return "", "", false, perm
 	}

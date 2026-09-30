@@ -1259,6 +1259,17 @@ type KnowledgeBaseService interface {
 
 // OutageService defines the operations available on the outages entity. All
 // methods require the ServiceNow data source; there is no Postgres fallback.
+// OutageNotificationService decides which internal-stakeholder outage emails
+// are due and records that they were reported. It does not send them — see
+// Sweep's own doc comment for why delivery belongs to the caller.
+type OutageNotificationService interface {
+	// Sweep evaluates every outage awaiting notification, records the sends,
+	// and returns what the caller should deliver. Internal callers only.
+	Sweep(ctx context.Context, limit int) (domain.OutageNotificationSweepResponse, error)
+	// State returns what has already been sent for one outage.
+	State(ctx context.Context, outageID string) (domain.OutageNotificationState, error)
+}
+
 type OutageService interface {
 	// CreateOutage creates a new outage. Type, Begin, and ShortDescription are
 	// required. AcknowledgePublicPublication is required when the resolved

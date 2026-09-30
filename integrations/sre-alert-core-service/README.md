@@ -97,7 +97,7 @@ own doc comments for the specific tradeoffs.
   helpers the poller and lease both build on.
 - `internal/config`: loads and validates `config.toml`.
 - `internal/auth`: PBKDF2 hashing/verification, the `integration_users`
-  Cassandra repository, and the `RequireAuth` middleware gating `/alertz`.
+  Cassandra repository, and the `RequireAuth` middleware (not currently applied to any route).
 - `cmd/server`: wires everything together and manages startup/shutdown.
 - `cmd/user`: CLI to create/rotate, list, enable, and disable `integration_users` rows.
 

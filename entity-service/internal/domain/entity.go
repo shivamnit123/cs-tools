@@ -542,6 +542,7 @@ const (
 	SalesforceEntityProjectContactAlt = "Project_Contact"
 	SalesforceEntityContact           = "Contact"
 	SalesforceEntityOpportunity       = "Opportunity"
+	SalesforceEntityProject           = "Project__c"
 	SalesforceSyncActor               = "salesforce-sync"
 	// PortalMembershipWriteActor is created_by/updated_by for a membership
 	// written by a portal rather than by the Salesforce ingest, so the two
@@ -560,6 +561,14 @@ const (
 	// sync's, which share the same table but never carry this value. See
 	// internal/service/sla_policy_resolver.go.
 	SLAEngineActor = "sla-engine"
+)
+
+// SalesforceEntityLinkedOpportunity is the Linked_Opportunity__c custom
+// object (a project's link to an opportunity). The Alt spelling is accepted
+// defensively, as SalesforceEntityProjectContactAlt is.
+const (
+	SalesforceEntityLinkedOpportunity    = "Linked_Opportunity__c"
+	SalesforceEntityLinkedOpportunityAlt = "Linked_Opportunity"
 )
 
 // SalesforceEventRequest is the ASB envelope POSTed to /salesforce/events.
@@ -944,6 +953,9 @@ const (
 	OnboardingStepDatabase     OnboardingStepName = "DATABASE"
 	OnboardingStepEmail        OnboardingStepName = "EMAIL"
 	OnboardingStepRegistration OnboardingStepName = "REGISTRATION"
+	// OnboardingStepWelcomeEmail is the Welcome email csm-notification-service
+	// sends after registration.
+	OnboardingStepWelcomeEmail OnboardingStepName = "WELCOME_EMAIL"
 )
 
 // OnboardingStepStatus is the onboarding_step.status enum.
@@ -1042,6 +1054,14 @@ const SalesforceIngestEntityOpportunity = "opportunity"
 // of the Contact writer, which owns the "user" and account_contact rows of a
 // Salesforce Contact (two tables, so the ledger names the Salesforce concept).
 const SalesforceIngestEntityContact = "contact"
+
+// SalesforceIngestEntityProject is the salesforce_ingest_state.entity value
+// of the Project family (table project).
+const SalesforceIngestEntityProject = "project"
+
+// SalesforceIngestEntityLinkedOpportunity is the salesforce_ingest_state.entity
+// value of the Linked_Opportunity__c family (table sf_opportunity_link).
+const SalesforceIngestEntityLinkedOpportunity = "linked_opportunity"
 
 // SalesforceIngestState is one row of salesforce_ingest_state — see migration
 // 0170 for the column semantics. It is the ledger the duplicate guard reads

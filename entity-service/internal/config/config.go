@@ -118,6 +118,28 @@ type Config struct {
 	// csm-sync-service still copies these tables from ServiceNow and the two
 	// writers would create duplicate rows (different row ids, non-unique sf_id).
 	CSMMigrationSalesforceOpportunityIngestEnabled bool
+	// CSMMigrationSalesforceProjectIngestEnabled turns on the Project__c
+	// branch of POST /salesforce/events, from
+	// CSM_MIGRATION_SALESFORCE_PROJECT_INGEST_ENABLED=true. Defaults to false:
+	// Project__c envelopes are acknowledged and ignored. On, it updates the
+	// ten Salesforce-owned project columns of rows CSM already has.
+	CSMMigrationSalesforceProjectIngestEnabled bool
+	// CSMMigrationSalesforceProjectInsertEnabled lets the Project ingest (and
+	// EnsureProject, for memberships and linked opportunities) insert
+	// projects CSM does not have, from
+	// CSM_MIGRATION_SALESFORCE_PROJECT_INSERT_ENABLED=true. Defaults to false,
+	// the update-only mode: while csm-sync-service still inserts project rows
+	// from ServiceNow, an ingest-created row would make its insert fail on
+	// project.key forever. Turn on at cutover, when csm-sync-service stops.
+	CSMMigrationSalesforceProjectInsertEnabled bool
+	// CSMMigrationSalesforcePartnerIngestEnabled turns on the partner-link
+	// refresh (account_relationship "Is Partner Of" / "Is Customer Of") that
+	// runs after Account events, after partner-contact membership events and
+	// from POST /salesforce/accounts/{sfId}/refresh-partners, from
+	// CSM_MIGRATION_SALESFORCE_PARTNER_INGEST_ENABLED=true. Defaults to false:
+	// nothing refreshes partners and the route is not registered, because
+	// csm-sync-service still copies account_relationship from ServiceNow.
+	CSMMigrationSalesforcePartnerIngestEnabled bool
 	// CSMMigrationMembershipRegistrationEnabled turns on POST /users/me/memberships/register,
 	// which marks the signed-in user's still-INVITED memberships as
 	// REGISTERED in Salesforce (see membership_registration_service.go). Defaults to
@@ -444,6 +466,9 @@ func Load() *Config {
 	cfg.AuthInternalClientIDs = ParseInternalClientIDs(cfg.AuthInternalClientIDsRaw)
 	// Set outside the literal so its longer key does not realign every field above.
 	cfg.CSMMigrationSalesforceOpportunityIngestEnabled = os.Getenv("CSM_MIGRATION_SALESFORCE_OPPORTUNITY_INGEST_ENABLED") == "true"
+	cfg.CSMMigrationSalesforceProjectIngestEnabled = os.Getenv("CSM_MIGRATION_SALESFORCE_PROJECT_INGEST_ENABLED") == "true"
+	cfg.CSMMigrationSalesforceProjectInsertEnabled = os.Getenv("CSM_MIGRATION_SALESFORCE_PROJECT_INSERT_ENABLED") == "true"
+	cfg.CSMMigrationSalesforcePartnerIngestEnabled = os.Getenv("CSM_MIGRATION_SALESFORCE_PARTNER_INGEST_ENABLED") == "true"
 	return cfg
 }
 

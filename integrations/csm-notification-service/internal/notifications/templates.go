@@ -63,6 +63,9 @@ var projectContactInvitedExistingTemplateRaw string
 //go:embed templates/project_contact_invited_reminder.html
 var projectContactInvitedReminderTemplateRaw string
 
+//go:embed templates/project_contact_registered.html
+var projectContactRegisteredTemplate string
+
 // wso2LogoURL is WSO2's own official logo asset, served from wso2.cachefly.net
 // (WSO2's public CDN for site assets — not third-party hosting). An earlier
 // version embedded the logo as an inline base64 data: URI instead, avoiding
@@ -888,4 +891,23 @@ func renderProjectContactInvited(tmpl string, d ProjectContactInvitedEmailData) 
 		"<!-- [PORTAL_URL] -->", escapeHTML(d.PortalURL),
 	)
 	return replacer.Replace(tmpl)
+}
+
+// ProjectContactRegisteredEmailData fills the Welcome email sent after a
+// contact's first sign-in moves their membership to REGISTERED.
+type ProjectContactRegisteredEmailData struct {
+	DisplayName string
+	ProjectName string
+	ProjectKey  string
+	PortalURL   string
+}
+
+// RenderProjectContactRegisteredEmail fills in the Welcome email.
+func RenderProjectContactRegisteredEmail(d ProjectContactRegisteredEmailData) string {
+	return strings.NewReplacer(
+		"<!-- [DISPLAY_NAME] -->", escapeHTML(d.DisplayName),
+		"<!-- [PROJECT_NAME] -->", escapeHTML(d.ProjectName),
+		"<!-- [PROJECT_KEY] -->", escapeHTML(d.ProjectKey),
+		"<!-- [PORTAL_URL] -->", escapeHTML(d.PortalURL),
+	).Replace(projectContactRegisteredTemplate)
 }

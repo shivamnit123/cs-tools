@@ -140,7 +140,7 @@ Backs `entity.EngineeringEntityClient.CreateGitIssue` (a separate internal engin
 | `ENGINEERING_ENTITY_BASE_URL` | Base URL of the engineering entity service. Optional — setting it switches "Open Git issue" over to it. Must be `https` (a path is allowed, but no userinfo, query or fragment); anything else fails startup |
 | `ENGINEERING_ENTITY_SCOPES` | Comma-separated OAuth2 scopes (optional) |
 
-On this path the target must be `repoOverride` and must match an entry of `GITHUB_ISSUE_REPO_OPTIONS` (owner/repo, case-insensitive), so the service account can only file in the curated repositories; the catalogue's `owner` is passed as both the GitHub organisation and owner (the engineering service selects its GitHub access token by that organisation name, so it must be one it is configured with). The service's response has no issue URL, so the URL returned to the web app is built as `https://github.com/<owner>/<repo>/issues/<number>`. The title (max 256 characters) and description are sent, with `updateLevel`, `publicIssueUrl` and `hotFixRequired` appended to the body, and the labels are the repo option's `githubLabel`, `issueTypeLabel`, `priorityLevel` (only for `Type/Incident`) and `regression`. `reason` is ignored, since it only steers the entity service's own routing. Unlike the entity service's implementation, this path does **not** write the issue URL back into the case's work notes or tag the case as a regression.
+On this path the target comes from the case's product, not from the request: the backend reads the case, takes its product name, and looks it up with the entity service's `GET /products/github-repo` (the `product_repo_mapping` table). `repoOverride` is ignored, and a case whose product has no mapping gets a 400 (`No GitHub repository is mapped for this product.`). The mapping's `owner` is passed as both the GitHub organisation and owner (the engineering service selects its GitHub access token by that organisation name, so it must be one it is configured with). The service's response has no issue URL, so the URL returned to the web app is built as `https://github.com/<owner>/<repo>/issues/<number>`. The title (max 256 characters) and description are sent, with `updateLevel`, `publicIssueUrl` and `hotFixRequired` appended to the body. The labels are `Origin/CS`, the update level, the mapping's `githubLabel`, `Type/Patch` and `patch` for a patch, the priority for `Type/Discussion`, and `Require/Hotfix`, `regression`, `Affected/Migration` (`reason` of `migration`) and `Onboarding/affected` when they apply. After the issue is created, a work note with its URL is written on the case; that write is best-effort, so a failure is logged and the create still succeeds. Case tags are left to the web app.
 
 ### Customer-onboarding status (optional, off by default)
 
@@ -193,14 +193,6 @@ Both optional — used only to back `GET /health/dependencies` today (see "Healt
 |---|---|
 | `NOTIFICATIONS_GOOGLE_CHAT_SPACES` | JSON array of `{"product","webhookUrl"}` objects, one per Google Chat space — e.g. `[{"product":"api-manager","webhookUrl":"https://chat.googleapis.com/..."}]`. Optional — left unset, malformed, Google Chat alerts are unavailable but startup and every other endpoint work normally |
 | `CSM_PORTAL_WEB_BASE_URL` | Base URL of the CSM portal webapp, used to build the "Open in CSM Portal" link at `/operations/incidents/{caseId}` (e.g. `http://localhost:3001` for local dev). Optional — only needed alongside `NOTIFICATIONS_GOOGLE_CHAT_SPACES` above |
-
-### "Open Git issue" dialog repository catalogue
-
-The webapp's "Open Git issue" dialog offers a CS engineer a list of destination repositories. That list used to be hardcoded in the frontend (`CreateGithubIssueDialog.tsx`) — which is how a real case filed with "Asgardeo" selected landed in the wrong GitHub repository, because the owner/repo mapping lived in code no config reviewer would think to check. It is now a config-driven catalogue, resolved once at startup and served as the `githubIssueRepoOptions` field of `GET /metadata`, same "JSON-array env var parsed at startup" shape as `DASHBOARDS_CONFIG` below.
-
-| Variable | Description |
-|---|---|
-| `GITHUB_ISSUE_REPO_OPTIONS` | JSON array of `{"value","displayLabel","owner","repo","githubLabel"}` objects, one per dropdown option — e.g. `[{"value":"choreo","displayLabel":"WSO2 Developer Platform (Choreo)","owner":"wso2-enterprise","repo":"choreo","githubLabel":"Choreo"}]`. `githubLabel` is the real GitHub issue label eventually applied to an issue filed against that option — stored/served only for now, not yet wired into issue creation. Optional — unset returns an empty catalogue; malformed content (bad JSON, a blank field, or a duplicate `value`) is fatal, naming the offending entry |
 
 ### Dashboards
 
@@ -344,9 +336,6 @@ backend/
 │   │   ├── customer.go          # CustomerEntityClient operations (cases, accounts, projects, ...)
 │   │   ├── onboarding.go        # CustomerEntityClient.SearchOnboardingSteps — typed onboarding-ledger search
 │   │   └── engineering.go       # EngineeringEntityClient — CreateGitIssue (wired when ENGINEERING_ENTITY_BASE_URL is set)
-│   ├── githubissue/
-│   │   ├── options.go          # RepoOption + ParseRepoOptions (GITHUB_ISSUE_REPO_OPTIONS)
-│   │   └── registry.go         # Active/SetActive — the resolved catalogue GET /metadata's githubIssueRepoOptions field serves
 │   ├── scim/
 │   │   └── client.go           # OAuth2 HTTP client for the SCIM operations service
 │   ├── updates/
@@ -404,10 +393,7 @@ backend/
 - `POST /cases/{id}/call-requests/search` — Search call requests for a case (ServiceNow only)
 - `PATCH /cases/{id}/call-requests/{callRequestId}` — Update a call request (ServiceNow only)
 - `POST /cases/{id}/github-issues` — Create a GitHub issue from a case. By default forwarded to the entity service (`reason` selects the target repo — `default`/`migration`/`rd_ticket`; ServiceNow only); with `ENGINEERING_ENTITY_BASE_URL` set it is filed through the engineering entity service instead (see above)
-
-### Metadata
-
-- `GET /metadata` — The portal's single config-driven metadata bag, fetched once by the webapp rather than per-field endpoints. Currently one field: `githubIssueRepoOptions` — the "Open Git issue" dialog's repository dropdown options (`value`, `displayLabel`, `owner`, `repo`, `githubLabel`), from `GITHUB_ISSUE_REPO_OPTIONS` (see [Configuration](#open-git-issue-dialog-repository-catalogue) above). Independent of the `reason`-based repo selection on `POST /cases/{id}/github-issues` above — this backs a different, user-facing repo picker. More fields will be added here over time
+- `GET /products/github-repo?name=` — The GitHub repository mapped to a product, proxied to the entity service's `product_repo_mapping` lookup. The "Open Git issue" dialog shows it; 404 when no repository is mapped
 
 ### Users
 
@@ -415,7 +401,7 @@ backend/
 - `PATCH /users/me` — Update current user profile (`phoneNumber` via SCIM, `timeZone` via entity service)
 - `POST /users/search` — Search users; optional `filters` (`searchQuery`, `roles`, `userNames`, `emails`, `active`) and `sortBy` (`field`, `order`); response shape depends on data source (`User` for postgres, `SNUser` for ServiceNow)
 - `GET /users/{id}` — Get one user's full profile (both data sources); adds `teams` (derived from `groups`) and, for external contacts only, `externalAccount` (`exists`/`locked`, from SCIM's "external" org search). For an internal (WSO2 staff) target, `roles` is replaced with the same portal-role vocabulary `GET /users/me` reports (`viewer`/`escalator`/.../`admin`), sourced from that user's own SCIM role assignment (filtered to this portal's `app-csm-*` roles) rather than entity-service's own role data — entity-service's `roles` is left as-is for an external contact, a genuinely different vocabulary. All three enrichments (teams, externalAccount, roles) are best-effort — absent/unchanged rather than failing the request if their lookup fails
-- `POST /users` — Create a new user (`firstName`, `lastName`, `email` required to have at least one of firstName/lastName; optional `roles`, validated against the configured role allow-list). **Admin-only** (`admin` permission — see "Access control" above); Postgres data source only
+- `POST /users` — Create a new user (`firstName`, `lastName`, `email` required to have at least one of firstName/lastName; optional `roles`, validated against the configured role allow-list). **Admin-only** (`admin` permission — see "Access control" above); Postgres data source only. `roles` is also how a caller sets the new user's type (entity-service derives `userType` from role membership) — the Add User form sends exactly one of `internal`/`external`. Granting `internal`/`admin` for a non-`@wso2.com` email is rejected with 400
 
 ### Accounts
 

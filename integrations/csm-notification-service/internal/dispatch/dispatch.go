@@ -99,6 +99,8 @@ type onboardingStepRecorder interface {
 	// invitation has already gone out, for this membership version" check
 	// (see Dispatcher.invitationAlreadySent).
 	SucceededEmailStep(ctx context.Context, membershipSfID string) (*entity.RecordedOnboardingStep, error)
+	// SucceededStep is the same lookup for any step (the Welcome guard).
+	SucceededStep(ctx context.Context, membershipSfID string, step entity.OnboardingStep) (*entity.RecordedOnboardingStep, error)
 }
 
 // OnboardingConfig is everything handleProjectContactInvited needs beyond
@@ -130,6 +132,8 @@ type OnboardingConfig struct {
 	// EmailFrom is the invitation's sender (ONBOARD_EMAIL_FROM); "" means
 	// Email's own FromAddress.
 	EmailFrom string
+	// ReplyTo (EMAIL_REPLY_TO) goes on onboarding emails only.
+	ReplyTo []string
 }
 
 // Dispatcher turns a published events.Envelope into an actual notification
@@ -414,6 +418,8 @@ func (d *Dispatcher) Handle(ctx context.Context, record eventbus.Record) error {
 		return d.handleCRPlanDateNotice(ctx, record, env.Payload)
 	case events.TypeProjectContactInvited:
 		return d.handleProjectContactInvited(ctx, record, env.Payload)
+	case events.TypeProjectContactRegistered:
+		return d.handleProjectContactRegistered(ctx, record, env.Payload)
 	case events.TypeSLATierReached:
 		// Published by internal/slaengine's own Engine.Tick (a poller, not
 		// a consumer of this topic) — nothing here reacts to it yet; it
@@ -1655,20 +1661,17 @@ func (d *Dispatcher) handleProjectContactInvited(ctx context.Context, record eve
 			// have opened the first email that they already have an
 			// account -- and the "new" one would welcome them a second
 			// time. The reminder claims neither.
-			subject = fmt.Sprintf("[WSO2 Support] Reminder: your invitation to %s", data.ProjectName)
+			subject = "Reminder: " + invitationSubject(data.ProjectName)
 			body = notifications.RenderProjectContactInvitedReminderEmail(data)
 		case d.onboarding.IdentityEnabled && existed:
-			subject = fmt.Sprintf("[WSO2 Support] %s has been added to your account", data.ProjectName)
+			subject = invitationSubject(data.ProjectName)
 			body = notifications.RenderProjectContactInvitedExistingEmail(data)
 		default:
 			data.AccountCreated = d.onboarding.IdentityEnabled
-			subject = fmt.Sprintf("[WSO2 Support] You have been given access to %s", data.ProjectName)
-			if data.AccountCreated {
-				subject = fmt.Sprintf("[WSO2 Support] Welcome: you now have access to %s", data.ProjectName)
-			}
+			subject = invitationSubject(data.ProjectName)
 			body = notifications.RenderProjectContactInvitedNewEmail(data)
 		}
-		if err := d.onboarding.Email.SendEmailFrom(ctx, d.onboarding.EmailFrom, to, nil, nil, nil, subject, body, nil); err != nil {
+		if err := d.onboarding.Email.SendEmailFrom(ctx, d.onboarding.EmailFrom, to, nil, nil, d.onboarding.ReplyTo, subject, body, nil); err != nil {
 			err = fmt.Errorf("dispatch: send invitation for membership %s: %w", p.MembershipSfID, err)
 			d.recordOnboardingStep(ctx, p, entity.OnboardingStepEmail, entity.OnboardingStepFailed, err)
 			return err
@@ -1677,6 +1680,103 @@ func (d *Dispatcher) handleProjectContactInvited(ctx context.Context, record eve
 		slog.InfoContext(ctx, "dispatch: invitation email sent", append(logAttrs, "existingAccount", d.onboarding.IdentityEnabled && existed, "resend", p.IsResend)...)
 	}
 
+	return nil
+}
+
+// invitationSubject is the subject of the new and existing-account invitations.
+func invitationSubject(projectName string) string {
+	return "Invitation To Use WSO2 Support for " + projectName
+}
+
+// handleProjectContactRegistered sends the Welcome email after a contact's
+// first sign-in. Same flags as the invitation; WELCOME_EMAIL guards duplicates.
+func (d *Dispatcher) handleProjectContactRegistered(ctx context.Context, record eventbus.Record, raw json.RawMessage) error {
+	var p events.ProjectContactRegisteredPayload
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return fmt.Errorf("dispatch: decode project_contact.registered payload: %w", err)
+	}
+	logAttrs := []any{"membershipSfId", p.MembershipSfID, "contactSfId", p.ContactSfID, "projectKey", p.ProjectKey}
+	recordStep := func(status entity.OnboardingStepStatus, lastErr error) {
+		d.writeOnboardingStep(ctx, entity.OnboardingStepRequest{
+			MembershipSfID:  p.MembershipSfID,
+			Step:            entity.OnboardingStepWelcomeEmail,
+			Status:          status,
+			EventType:       string(events.TypeProjectContactRegistered),
+			EventModifiedOn: parseEventModifiedOn(p.EventModifiedOn),
+			Email:           p.Email,
+			ContactSfID:     p.ContactSfID,
+		}, lastErr)
+	}
+	skip := func(msg string) error {
+		// A SKIPPED write may replace SUCCEEDED for the same version, so a replay must not overwrite a sent Welcome.
+		if d.onboarding.Steps != nil {
+			sent, err := d.onboarding.Steps.SucceededStep(ctx, p.MembershipSfID, entity.OnboardingStepWelcomeEmail)
+			if err != nil {
+				return fmt.Errorf("dispatch: check welcome email already sent for membership %s: %w", p.MembershipSfID, err)
+			}
+			if sent != nil {
+				slog.InfoContext(ctx, "dispatch: welcome email already recorded as sent; not recording a skip", logAttrs...)
+				return nil
+			}
+		}
+		recordStep(entity.OnboardingStepSkipped, nil)
+		slog.InfoContext(ctx, msg, logAttrs...)
+		return nil
+	}
+	fail := func(err error) error {
+		recordStep(entity.OnboardingStepFailed, err)
+		return err
+	}
+
+	switch {
+	case p.IsIntegrationUser:
+		return skip("dispatch: project_contact.registered for an integration user; welcome email skipped")
+	case !d.onboarding.EmailEnabled:
+		return skip("dispatch: welcome email disabled (CSM_MIGRATION_ONBOARD_EMAIL_ENABLED != true); skipping")
+	case !d.emailSendingEnabled:
+		return skip("dispatch: email sending disabled (EMAIL_SENDING_ENABLED=false); not sending welcome email")
+	case d.emailDebugMode && len(d.emailDebugRecipients) == 0:
+		return skip("dispatch: EMAIL_DEBUG_MODE=true but EMAIL_DEBUG_RECIPIENTS is empty; not sending welcome email")
+	case d.onboarding.Email == nil:
+		return fail(fmt.Errorf("dispatch: welcome email enabled but no email client configured"))
+	case d.onboarding.Steps == nil:
+		return fail(fmt.Errorf("dispatch: welcome email enabled but no onboarding-step ledger configured; cannot check whether it was already sent"))
+	}
+	to := []string{p.Email}
+	if d.emailDebugMode {
+		slog.InfoContext(ctx, "dispatch: EMAIL_DEBUG_MODE=true; redirecting welcome email to configured debug recipients", append(logAttrs, "debugRecipientCount", len(d.emailDebugRecipients))...)
+		to = d.emailDebugRecipients
+	}
+
+	key := recordBaseKey(record) + "/welcome"
+	if !d.claim(key) {
+		return fmt.Errorf("dispatch: welcome email for membership %s is already in progress", p.MembershipSfID)
+	}
+	defer d.forget(key)
+
+	// One Welcome per membership: any SUCCEEDED row means it already went out.
+	sent, err := d.onboarding.Steps.SucceededStep(ctx, p.MembershipSfID, entity.OnboardingStepWelcomeEmail)
+	if err != nil {
+		return fmt.Errorf("dispatch: check welcome email already sent for membership %s: %w", p.MembershipSfID, err)
+	}
+	if sent != nil {
+		slog.InfoContext(ctx, "dispatch: welcome email already recorded as sent; not sending again", logAttrs...)
+		return nil
+	}
+
+	projectName := displayProjectName(p.ProjectName, p.ProjectKey)
+	body := notifications.RenderProjectContactRegisteredEmail(notifications.ProjectContactRegisteredEmailData{
+		DisplayName: inviteeDisplayName(p.GivenName, p.FamilyName, p.Email),
+		ProjectName: projectName,
+		ProjectKey:  p.ProjectKey,
+		PortalURL:   d.onboarding.PortalURL,
+	})
+	subject := "Welcome to WSO2 Support for " + projectName
+	if err := d.onboarding.Email.SendEmailFrom(ctx, d.onboarding.EmailFrom, to, nil, nil, d.onboarding.ReplyTo, subject, body, nil); err != nil {
+		return fail(fmt.Errorf("dispatch: send welcome email for membership %s: %w", p.MembershipSfID, err))
+	}
+	recordStep(entity.OnboardingStepSucceeded, nil)
+	slog.InfoContext(ctx, "dispatch: welcome email sent", logAttrs...)
 	return nil
 }
 
@@ -1764,19 +1864,23 @@ func parseLedgerTime(s string) (time.Time, bool) {
 // timestamp (entity-service could not parse the Salesforce date) does this
 // fall back to the processing time.
 func (d *Dispatcher) recordOnboardingStep(ctx context.Context, p events.ProjectContactInvitedPayload, step entity.OnboardingStep, status entity.OnboardingStepStatus, lastErr error) {
-	if d.onboarding.Steps == nil {
-		slog.WarnContext(ctx, "dispatch: no onboarding-step recorder configured; step outcome not recorded",
-			"membershipSfId", p.MembershipSfID, "step", step, "status", status)
-		return
-	}
-	req := entity.OnboardingStepRequest{
+	d.writeOnboardingStep(ctx, entity.OnboardingStepRequest{
 		MembershipSfID:  p.MembershipSfID,
 		Step:            step,
 		Status:          status,
 		EventType:       string(events.TypeProjectContactInvited),
-		EventModifiedOn: onboardingEventModifiedOn(p),
+		EventModifiedOn: parseEventModifiedOn(p.EventModifiedOn),
 		Email:           p.Email,
 		ContactSfID:     p.ContactSfID,
+	}, lastErr)
+}
+
+// writeOnboardingStep is recordOnboardingStep's event-agnostic core.
+func (d *Dispatcher) writeOnboardingStep(ctx context.Context, req entity.OnboardingStepRequest, lastErr error) {
+	if d.onboarding.Steps == nil {
+		slog.WarnContext(ctx, "dispatch: no onboarding-step recorder configured; step outcome not recorded",
+			"membershipSfId", req.MembershipSfID, "step", req.Step, "status", req.Status)
+		return
 	}
 	if lastErr != nil {
 		req.LastError = lastErr.Error()
@@ -1793,21 +1897,21 @@ func (d *Dispatcher) recordOnboardingStep(ctx context.Context, p events.ProjectC
 	defer cancel()
 	if err := d.onboarding.Steps.RecordOnboardingStep(recordCtx, req); err != nil {
 		slog.ErrorContext(ctx, "dispatch: failed to record onboarding step; continuing",
-			"membershipSfId", p.MembershipSfID, "step", step, "status", status, "err", err)
+			"membershipSfId", req.MembershipSfID, "step", req.Step, "status", req.Status, "err", err)
 		return
 	}
-	slog.InfoContext(ctx, "dispatch: onboarding step recorded", "membershipSfId", p.MembershipSfID, "step", step, "status", status)
+	slog.InfoContext(ctx, "dispatch: onboarding step recorded", "membershipSfId", req.MembershipSfID, "step", req.Step, "status", req.Status)
 }
 
 // recordOnboardingStepTimeout bounds one best-effort ledger write.
 const recordOnboardingStepTimeout = 5 * time.Second
 
-// onboardingEventModifiedOn returns the payload's Salesforce timestamp, or
+// parseEventModifiedOn returns the payload's Salesforce timestamp, or
 // the processing time when the payload has none (events.Validate has already
 // rejected a malformed one).
-func onboardingEventModifiedOn(p events.ProjectContactInvitedPayload) time.Time {
-	if p.EventModifiedOn != "" {
-		if ts, err := time.Parse(time.RFC3339Nano, p.EventModifiedOn); err == nil {
+func parseEventModifiedOn(eventModifiedOn string) time.Time {
+	if eventModifiedOn != "" {
+		if ts, err := time.Parse(time.RFC3339Nano, eventModifiedOn); err == nil {
 			return ts.UTC()
 		}
 	}

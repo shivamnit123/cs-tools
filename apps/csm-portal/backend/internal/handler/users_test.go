@@ -25,6 +25,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/directory"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/scim"
 )
@@ -568,6 +569,69 @@ func TestCreateUser(t *testing.T) {
 		if called {
 			t.Fatal("entity service must not be called for an invalid role")
 		}
+	})
+
+	t.Run("rejects an internal-resolving role for a non-wso2.com email, before reaching upstream", func(t *testing.T) {
+		teams, err := directory.ParseTeamRegistry(testTeamRegistry)
+		if err != nil {
+			t.Fatalf("ParseTeamRegistry: %v", err)
+		}
+		roles, err := directory.ParseRoles("internal,external,admin,agent")
+		if err != nil {
+			t.Fatalf("ParseRoles: %v", err)
+		}
+		dir, err := directory.New(teams, roles)
+		if err != nil {
+			t.Fatalf("directory.New: %v", err)
+		}
+		for _, role := range []string{"internal", "admin"} {
+			t.Run(role, func(t *testing.T) {
+				called := false
+				entityClient := &mockEntityUserClient{
+					createUserFn: func(context.Context, []byte) ([]byte, error) {
+						called = true
+						return []byte(`{}`), nil
+					},
+				}
+				h := NewUsersHandler(&mockSCIMClient{}, entityClient, dir, false)
+				r := withUser(httptest.NewRequest(http.MethodPost, "/users",
+					strings.NewReader(`{"firstName":"Jane","email":"jane@example.com","roles":["`+role+`"]}`)))
+				w := httptest.NewRecorder()
+				h.CreateUser(w, r)
+				assertStatus(t, w, http.StatusBadRequest)
+				if called {
+					t.Fatal("entity service must not be called when an internal-resolving role is requested for a non-wso2.com email")
+				}
+			})
+		}
+
+		t.Run("allows the same role for a wso2.com email", func(t *testing.T) {
+			entityClient := &mockEntityUserClient{
+				createUserFn: func(context.Context, []byte) ([]byte, error) {
+					return []byte(`{"id":"u-1"}`), nil
+				},
+			}
+			h := NewUsersHandler(&mockSCIMClient{}, entityClient, dir, false)
+			r := withUser(httptest.NewRequest(http.MethodPost, "/users",
+				strings.NewReader(`{"firstName":"Jane","email":"jane@wso2.com","roles":["internal"]}`)))
+			w := httptest.NewRecorder()
+			h.CreateUser(w, r)
+			assertStatus(t, w, http.StatusCreated)
+		})
+
+		t.Run("allows a non-wso2.com email for a non-internal role", func(t *testing.T) {
+			entityClient := &mockEntityUserClient{
+				createUserFn: func(context.Context, []byte) ([]byte, error) {
+					return []byte(`{"id":"u-1"}`), nil
+				},
+			}
+			h := NewUsersHandler(&mockSCIMClient{}, entityClient, dir, false)
+			r := withUser(httptest.NewRequest(http.MethodPost, "/users",
+				strings.NewReader(`{"firstName":"Jane","email":"jane@example.com","roles":["external"]}`)))
+			w := httptest.NewRecorder()
+			h.CreateUser(w, r)
+			assertStatus(t, w, http.StatusCreated)
+		})
 	})
 
 	t.Run("forwards the body unchanged and returns 201 with the upstream response", func(t *testing.T) {

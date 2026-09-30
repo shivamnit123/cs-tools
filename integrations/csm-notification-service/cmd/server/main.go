@@ -71,6 +71,7 @@ func main() {
 		ClientSecret: os.Getenv("OAUTH2_CLIENT_SECRET"),
 		Scopes:       splitComma(os.Getenv("EMAIL_SCOPES")),
 		FromAddress:  os.Getenv("EMAIL_FROM_ADDRESS"),
+		ReplyTo:      splitComma(emailReplyTo()),
 	})
 
 	// Google Chat is likewise optional per deployment; a missing or malformed
@@ -654,6 +655,7 @@ func loadOnboardingConfig(steps *entity.CustomerEntityClient, emailClient *notif
 		EmailEnabled:    emailEnabled,
 		PortalURL:       portalURL,
 		EmailFrom:       emailFrom,
+		ReplyTo:         emailClient.ReplyTo(),
 	}
 }
 
@@ -711,6 +713,15 @@ func envBool(key string, def bool) bool {
 	default:
 		return def
 	}
+}
+
+// emailReplyTo reads EMAIL_REPLY_TO: unset means support@wso2.com, set but
+// empty means no Reply-To.
+func emailReplyTo() string {
+	if v, ok := os.LookupEnv("EMAIL_REPLY_TO"); ok {
+		return v
+	}
+	return "support@wso2.com"
 }
 
 func envOrDefault(key, def string) string {

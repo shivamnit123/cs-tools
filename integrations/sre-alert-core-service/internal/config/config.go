@@ -149,7 +149,7 @@ func defaults() Config {
 			RetryBaseDelay:       Duration(200 * time.Millisecond),
 			HTTPTimeout:          Duration(10 * time.Second),
 			RetrySweepInterval:   Duration(30 * time.Second),
-			MaxCSMAttempts:       13,
+			MaxCSMAttempts:       20,
 			ServiceCacheTTL:      Duration(15 * time.Minute),
 			StateCheckInterval:   Duration(1 * time.Minute),
 			CSMRetryBaseDelay:    Duration(30 * time.Second),

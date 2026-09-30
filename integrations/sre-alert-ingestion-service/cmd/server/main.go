@@ -72,6 +72,14 @@ func main() {
 		logger.Error("failed to read environment", "error", err)
 		os.Exit(1)
 	}
+	authn, err := auth.New(cfg.Auth.Mode)
+	if err != nil {
+		logger.Error("failed to initialise auth hook", "error", err)
+		os.Exit(1)
+	}
+	if cfg.Auth.Mode == "none" {
+		logger.Warn("auth.mode is \"none\": vendor routes are unauthenticated")
+	}
 	registry, err := vendors.New()
 	if err != nil {
 		logger.Error("failed to load vendor config", "error", err)
@@ -92,12 +100,6 @@ func main() {
 	}
 	defer session.Close()
 
-	authn, err := auth.New(cfg.Auth.Mode, session)
-	if err != nil {
-		logger.Error("failed to initialise auth hook", "error", err)
-		os.Exit(1)
-	}
-
 	store := cassandra.NewStore(session, cfg.Store.QueryTimeout.Duration(), cfg.Store.ClaimTimeout.Duration())
 	if err := store.SeedSeq(context.Background()); err != nil {
 		logger.Error("failed to seed alert_seq", "error", err)
@@ -116,7 +118,7 @@ func main() {
 		SummaryInterval:  dbFailureInterval,
 		HTTPTimeout:      chatTimeout,
 	})
-	waker := corewake.New(base.With("component", "corewake"), envCfg.WakeURL, envCfg.WakeUsername, envCfg.WakeSecret, cfg.Wake.Timeout.Duration())
+	waker := corewake.New(base.With("component", "corewake"), envCfg.WakeURL, cfg.Wake.Timeout.Duration())
 
 	sns, err := newSNSConfirmer(base.With("component", "snsconfirm"))
 	if err != nil {

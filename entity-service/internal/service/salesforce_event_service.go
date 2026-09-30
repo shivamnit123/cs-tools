@@ -115,6 +115,9 @@ type AccountLookup interface {
 type SalesforceIngestSupport struct {
 	Accounts AccountLookup
 	States   repository.SalesforceIngestStateRepository
+	// Projects is the read side of EnsureProject, flag-independent like
+	// Accounts (salesforce_project_ingest.go).
+	Projects ProjectLookup
 }
 
 type salesforceEventService struct {
@@ -124,6 +127,18 @@ type salesforceEventService struct {
 	membership *MembershipIngest
 	// opportunity is set by WithOpportunityIngest (salesforce_opportunity_ingest.go).
 	opportunity *OpportunityIngest
+	// project is set by WithProjectIngest (salesforce_project_ingest.go).
+	project *ProjectIngest
+	// linkedOpportunity is set by WithLinkedOpportunityIngest
+	// (salesforce_linked_opportunity_ingest.go).
+	linkedOpportunity *LinkedOpportunityIngest
+	// partners is set by WithPartnerIngest (salesforce_partner_ingest.go).
+	partners *PartnerIngest
+	// invoices is set by WithInvoiceIngest (salesforce_invoice_ingest.go).
+	invoices *InvoiceIngest
+	// lineItems is set by WithOpportunityLineItemIngest
+	// (salesforce_opportunity_line_item_ingest.go).
+	lineItems *OpportunityLineItemIngest
 }
 
 // NewSalesforceEventService constructs a SalesforceEventService that ingests
@@ -216,6 +231,16 @@ func (s *salesforceEventService) HandleEvent(ctx context.Context, req domain.Sal
 		return s.handleContactEvent(ctx, req)
 	case strings.EqualFold(req.Entity, domain.SalesforceEntityOpportunity):
 		return s.handleOpportunityEvent(ctx, req)
+	case strings.EqualFold(req.Entity, domain.SalesforceEntityProject):
+		return s.handleProjectEvent(ctx, req)
+	case strings.EqualFold(req.Entity, domain.SalesforceEntityLinkedOpportunity),
+		strings.EqualFold(req.Entity, domain.SalesforceEntityLinkedOpportunityAlt):
+		return s.handleLinkedOpportunityEvent(ctx, req)
+	case strings.EqualFold(req.Entity, domain.SalesforceEntityInvoice),
+		strings.EqualFold(req.Entity, domain.SalesforceEntityInvoiceAlt):
+		return s.handleInvoiceEvent(ctx, req)
+	case strings.EqualFold(req.Entity, domain.SalesforceEntityOpportunityLineItem):
+		return s.handleOpportunityLineItemEvent(ctx, req)
 	default:
 		// Other Salesforce objects are acknowledged and ignored: a 400 would
 		// make ASB retry the envelope forever.
@@ -232,7 +257,10 @@ func (s *salesforceEventService) HandleEvent(ctx context.Context, req domain.Sal
 
 	switch req.EventType {
 	case domain.SalesforceEventCreated, domain.SalesforceEventUpdated, domain.SalesforceEventRestored:
-		return s.upsertAccount(ctx, req.ReferenceID, req.EventType, true)
+		if err := s.upsertAccount(ctx, req.ReferenceID, req.EventType, true); err != nil {
+			return err
+		}
+		return s.refreshPartnersAfterAccountEvent(ctx, req.ReferenceID)
 	case domain.SalesforceEventDeleted:
 		return s.softDeleteAccount(ctx, req.ReferenceID)
 	default:
