@@ -256,6 +256,23 @@ func Validate(entityID string, t Type, raw json.RawMessage) error {
 		if !validRecipients(p.Recipients) {
 			return fmt.Errorf("events: invalid recipients for %s", t)
 		}
+	case TypeOutageNotificationDue, TypeOutageCommunicationDue:
+		var p OutageNoticePayload
+		if err := decodeStrict(raw, &p); err != nil {
+			return err
+		}
+		if p.OutageID == "" || p.Number == "" || p.Subject == "" || p.Body == "" {
+			return fmt.Errorf("events: missing required field for %s", t)
+		}
+		if p.OutageID != entityID {
+			return fmt.Errorf("events: payload outageId %q does not match entityId %q", p.OutageID, entityID)
+		}
+		if !validOutageKind[t][p.Kind] {
+			return fmt.Errorf("events: %s has unknown kind %q", t, p.Kind)
+		}
+		if !validRecipients(p.Recipients) {
+			return fmt.Errorf("events: invalid recipients for %s", t)
+		}
 	case TypeCRApprovalRequested:
 		var p CRApprovalRequestedPayload
 		if err := decodeStrict(raw, &p); err != nil {
@@ -339,4 +356,12 @@ func decodeStrict(raw json.RawMessage, v any) error {
 		return fmt.Errorf("events: unexpected trailing data after payload")
 	}
 	return nil
+}
+
+// validOutageKind is which kinds each outage email can carry: the internal
+// notification has an Update arm between declaration and resolution, the
+// outage communication does not.
+var validOutageKind = map[Type]map[string]bool{
+	TypeOutageNotificationDue:  {"DECLARED": true, "UPDATE": true, "RESOLVED": true},
+	TypeOutageCommunicationDue: {"DECLARED": true, "RESOLVED": true},
 }

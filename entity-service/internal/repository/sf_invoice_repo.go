@@ -28,7 +28,7 @@ import (
 // sf_invoice (migration 0081), recording the salesforce_ingest_state row in
 // the same transaction.
 type SalesforceInvoiceRepository interface {
-	// UpsertFromSalesforce writes one invoice by sf_id and records state. It
+	// UpsertFromSalesforce writes one invoice row by sf_id and records state. It
 	// reports whether a new row was inserted.
 	UpsertFromSalesforce(ctx context.Context, row domain.SalesforceInvoiceUpsert, state domain.UpsertSalesforceIngestStateRequest) (bool, error)
 	// DeleteBySfID hard-deletes every sf_invoice row carrying sfID and
@@ -50,8 +50,8 @@ func NewSalesforceInvoiceRepository(db *pgxpool.Pool) SalesforceInvoiceRepositor
 // insert.
 func sfInvoiceLockKey(sfID string) string { return "sf-invoice:" + sfID }
 
-// updateSfInvoiceQuery: sf_invoice has no column without a Salesforce
-// source, so every data column is listed.
+// updateSfInvoiceQuery writes every data column of one copy: the one already under the
+// opportunity ($5), then the oldest. Nothing references sf_invoice rows.
 const updateSfInvoiceQuery = `
 	UPDATE sf_invoice SET
 		name = $2,
@@ -68,7 +68,10 @@ const updateSfInvoiceQuery = `
 		updated_on = now(),
 		updated_by = $1,
 		sync_time_stamp = now()
-	WHERE sf_id = $13`
+	FROM (SELECT i.id, count(*) OVER () AS n FROM sf_invoice i WHERE i.sf_id = $13
+		ORDER BY (i.opportunity_id IS NOT DISTINCT FROM $5::uuid) DESC, i.created_on, i.id LIMIT 1) t
+	WHERE sf_invoice.id = t.id
+	RETURNING sf_invoice.id::text, t.n`
 
 const insertSfInvoiceQuery = `
 	INSERT INTO sf_invoice (
@@ -102,7 +105,7 @@ func (r *sfInvoiceRepo) UpsertFromSalesforce(ctx context.Context, row domain.Sal
 }
 
 // writeSfInvoice is UpsertFromSalesforce's body: lock on the sf_id, update
-// every row carrying it, else insert one, then record the ledger.
+// one row carrying it, else insert one, then record the ledger.
 func writeSfInvoice(ctx context.Context, q querier, row domain.SalesforceInvoiceUpsert, state domain.UpsertSalesforceIngestStateRequest) (bool, error) {
 	if _, err := q.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0::bigint))`, sfInvoiceLockKey(row.SfID)); err != nil {
 		return false, fmt.Errorf("upsert invoice from salesforce: lock: %w", err)
@@ -114,12 +117,12 @@ func writeSfInvoice(ctx context.Context, q querier, row domain.SalesforceInvoice
 		row.InvoicedPaidDate, row.ServiceStartDate, row.ServiceEndDate,
 		row.SfID,
 	}
-	tag, err := q.Exec(ctx, updateSfInvoiceQuery, args...)
+	_, n, err := updateOneBySfID(ctx, q, updateSfInvoiceQuery, "sf_invoice", row.SfID, args...)
 	if err != nil {
 		return false, fmt.Errorf("upsert invoice from salesforce: update by sf_id: %w", err)
 	}
 	created := false
-	if tag.RowsAffected() == 0 {
+	if n == 0 {
 		if _, err := q.Exec(ctx, insertSfInvoiceQuery, args...); err != nil {
 			return false, fmt.Errorf("upsert invoice from salesforce: insert: %w", err)
 		}

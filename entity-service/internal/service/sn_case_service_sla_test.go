@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 )
@@ -36,6 +37,7 @@ type fakeSLAEngineService struct {
 	reviseCalls             []fakeSLARegisterCall
 	completeCalls           []string // caseID (response clock)
 	completeWorkaroundCalls []string // caseID (workaround clock)
+	completeFixEtaCalls     []string // caseID (workaround+resolution clocks, fix ETA shared)
 	stateCalls              []fakeSLAStateCall
 }
 
@@ -64,6 +66,10 @@ func (f *fakeSLAEngineService) CompleteResponseClock(_ context.Context, caseID s
 
 func (f *fakeSLAEngineService) CompleteWorkaroundClock(_ context.Context, caseID string) {
 	f.completeWorkaroundCalls = append(f.completeWorkaroundCalls, caseID)
+}
+
+func (f *fakeSLAEngineService) CompleteFixEtaSharedClocks(_ context.Context, caseID string) {
+	f.completeFixEtaCalls = append(f.completeFixEtaCalls, caseID)
 }
 
 func (f *fakeSLAEngineService) ApplyCaseStateEffects(_ context.Context, caseID string, state domain.CaseState) {
@@ -308,6 +314,104 @@ func TestSNCaseService_UpdateCase_AppliesSLAStateEffects(t *testing.T) {
 	}
 	if call.state != domain.CaseStateWorkInProgress {
 		t.Errorf("state = %q, want %q", call.state, domain.CaseStateWorkInProgress)
+	}
+}
+
+// TestSNCaseService_UpdateCase_SharingFixEtaCompletesWorkaroundAndResolution
+// verifies UpdateCase's own wiring: once work_item.eta_shared_on is set in
+// Postgres (the "Share fix ETA with customer" action persists it there,
+// regardless of data source -- see domain.CaseView.EtaSharedOn's own doc
+// comment), the very next UpdateCase call on that case calls
+// SLAEngineService.CompleteFixEtaSharedClocks, not just the Chat/email-side
+// public comment ServiceNow itself handles.
+func TestSNCaseService_UpdateCase_SharingFixEtaCompletesWorkaroundAndResolution(t *testing.T) {
+	caseSysid := sysid32('a')
+	projectSysid := sysid32('b')
+	caseID := sysidToUUID(caseSysid)
+
+	getCaseBody := `{
+		"id": "` + caseSysid + `",
+		"internalId": "WSO2-023",
+		"number": "CS0023001",
+		"title": "Fix ETA share test",
+		"description": "d",
+		"createdOn": "2026-01-02 10:00:00",
+		"createdBy": "jane.doe@example.com",
+		"project": {"id": "` + projectSysid + `", "name": "Project Zeta"},
+		"deployment": {"id": "", "name": ""},
+		"deployedProduct": {"id": "", "name": "", "version": ""},
+		"state": {"id": 1, "label": "Open"}
+	}`
+	updateCaseBody := `{
+		"message": "Case updated successfully",
+		"case": {"id": "` + caseSysid + `", "updatedOn": "2026-01-02 12:00:00", "updatedBy": "jane.doe"}
+	}`
+
+	client := newTestUpdateCaseClient(t, getCaseBody, updateCaseBody)
+	slaEngine := &fakeSLAEngineService{}
+	etaSharedOn := time.Date(2026, 1, 2, 11, 0, 0, 0, time.UTC)
+	pgFallback := &stubMirrorCaseService{
+		getCaseEtaSharedOnFn: func(ctx context.Context, caseID string) (*time.Time, error) {
+			return &etaSharedOn, nil
+		},
+	}
+	svc := NewServiceNowCaseService(client, pgFallback, nil, nil, nil, "", slaEngine)
+
+	addPublicComment := true
+	mostLikely := "2026-02-01"
+	product := "WSO2 API Manager"
+	publicTicket := "CS0023001"
+	req := domain.UpdateCaseRequest{
+		ID: caseID, AddPublicComment: &addPublicComment,
+		MostLikelyFixEta: &mostLikely, Product: &product, PublicTicket: &publicTicket,
+	}
+	if _, err := svc.UpdateCase(contextWithUserIDToken("token"), req); err != nil {
+		t.Fatalf("UpdateCase() error = %v", err)
+	}
+
+	if len(slaEngine.completeFixEtaCalls) != 1 || slaEngine.completeFixEtaCalls[0] != caseID {
+		t.Errorf("completeFixEtaCalls = %v, want [%q]", slaEngine.completeFixEtaCalls, caseID)
+	}
+	// Sharing a fix ETA is not itself a "workaround provided" signal -- the
+	// two triggers are independent (see CompleteFixEtaSharedClocks' own doc
+	// comment), so this request must not also fire CompleteWorkaroundClock.
+	if len(slaEngine.completeWorkaroundCalls) != 0 {
+		t.Errorf("completeWorkaroundCalls = %v, want none", slaEngine.completeWorkaroundCalls)
+	}
+}
+
+// TestSNCaseService_UpdateCase_NoEtaSharedSkipsFixEtaClocks verifies the new
+// trigger is opt-in: when GetCaseEtaSharedOn returns nil (no fix ETA shared
+// yet, or no pgFallback configured at all), an ordinary UpdateCase call must
+// not complete the workaround/resolution clocks.
+func TestSNCaseService_UpdateCase_NoEtaSharedSkipsFixEtaClocks(t *testing.T) {
+	caseSysid := sysid32('a')
+	caseID := sysidToUUID(caseSysid)
+
+	getCaseBody := `{"id": "` + caseSysid + `", "state": {"id": 1, "label": "Open"}}`
+	updateCaseBody := `{
+		"message": "Case updated successfully",
+		"case": {"id": "` + caseSysid + `", "updatedOn": "2026-01-02 12:00:00", "updatedBy": "jane.doe"}
+	}`
+
+	client := newTestUpdateCaseClient(t, getCaseBody, updateCaseBody)
+	slaEngine := &fakeSLAEngineService{}
+	svc := NewServiceNowCaseService(client, nil, nil, nil, nil, "", slaEngine)
+
+	addPublicComment := true
+	mostLikely := "2026-02-01"
+	product := "WSO2 API Manager"
+	publicTicket := "CS0023001"
+	req := domain.UpdateCaseRequest{
+		ID: caseID, AddPublicComment: &addPublicComment,
+		MostLikelyFixEta: &mostLikely, Product: &product, PublicTicket: &publicTicket,
+	}
+	if _, err := svc.UpdateCase(contextWithUserIDToken("token"), req); err != nil {
+		t.Fatalf("UpdateCase() error = %v", err)
+	}
+
+	if len(slaEngine.completeFixEtaCalls) != 0 {
+		t.Errorf("completeFixEtaCalls = %v, want none", slaEngine.completeFixEtaCalls)
 	}
 }
 

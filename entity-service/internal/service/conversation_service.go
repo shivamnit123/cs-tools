@@ -27,11 +27,32 @@ import (
 
 type conversationService struct {
 	repo repository.ConversationRepository
+	// snWriteback/snMirror back UpdateConversation's best-effort, asynchronous
+	// ServiceNow mirror write under DATA_SOURCE=postgres-servicenow-dual-write
+	// -- both nil in every other mode. Set only via
+	// NewConversationServiceWithSNWriteback. CreateConversation has no
+	// mirror and never will on this data source: it is deliberately
+	// unsupported (work_item.number has no generator -- see
+	// CreateConversation's own doc comment), so every conversation row's id
+	// already IS a real ServiceNow-sourced, sysidToUUID-derived UUID synced
+	// in from elsewhere -- no id-mapping concern for UpdateConversation's
+	// mirror either.
+	snWriteback *SNWritebackDispatcher
+	snMirror    ConversationService
 }
 
 // NewConversationService constructs a ConversationService backed by Postgres.
 func NewConversationService(repo repository.ConversationRepository) ConversationService {
 	return &conversationService{repo: repo}
+}
+
+// NewConversationServiceWithSNWriteback is NewConversationService plus the
+// wiring DATA_SOURCE=postgres-servicenow-dual-write needs: UpdateConversation
+// dispatches a best-effort, asynchronous ServiceNow mirror write onto mirror
+// after the Postgres write commits -- see conversationService's own
+// snWriteback/snMirror doc comment.
+func NewConversationServiceWithSNWriteback(repo repository.ConversationRepository, dispatcher *SNWritebackDispatcher, mirror ConversationService) ConversationService {
+	return &conversationService{repo: repo, snWriteback: dispatcher, snMirror: mirror}
 }
 
 // SearchConversations implements ConversationService.
@@ -105,6 +126,19 @@ func (s *conversationService) UpdateConversation(ctx context.Context, id string,
 	updated, err := s.repo.UpdateConversation(ctx, id, req.State, callerEmail)
 	if err != nil {
 		return domain.UpdateConversationResponse{}, err
+	}
+
+	// Best-effort ServiceNow mirror write, DATA_SOURCE=postgres-servicenow-dual-write
+	// only (snWriteback/snMirror are both nil otherwise -- see
+	// conversationService's own doc comment). Postgres has already committed
+	// by this point.
+	if s.snWriteback != nil {
+		s.snWriteback.Dispatch(ctx, "conversation", id, "update", req,
+			func(writeCtx context.Context) error {
+				_, err := s.snMirror.UpdateConversation(writeCtx, id, req)
+				return err
+			},
+		)
 	}
 
 	return domain.UpdateConversationResponse{

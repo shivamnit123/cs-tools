@@ -22,30 +22,30 @@ import (
 	"net/http"
 )
 
-// splLookupsClient abstracts the ServiceNow lookup operations used by
-// SplLookupsHandler.
-type splLookupsClient interface {
+// lookupsClient abstracts the ServiceNow lookup operations used by
+// LookupsHandler.
+type lookupsClient interface {
 	GetProductList(ctx context.Context) ([]string, error)
 	GetABTTeamList(ctx context.Context) ([]string, error)
 }
 
-// SplLookupsHandler handles HTTP requests for SupportPortalLite's small
+// LookupsHandler handles HTTP requests for SupportPortalLite's small
 // standalone dropdown lookups, delegating to the ServiceNow service.
-type SplLookupsHandler struct {
-	servicenow  splLookupsClient
+type LookupsHandler struct {
+	servicenow  lookupsClient
 	accessGuard *AccessGuard
 }
 
-// NewSplLookupsHandler creates a SplLookupsHandler backed by the given
-// ServiceNow client. accessGuard enforces PermSPLAccess, SupportPortalLite's
+// NewLookupsHandler creates a LookupsHandler backed by the given
+// ServiceNow client. accessGuard enforces PermViewerAccess, SupportPortalLite's
 // blanket audience gate.
-func NewSplLookupsHandler(sn splLookupsClient, accessGuard *AccessGuard) *SplLookupsHandler {
-	return &SplLookupsHandler{servicenow: sn, accessGuard: accessGuard}
+func NewLookupsHandler(sn lookupsClient, accessGuard *AccessGuard) *LookupsHandler {
+	return &LookupsHandler{servicenow: sn, accessGuard: accessGuard}
 }
 
 // GetProducts handles GET /products.
-func (h *SplLookupsHandler) GetProducts(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+func (h *LookupsHandler) GetProducts(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
@@ -61,8 +61,8 @@ func (h *SplLookupsHandler) GetProducts(w http.ResponseWriter, r *http.Request) 
 }
 
 // GetABTTeams handles GET /abt-teams.
-func (h *SplLookupsHandler) GetABTTeams(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+func (h *LookupsHandler) GetABTTeams(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}

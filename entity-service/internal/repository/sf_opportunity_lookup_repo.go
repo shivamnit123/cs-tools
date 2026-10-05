@@ -18,10 +18,7 @@ package repository
 
 import (
 	"context"
-	"errors"
-	"fmt"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -29,9 +26,8 @@ import (
 // Opportunity Id, for the child ingests (invoices, line items) that need
 // their parent's row id before writing.
 type SalesforceOpportunityLookup interface {
-	// LookupOpportunityIDBySfID returns the sf_opportunity.id carrying sfID,
-	// or nil (no error) when there is none. With duplicates the oldest row
-	// wins, the one the Opportunity ingest writes line items under.
+	// LookupOpportunityIDBySfID returns the sf_opportunity.id the ingest writes for sfID
+	// (resolveOpportunityBySfIDQuery), or nil when there is none.
 	LookupOpportunityIDBySfID(ctx context.Context, sfID string) (*string, error)
 }
 
@@ -45,13 +41,5 @@ func NewSalesforceOpportunityLookup(db *pgxpool.Pool) SalesforceOpportunityLooku
 }
 
 func (r *sfOpportunityLookupRepo) LookupOpportunityIDBySfID(ctx context.Context, sfID string) (*string, error) {
-	var id string
-	err := r.db.QueryRow(ctx, selectSfOpportunityIDQuery, sfID).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("lookup opportunity by sf_id: %w", err)
-	}
-	return &id, nil
+	return resolveIDBySfID(ctx, r.db, resolveOpportunityBySfIDQuery, "sf_opportunity", sfID)
 }

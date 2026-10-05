@@ -221,6 +221,12 @@ func (r *Resolver) ChangeRequestLink(audience, changeRequestID, projectID string
 	return fmt.Sprintf("%s/operations/change-requests/%s", r.csmBase, url.PathEscape(changeRequestID))
 }
 
+// OutageLink is an outage's page in the CSM portal, the route the portal's own
+// outage list navigates to.
+func (r *Resolver) OutageLink(outageID string) string {
+	return fmt.Sprintf("%s/operations/outages/%s", r.csmBase, url.PathEscape(outageID))
+}
+
 // emailDomain returns the part of email after its last "@", lowercased —
 // "" for an address with no "@" at all, which wso2EmailDomain will simply
 // never match (see linkFor).

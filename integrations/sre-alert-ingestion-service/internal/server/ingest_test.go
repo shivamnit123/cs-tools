@@ -126,6 +126,21 @@ func TestIngest_PrometheusBatchSubmittedTogether(t *testing.T) {
 	}
 }
 
+func TestIngest_ServiceNowForwardStoresCanonicalAlerts(t *testing.T) {
+	sub := &fakeSubmitter{}
+	body := `[{"source":"AWS","severity":"Critical","unique_identifier":"a1"},{"source":"Azure","severity":"OK","unique_identifier":"z1"}]`
+	rec := do(t, newIngestServer(t, sub, nil), "POST", VendorRoutePrefix+"servicenow", body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
+	}
+	if m := decode(t, rec); m["count"] != float64(2) {
+		t.Errorf("body = %v", m)
+	}
+	if sub.vendor != "servicenow" || len(sub.calls) != 1 || sub.calls[0][0].Source != "AWS" || sub.calls[0][1].UniqueIdentifier != "z1" {
+		t.Errorf("submitted %+v for %s", sub.calls, sub.vendor)
+	}
+}
+
 func TestIngest_PrometheusBatch503WhenAnyFails(t *testing.T) {
 	sub := &fakeSubmitter{err: errors.New("alert could not be stored")}
 	rec := do(t, newIngestServer(t, sub, nil), "POST", VendorRoutePrefix+"prometheus", prometheusBatch)

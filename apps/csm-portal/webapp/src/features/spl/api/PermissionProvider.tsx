@@ -39,11 +39,11 @@ export function PermissionProvider({ children }: { children: ReactNode }) {
     const held = new Set(roles ?? []);
     const full = held.has(PORTAL_ROLE.csEngineer) || held.has(PORTAL_ROLE.admin);
     return {
-      // No backend permission grants this — the /spl/cases/:id/work-notes
-      // route it once gated was removed from the Go backend before this
-      // migration, so this stays permanently false rather than being wired
-      // to a role that doesn't correspond to anything server-side.
-      canAddWorkNotes: false,
+      // Mirrors the backend's PermCreateWorkNote (internal/handler/access.go):
+      // full write (cs_engineer/admin) can always post a work note, and the
+      // narrower worknote_creator role can post one too, just nothing else --
+      // see CaseDetailPage.tsx's composer, the only caller of this flag.
+      canAddWorkNotes: full || held.has(PORTAL_ROLE.worknoteCreator),
       canAddEscalations: full || held.has(PORTAL_ROLE.escalator),
       canDownloadAttachments: full || held.has(PORTAL_ROLE.attachmentDownloader),
       canViewUsageMetrics: full || held.has(PORTAL_ROLE.usageMetricsViewer),

@@ -155,7 +155,7 @@ func TestUpsertContactTx_NewContact(t *testing.T) {
 		{match: `INSERT INTO "user"`, row: scriptedRow{vals: []any{"user-1", "jane@acme.com"}}},
 		{match: "FROM role WHERE name", rows: [][]any{{"r-ext", "external"}, {"r-cust", "customer"}}},
 		{match: "FROM user_role ur JOIN role", rows: nil},
-		{match: "FROM account_contact WHERE sf_id", row: noRows},
+		{match: "FROM account_contact ac WHERE ac.sf_id", row: noRows},
 		{match: "FROM account_contact WHERE account_id", row: noRows},
 		{match: "INSERT INTO account_contact", row: scriptedRow{vals: []any{"ac-1"}}},
 		{match: "SELECT EXISTS", row: scriptedRow{vals: []any{false}}},
@@ -197,13 +197,13 @@ func TestUpsertContactTx_NewContact(t *testing.T) {
 // "user" row back; the existing row is updated in place.
 func TestUpsertContactTx_RestoreReactivatesUser(t *testing.T) {
 	deleted := time.Date(2026, 9, 18, 6, 37, 7, 0, time.UTC)
-	ledger := scriptedRow{vals: []any{"contact", "003000000000001AAA", deleted, "DELETED", "SUCCEEDED", nil, 2, deleted, deleted}}
+	ledger := scriptedRow{vals: []any{"contact", "003000000000001AAA", deleted, "DELETED", "SUCCEEDED", nil, 2, deleted, deleted, 0}}
 	q := &scriptedQuerier{t: t, script: []scriptStep{
 		{match: "FROM salesforce_ingest_state", row: ledger},
-		{match: `FROM "user" WHERE sf_id`, row: scriptedRow{vals: []any{"user-1", "jane@acme.com"}}},
+		{match: `FROM "user" WHERE sf_id`, row: scriptedRow{vals: []any{"user-1", "jane@acme.com", int64(1)}}},
 		{match: "FROM role WHERE name", rows: [][]any{{"r-ext", "external"}, {"r-cust", "customer"}}},
 		{match: "FROM user_role ur JOIN role", rows: [][]any{{"external"}, {"customer"}}},
-		{match: "FROM account_contact WHERE sf_id", row: scriptedRow{vals: []any{"ac-1"}}},
+		{match: "FROM account_contact ac WHERE ac.sf_id", row: scriptedRow{vals: []any{"ac-1", int64(1)}}},
 		{match: "SELECT EXISTS", row: scriptedRow{vals: []any{true}}},
 	}}
 	res, err := upsertContactTx(context.Background(), q, sampleContactUpsert())
@@ -229,7 +229,7 @@ func TestUpsertContactTx_RestoreReactivatesUser(t *testing.T) {
 // on update when not.
 func TestUpsertAccountContact_PrimaryFlag(t *testing.T) {
 	q := &scriptedQuerier{t: t, script: []scriptStep{
-		{match: "FROM account_contact WHERE sf_id", row: noRows},
+		{match: "FROM account_contact ac WHERE ac.sf_id", row: noRows},
 		{match: "FROM account_contact WHERE account_id", row: noRows},
 		{match: "INSERT INTO account_contact", row: scriptedRow{vals: []any{"ac-1"}}},
 	}}
@@ -241,7 +241,7 @@ func TestUpsertAccountContact_PrimaryFlag(t *testing.T) {
 	}
 
 	q = &scriptedQuerier{t: t, script: []scriptStep{
-		{match: "FROM account_contact WHERE sf_id", row: scriptedRow{vals: []any{"ac-1"}}},
+		{match: "FROM account_contact ac WHERE ac.sf_id", row: scriptedRow{vals: []any{"ac-1", int64(1)}}},
 	}}
 	if _, _, err := upsertAccountContact(context.Background(), q, "003A", "acct-1", "jane@acme.com", nil, "actor"); err != nil {
 		t.Fatal(err)

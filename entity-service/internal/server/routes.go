@@ -61,7 +61,12 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	// reads go to ServiceNow itself with the forwarded x-user-id-token, so
 	// scoping there is ServiceNow's own (snProjectService/snCaseService hold a
 	// pgFallback but do not route GetProjectByID/GetCaseByID through it).
-	accessSvc := service.NewAccessService(repository.NewAccessRepository(db), cfg.AuthInternalClientIDs)
+	accessSvc := service.NewAccessService(repository.NewAccessRepository(db), service.AccessClientConfig{
+		M2MClientIDs:                  cfg.M2MClientIDs,
+		CSMPortalBackendClientID:      cfg.CSMPortalBackendClientID,
+		CSMPortalUserDomain:           cfg.CSMPortalUserDomain,
+		CustomerPortalBackendClientID: cfg.CustomerPortalBackendClientID,
+	})
 
 	var savedFilterViewHandler *handler.SavedFilterViewHandler
 	if db != nil {
@@ -131,7 +136,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	// sla_clocks table entirely; see domain.SLAStatus's own doc comment.
 	var slaStatusHandler *handler.SLAStatusHandler
 	if db != nil {
-		slaStatusRepo := repository.NewSLAStatusRepository(db)
+		slaStatusRepo := repository.NewSLAStatusRepository(repository.NewScoped(db))
 		slaStatusHandler = handler.NewSLAStatusHandler(service.NewSLAStatusService(slaStatusRepo, accessSvc))
 	}
 
@@ -144,7 +149,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	// webhook endpoint is not registered merely because a database exists --
 	// it authenticates by HMAC rather than by bearer token, and an endpoint
 	// that mutates change requests should appear only when asked for.
-	var githubWebhookHandler *handler.GithubWebhookHandler
+	var githubDeliveryHandler *handler.GithubDeliveryHandler
 	var githubServiceRequestHandler *handler.GithubServiceRequestHandler
 
 	// Assigned inside the GitHub-integration block below and read further down,
@@ -174,7 +179,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 			}
 			// The outbound worker is started by cmd/api, which owns process
 			// lifetime; routes.go only builds what the HTTP surface needs.
-			githubSyncRepo = repository.NewGithubSyncRepository(db)
+			githubSyncRepo = repository.NewGithubSyncRepository(repository.NewScoped(db))
 			githubClient = github.NewClient(github.Config{
 				BaseURL: cfg.GithubBaseURL,
 				Token:   cfg.GithubToken,
@@ -182,13 +187,13 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 			githubLabelSet = githubLabels
 			githubSyncSvc := service.NewGithubSyncServiceWriting(
 				githubSyncRepo,
-				repository.NewGithubMutationRepository(db),
+				repository.NewGithubMutationRepository(repository.NewScoped(db)),
 				githubClient,
 				cfg.GithubIntegrationLogin,
 				githubLabels,
 			)
-			githubWebhookHandler = handler.NewGithubWebhookHandler(githubSyncSvc, cfg.GithubWebhookSecret)
-			githubServiceRequestHandler = handler.NewGithubServiceRequestHandler(githubSyncSvc, cfg.AuthInternalClientIDs)
+			githubDeliveryHandler = handler.NewGithubDeliveryHandler(githubSyncSvc, cfg.M2MClientIDs)
+			githubServiceRequestHandler = handler.NewGithubServiceRequestHandler(githubSyncSvc, cfg.M2MClientIDs)
 		}
 	}
 
@@ -214,7 +219,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	// configured.
 	var scheduleHandler *handler.ScheduleHandler
 
-	accountRepo := repository.NewAccountRepository(db)
+	accountRepo := repository.NewAccountRepository(repository.NewScoped(db))
 	accountHandler := handler.NewAccountHandler(service.NewAccountService(accountRepo))
 
 	// teamHandler has no ServiceNow-backed counterpart to switch on — see
@@ -263,7 +268,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		// repository serves EnsureAccount's read even while the Account
 		// branch (the write side) is off, and the salesforce_ingest_state
 		// ledger is where every non-membership family records its version.
-		projectIngestRepo := repository.NewSalesforceProjectRepository(db)
+		projectIngestRepo := repository.NewSalesforceProjectRepository(repository.NewScoped(db))
 		ingestSupport := service.SalesforceIngestSupport{
 			Accounts: accountRepo,
 			States:   repository.NewSalesforceIngestStateRepository(db),
@@ -338,7 +343,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 			stepRepo := repository.NewOnboardingStepRepository(db)
 			membershipIngestSvc = service.NewSalesforceEventServiceWithMembershipIngest(
 				accountIngestRepo, salesEntityClient, ingestSupport, service.MembershipIngest{
-					Memberships: repository.NewProjectMembershipRepository(db),
+					Memberships: repository.NewProjectMembershipRepository(repository.NewScoped(db)),
 					Steps:       stepRepo,
 					SalesEntity: salesEntityClient,
 					Contacts:    repository.NewSalesforceContactRepository(db),
@@ -430,14 +435,25 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	var projectMembershipHandler *handler.ProjectMembershipHandler
 	if db != nil && cfg.HasPortalMembershipWrites() && salesEntityClient != nil {
 		projectMembershipHandler = handler.NewProjectMembershipHandler(service.NewProjectMembershipWriteService(service.MembershipWriteDeps{
-			Memberships: repository.NewProjectMembershipRepository(db),
+			Memberships: repository.NewProjectMembershipRepository(repository.NewScoped(db)),
 			Steps:       repository.NewOnboardingStepRepository(db),
 			SalesEntity: salesEntityClient,
 			Publisher:   projectEventPublisher,
 			Failures:    eventPublishFailureSvc,
 			Access:      accessSvc,
 			Invitations: service.NewInvitationValidator(salesEntityClient, repository.NewAccountPartnerRepository(db)),
+			Admins:      repository.NewAccountAdminRepository(db),
 		}))
+	}
+
+	// Allocation-app events into customer engagements; off by default (route not registered).
+	var customerEngagementAllocationHandler *handler.CustomerEngagementAllocationHandler
+	if db != nil && cfg.HasCustomerEngagementIngest() {
+		customerEngagementAllocationHandler = handler.NewCustomerEngagementAllocationHandler(
+			service.NewCustomerEngagementAllocationService(
+				repository.NewCustomerEngagementAllocationRepository(repository.NewScoped(db)),
+				cfg.CustomerEngagementFirefightingTypeID),
+			cfg.M2MClientIDs)
 	}
 
 	// Also constructed for DataSourcePostgresServiceNowDualWrite: that mode's
@@ -464,23 +480,23 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	if cfg.DataSource == config.DataSourceServiceNow {
 		activeAccountContactSvc = service.NewServiceNowAccountContactService(serviceNowIntegrationServiceClient)
 	} else {
-		activeAccountContactSvc = service.NewAccountContactService(accountContactRepo)
+		activeAccountContactSvc = service.NewAccountContactService(accountContactRepo, accessSvc)
 	}
 	accountContactHandler := handler.NewAccountContactHandler(activeAccountContactSvc)
 
+	// Postgres modes read the Salesforce-ingested sf_* tables in the same shapes.
 	var opportunityHandler *handler.OpportunityHandler
-	if cfg.DataSource == config.DataSourceServiceNow {
-		opportunityHandler = handler.NewOpportunityHandler(service.NewServiceNowOpportunityService(serviceNowIntegrationServiceClient))
-	}
-
 	var invoiceHandler *handler.InvoiceHandler
-	if cfg.DataSource == config.DataSourceServiceNow {
-		invoiceHandler = handler.NewInvoiceHandler(service.NewServiceNowInvoiceService(serviceNowIntegrationServiceClient))
-	}
-
 	var projectOpportunityLinkHandler *handler.ProjectOpportunityLinkHandler
 	if cfg.DataSource == config.DataSourceServiceNow {
+		opportunityHandler = handler.NewOpportunityHandler(service.NewServiceNowOpportunityService(serviceNowIntegrationServiceClient))
+		invoiceHandler = handler.NewInvoiceHandler(service.NewServiceNowInvoiceService(serviceNowIntegrationServiceClient))
 		projectOpportunityLinkHandler = handler.NewProjectOpportunityLinkHandler(service.NewServiceNowProjectOpportunityLinkService(serviceNowIntegrationServiceClient))
+	} else {
+		sfReadRepo := repository.NewSalesforceReadRepository(db)
+		opportunityHandler = handler.NewOpportunityHandler(service.NewOpportunityService(sfReadRepo, accessSvc))
+		invoiceHandler = handler.NewInvoiceHandler(service.NewInvoiceService(sfReadRepo, accessSvc))
+		projectOpportunityLinkHandler = handler.NewProjectOpportunityLinkHandler(service.NewProjectOpportunityLinkService(sfReadRepo, accessSvc))
 	}
 
 	// snWritebackDispatcher is the single shared SNWritebackDispatcher for
@@ -497,7 +513,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		snWritebackDispatcher = service.NewSNWritebackDispatcher(repository.NewSNWritebackFailureRepository(db))
 	}
 
-	projectRepo := repository.NewProjectRepository(db)
+	projectRepo := repository.NewProjectRepository(repository.NewScoped(db))
 	pgProjectSvc := service.NewProjectService(projectRepo, accessSvc)
 	var activeProjectSvc service.ProjectService
 	if cfg.DataSource == config.DataSourceServiceNow {
@@ -512,15 +528,14 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	if cfg.DataSource == config.DataSourceServiceNow {
 		activeProjectContactSvc = service.NewServiceNowProjectContactService(serviceNowIntegrationServiceClient)
 	} else {
-		activeProjectContactSvc = service.NewProjectContactService(projectContactRepo)
+		activeProjectContactSvc = service.NewProjectContactService(projectContactRepo, accessSvc)
 	}
 	projectContactHandler := handler.NewProjectContactHandler(activeProjectContactSvc)
 
 	// activeProjectUpdateSvc backs PATCH /projects/{id} on every data source
 	// -- see pgProjectUpdateService's own doc comment for exactly which
 	// fields the Postgres data sources accept (a subset of the ServiceNow
-	// contract; unsupported fields are rejected with a ValidationError, not
-	// silently dropped). DATA_SOURCE=postgres-servicenow-dual-write also
+	// contract). DATA_SOURCE=postgres-servicenow-dual-write also
 	// mirrors a successful write to ServiceNow, asynchronously, via
 	// snWritebackDispatcher -- plain DATA_SOURCE=postgres never touches
 	// ServiceNow at all (snWritebackDispatcher is nil in that mode, so the
@@ -533,9 +548,9 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		activeProjectUpdateSvc = service.NewServiceNowProjectUpdateService(serviceNowIntegrationServiceClient)
 	case config.DataSourcePostgresServiceNowDualWrite:
 		snProjectMirrorSvc := service.NewServiceNowProjectUpdateService(serviceNowIntegrationServiceClient)
-		activeProjectUpdateSvc = service.NewProjectUpdateServiceWithSNWriteback(projectRepo, userRepo, snWritebackDispatcher, snProjectMirrorSvc)
+		activeProjectUpdateSvc = service.NewProjectUpdateServiceWithSNWriteback(projectRepo, userRepo, accessSvc, snWritebackDispatcher, snProjectMirrorSvc)
 	default:
-		activeProjectUpdateSvc = service.NewProjectUpdateService(projectRepo, userRepo)
+		activeProjectUpdateSvc = service.NewProjectUpdateService(projectRepo, userRepo, accessSvc)
 	}
 	projectUpdateHandler := handler.NewProjectUpdateHandler(activeProjectUpdateSvc)
 
@@ -569,9 +584,9 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		// scope into their WHERE clause, the project id here comes from the
 		// path and needs an explicit check.
 		projectCaseStatsSvc = service.NewProjectCaseStatsService(
-			repository.NewProjectCaseStatsRepository(db), referenceDataRepo, accessSvc)
+			repository.NewProjectCaseStatsRepository(repository.NewScoped(db)), referenceDataRepo, accessSvc)
 		projectStatsSvc = service.NewProjectStatsService(
-			repository.NewProjectStatsRepository(db), referenceDataRepo, accessSvc,
+			repository.NewProjectStatsRepository(repository.NewScoped(db)), referenceDataRepo, accessSvc,
 			projectMetadataSvc, projectCaseStatsSvc)
 	}
 	projectMetadataHandler := handler.NewProjectMetadataHandler(projectMetadataSvc)
@@ -597,7 +612,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		productVersionHandler = handler.NewProductVersionHandler(productVersionSvc)
 	}
 
-	deploymentRepo := repository.NewDeploymentRepository(db)
+	deploymentRepo := repository.NewDeploymentRepository(repository.NewScoped(db))
 	var activeDeploymentSvc service.DeploymentService
 	switch cfg.DataSource {
 	case config.DataSourceServiceNow:
@@ -640,7 +655,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		knowledgeBaseHandler = handler.NewKnowledgeBaseHandler(knowledgeBaseSvc)
 	}
 
-	deployedProductRepo := repository.NewDeployedProductRepository(db)
+	deployedProductRepo := repository.NewDeployedProductRepository(repository.NewScoped(db))
 	var activeDeployedProductSvc service.DeployedProductService
 	switch cfg.DataSource {
 	case config.DataSourceServiceNow:
@@ -681,10 +696,10 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	// regardless of DataSource.
 	var slaEngineSvc service.SLAEngineService
 	if db != nil {
-		slaEngineSvc = service.NewSLAEngineService(repository.NewSLAEngineRepository(db), activeProjectSvc)
+		slaEngineSvc = service.NewSLAEngineService(repository.NewSLAEngineRepository(repository.NewScoped(db)), activeProjectSvc)
 	}
 
-	caseRepo := repository.NewCaseRepository(db)
+	caseRepo := repository.NewCaseRepository(repository.NewScoped(db))
 	var activeCaseSvc service.CaseService
 	// caseAttachmentOverrideSvc, when non-nil, is the CaseService case
 	// attachment routes (registered further below) use INSTEAD of
@@ -756,28 +771,35 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		// registration with a foreign-key violation).
 		snCaseMirrorSvc := service.NewServiceNowCaseService(serviceNowIntegrationServiceClient, nil, nil, snUserService, cfg.CustomerRoles, cfg.CSEngineerRole, nil)
 		activeCaseSvc = service.NewCaseServiceWithSNWriteback(caseRepo, userRepo, eventPublisher, accessSvc, projectContactRepo, snWritebackDispatcher, snCaseMirrorSvc, slaEngineSvc, cfg.CSEngineerRole)
-		// Case ATTACHMENTS are ServiceNow-only in this mode, permanently —
-		// unlike case metadata (CREATE/UPDATE above), not a pilot scope
-		// decision but a hard requirement: the sftpgo-backed Postgres
-		// attachment implementation (case_attachment table,
-		// CaseRepository.CreateCaseAttachment et al. — real, working SQL,
-		// unlike the old CreateCase bug) is not production-ready for the
-		// Oct 4 go-live, so attachment routes must never reach it while this
-		// mode is active, regardless of how case metadata itself is wired.
-		// snCaseMirrorSvc (above) is reused as-is: every one of its
-		// attachment methods (CreateCaseAttachment/SearchCaseAttachments/
-		// GetCaseAttachmentContent/DeleteCaseAttachment/GetAttachmentByID/
-		// UpdateAttachment) already converts the platform case UUID to a
-		// ServiceNow sys_id via uuidToSysid internally, and that round-trips
-		// correctly because CreateCaseFromServiceNow (createCaseSNFirst)
-		// stores id = sysidToUUID(the real sys_id) for every case created in
-		// this mode — the same identity convention DataSource=servicenow
-		// itself relies on. ConfirmCaseAttachment correctly 503s here too,
-		// same as it already does in plain DataSource=servicenow — a
-		// pre-existing, expected gap (Postgres-only concept: ServiceNow's
-		// /attachments API has no pending/in-progress upload state to
-		// confirm), not something this override introduces.
-		caseAttachmentOverrideSvc = snCaseMirrorSvc
+		// Case ATTACHMENTS: file bytes still live ONLY in ServiceNow in this
+		// mode (SFTPGo, the CSM-native/Postgres storage backend, is never
+		// used here) — but metadata is now ALSO written into and read from
+		// Postgres, matching this codebase's "reads come from Postgres,
+		// writes go to both" policy for every other entity. This replaces
+		// the previous permanent "attachments are ServiceNow-only" override:
+		// that reasoning (the sftpgo-backed Postgres attachment
+		// implementation wasn't production-ready for the Oct 4 go-live) is
+		// now obsolete — case_attachment.storage_key is nullable (migration
+		// 0185) precisely so a ServiceNow-sourced row can have metadata-only
+		// Postgres rows alongside the existing SFTPGo-backed ones.
+		//
+		// service.NewCaseAttachmentDualWriteService wraps activeCaseSvc
+		// (itself a *caseService, reused for its Postgres-backed
+		// SearchCaseAttachments/GetAttachmentByID and its repo/resolveActor)
+		// and overrides CreateCaseAttachment (ServiceNow-first/synchronous,
+		// then a Postgres metadata insert via
+		// CaseRepository.CreateCaseAttachmentFromServiceNow),
+		// ConfirmCaseAttachment (still 503s — there is no pending/
+		// in-progress upload state in this mode, same as plain
+		// DataSource=servicenow), GetCaseAttachmentContent (bytes only exist
+		// in ServiceNow, forwarded to snCaseMirrorSvc), and
+		// DeleteCaseAttachment/UpdateAttachment (Postgres-first with a
+		// best-effort, asynchronous ServiceNow mirror via
+		// snWritebackDispatcher, the same shape as every other dual-write
+		// UPDATE/DELETE). SearchCaseAttachments/GetAttachmentByID are
+		// inherited unmodified — see that type's own doc comment
+		// (case_attachment_dual_write_service.go) for the full design.
+		caseAttachmentOverrideSvc = service.NewCaseAttachmentDualWriteService(activeCaseSvc, snCaseMirrorSvc, snWritebackDispatcher)
 	default:
 		activeCaseSvc = service.NewCaseService(caseRepo, userRepo, eventPublisher, accessSvc, projectContactRepo)
 	}
@@ -801,7 +823,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 
 	// customer_call (migration 0073) backs call requests on the Postgres
 	// data source, so these routes are registered for both data sources.
-	callRequestRepo := repository.NewCallRequestRepository(db)
+	callRequestRepo := repository.NewCallRequestRepository(repository.NewScoped(db))
 	var activeCallRequestSvc service.CallRequestService
 	switch cfg.DataSource {
 	case config.DataSourceServiceNow:
@@ -849,17 +871,24 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		EL4CROGroupID:            cfg.EscalationEL4CROGroupID,
 		EL5CEOGroupID:            cfg.EscalationEL5CEOGroupID,
 	}
-	escalationRepo := repository.NewEscalationRepository(db, escalationNotifyCfg)
+	escalationRepo := repository.NewEscalationRepository(repository.NewScoped(db), escalationNotifyCfg)
 	var activeEscalationSvc service.EscalationService
-	if cfg.DataSource == config.DataSourceServiceNow {
+	switch cfg.DataSource {
+	case config.DataSourceServiceNow:
 		activeEscalationSvc = service.NewServiceNowEscalationService(serviceNowIntegrationServiceClient)
-	} else {
+	case config.DataSourcePostgresServiceNowDualWrite:
+		// CreateEscalation mirrors to ServiceNow asynchronously, best-effort,
+		// via the shared snWritebackDispatcher -- see
+		// escalationService.CreateEscalation's own doc comment.
+		snEscalationMirrorSvc := service.NewServiceNowEscalationService(serviceNowIntegrationServiceClient)
+		activeEscalationSvc = service.NewEscalationServiceWithSNWriteback(escalationRepo, userRepo, caseRepo, accessSvc, snWritebackDispatcher, snEscalationMirrorSvc)
+	default:
 		activeEscalationSvc = service.NewEscalationService(escalationRepo, userRepo, caseRepo, accessSvc)
 	}
 	escalationHandler := handler.NewEscalationHandler(activeEscalationSvc)
 	caseEscalationHandler := handler.NewCaseEscalationHandler(service.NewCaseEscalationService(activeEscalationSvc, activeCaseSvc))
 
-	changeRequestRepo := repository.NewChangeRequestRepository(db)
+	changeRequestRepo := repository.NewChangeRequestRepository(repository.NewScoped(db))
 	var activeChangeRequestSvc service.ChangeRequestService
 	switch cfg.DataSource {
 	case config.DataSourceServiceNow:
@@ -881,7 +910,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	}
 	changeRequestHandler := handler.NewChangeRequestHandler(activeChangeRequestSvc)
 
-	timeCardRepo := repository.NewTimeCardRepository(db)
+	timeCardRepo := repository.NewTimeCardRepository(repository.NewScoped(db))
 	var activeTimeCardSvc service.TimeCardService
 	switch cfg.DataSource {
 	case config.DataSourceServiceNow:
@@ -901,12 +930,24 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	// sr_category/catalog_item/catalog_item_category/catalog_variable/
 	// sr_category_routing_rule (migrations 000067-000071) back the service
 	// request catalog on the Postgres data source, so these routes are
-	// registered for both data sources.
-	catalogRepo := repository.NewCatalogRepository(db)
+	// registered for both data sources. Under dual-write, SearchCatalogs
+	// still reads from ServiceNow -- see catalogService.snMirror's own doc
+	// comment for why (deployed_product/routing-rule data was never
+	// backfilled from ServiceNow, same gap as deployments/deployed-products/
+	// instances). GetCatalogItemVariables is the exception: catalog_variable's
+	// extra fields and its catalog_variable_choice table (migration 0125) are
+	// kept current by a separate sync service, so that one read goes to
+	// Postgres under dual-write too -- see catalogService.GetCatalogItemVariables'
+	// own doc comment.
+	catalogRepo := repository.NewCatalogRepository(repository.NewScoped(db))
 	var activeCatalogSvc service.CatalogService
-	if cfg.DataSource == config.DataSourceServiceNow {
+	switch cfg.DataSource {
+	case config.DataSourceServiceNow:
 		activeCatalogSvc = service.NewServiceNowCatalogService(serviceNowIntegrationServiceClient)
-	} else {
+	case config.DataSourcePostgresServiceNowDualWrite:
+		snCatalogMirrorSvc := service.NewServiceNowCatalogService(serviceNowIntegrationServiceClient)
+		activeCatalogSvc = service.NewCatalogServiceWithSNFallback(catalogRepo, snCatalogMirrorSvc)
+	default:
 		activeCatalogSvc = service.NewCatalogService(catalogRepo)
 	}
 	catalogHandler := handler.NewCatalogHandler(activeCatalogSvc)
@@ -924,7 +965,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	case config.DataSourceServiceNow:
 		activeFeedbackSvc = service.NewServiceNowFeedbackService(serviceNowIntegrationServiceClient)
 	case config.DataSourcePostgres, config.DataSourcePostgresServiceNowDualWrite:
-		activeFeedbackSvc = service.NewPostgresFeedbackService(repository.NewFeedbackRepository(db))
+		activeFeedbackSvc = service.NewPostgresFeedbackService(repository.NewFeedbackRepository(repository.NewScoped(db)))
 	default:
 		activeFeedbackSvc = service.NewUnavailableFeedbackService()
 	}
@@ -943,7 +984,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	// 000066) -- see incident_repo.go/problem_repo.go's own doc comments for
 	// what's implemented (reads) vs. still ServiceUnavailableError (writes
 	// needing work_item.number generation or undiscoverable business rules).
-	incidentRepo := repository.NewIncidentRepository(db)
+	incidentRepo := repository.NewIncidentRepository(repository.NewScoped(db))
 	var activeIncidentSvc service.IncidentService
 	switch cfg.DataSource {
 	case config.DataSourceServiceNow:
@@ -977,11 +1018,11 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		snIncidentMirrorSvc := service.NewServiceNowIncidentService(serviceNowIntegrationServiceClient, nil)
 		activeIncidentSvc = service.NewIncidentServiceWithSNMirror(incidentRepo, userRepo, snIncidentMirrorSvc, eventPublisher, snWritebackDispatcher)
 	default:
-		activeIncidentSvc = service.NewIncidentService(incidentRepo)
+		activeIncidentSvc = service.NewIncidentService(incidentRepo, eventPublisher)
 	}
 	incidentHandler := handler.NewIncidentHandler(activeIncidentSvc)
 
-	problemRepo := repository.NewProblemRepository(db)
+	problemRepo := repository.NewProblemRepository(repository.NewScoped(db))
 	var activeProblemSvc service.ProblemService
 	switch cfg.DataSource {
 	case config.DataSourceServiceNow:
@@ -1015,7 +1056,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		smartAlertHandler = handler.NewSmartAlertHandler(service.NewServiceNowSmartAlertService(serviceNowIntegrationServiceClient))
 	}
 
-	incidentTaskRepo := repository.NewIncidentTaskRepository(db)
+	incidentTaskRepo := repository.NewIncidentTaskRepository(repository.NewScoped(db))
 	var activeIncidentTaskSvc service.IncidentTaskService
 	if cfg.DataSource == config.DataSourceServiceNow {
 		activeIncidentTaskSvc = service.NewServiceNowIncidentTaskService(serviceNowIntegrationServiceClient)
@@ -1024,25 +1065,51 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	}
 	incidentTaskHandler := handler.NewIncidentTaskHandler(activeIncidentTaskSvc)
 
-	conversationRepo := repository.NewConversationRepository(db)
+	conversationRepo := repository.NewConversationRepository(repository.NewScoped(db))
 	var activeConversationSvc service.ConversationService
-	if cfg.DataSource == config.DataSourceServiceNow {
+	switch cfg.DataSource {
+	case config.DataSourceServiceNow:
 		activeConversationSvc = service.NewServiceNowConversationService(serviceNowIntegrationServiceClient)
-	} else {
+	case config.DataSourcePostgresServiceNowDualWrite:
+		// UpdateConversation mirrors to ServiceNow asynchronously,
+		// best-effort, via the shared snWritebackDispatcher -- see
+		// conversationService.UpdateConversation's own doc comment.
+		// CreateConversation stays unsupported (work_item.number has no
+		// generator here) -- see conversationService's own doc comment.
+		snConversationMirrorSvc := service.NewServiceNowConversationService(serviceNowIntegrationServiceClient)
+		activeConversationSvc = service.NewConversationServiceWithSNWriteback(conversationRepo, snWritebackDispatcher, snConversationMirrorSvc)
+	default:
 		activeConversationSvc = service.NewConversationService(conversationRepo)
 	}
 	conversationHandler := handler.NewConversationHandler(activeConversationSvc)
 
 	var outageNotificationHandler *handler.OutageNotificationHandler
+	var outageCommunicationHandler *handler.OutageCommunicationHandler
 	if cfg.HasDatabase() {
 		outageNotificationHandler = handler.NewOutageNotificationHandler(
 			service.NewOutageNotificationService(
 				repository.NewOutageNotificationRepository(db), accessSvc))
+		outageCommunicationHandler = handler.NewOutageCommunicationHandler(
+			service.NewOutageCommunicationService(
+				repository.NewOutageCommunicationRepository(db), accessSvc))
 	}
 
+	// *** THE else BRANCH IS THE WHOLE FIX. *** Before it, these endpoints
+	// existed ONLY under DataSourceServiceNow, so a deployment running
+	// postgres or postgres-servicenow-dual-write registered no outage routes
+	// at all and the portal's Outages page got 404 page not found from the
+	// mux -- which is exactly what staging was serving.
+	//
+	// It also matters for the cloud status port: its sweep reads the Postgres
+	// outage table, so a portal-created outage has to land there to be seen.
+	// Creating it in ServiceNow instead leaves the sweep reading nothing and
+	// looks like a defect in the webhook port rather than a routing choice.
 	var outageHandler *handler.OutageHandler
 	if cfg.DataSource == config.DataSourceServiceNow {
 		outageHandler = handler.NewOutageHandler(service.NewServiceNowOutageService(serviceNowIntegrationServiceClient))
+	} else if cfg.HasDatabase() {
+		outageHandler = handler.NewOutageHandler(
+			service.NewOutageService(repository.NewOutageRepository(repository.NewScoped(db))))
 	}
 
 	// cloudStatusHandler is Postgres-only, and unconditionally so even though
@@ -1066,6 +1133,11 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	// them unregistered gives an honest 404 instead.
 	var cloudStatusDashboardHandler *handler.CloudStatusDashboardHandler
 	var cloudStatusHandler *handler.CloudStatusHandler
+	// availabilityHandler is the PRODUCER for the three dashboard endpoints
+	// above. They read service_availability; until now nothing in Postgres
+	// wrote it -- csm-sync-service mirrors ServiceNow's output, so at cutover
+	// the uptime figures would stop advancing with no error anywhere.
+	var availabilityHandler *handler.AvailabilityHandler
 	if db != nil {
 		cloudStatusDashboardHandler = handler.NewCloudStatusDashboardHandler(
 			service.NewCloudStatusDashboardService(repository.NewCloudStatusDashboardRepository(db)),
@@ -1073,6 +1145,14 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		cloudStatusHandler = handler.NewCloudStatusHandler(
 			service.NewCloudStatusService(repository.NewCloudStatusRepository(db), cfg.CloudStatusServiceIDs),
 		)
+		availabilitySvc, err := service.NewAvailabilityService(
+			repository.NewAvailabilityRepository(db), cfg.AvailabilityTimezone)
+		if err != nil {
+			// A bad zone mis-dates every row the sweep writes, so this is a
+			// startup error rather than a fallback.
+			log.Fatalf("availability service: %v", err)
+		}
+		availabilityHandler = handler.NewAvailabilityHandler(availabilitySvc)
 	}
 	// globalHandler is wired for both data sources now: GetSystemMetadata has
 	// a Postgres-backed implementation (globalService, reusing
@@ -1085,7 +1165,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	} else {
 		globalHandler = handler.NewGlobalHandler(service.NewGlobalService(
 			referenceDataRepo,
-			repository.NewGlobalSearchRepository(db),
+			repository.NewGlobalSearchRepository(repository.NewScoped(db)),
 			accessSvc,
 		))
 	}
@@ -1094,7 +1174,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	// instance_repo.go's own doc comment for the caveats around resolving an
 	// instance's project/deployment/deployed-product references on this data
 	// source.
-	instanceRepo := repository.NewInstanceRepository(db)
+	instanceRepo := repository.NewInstanceRepository(repository.NewScoped(db))
 	var activeInstanceSvc service.InstanceService
 	switch cfg.DataSource {
 	case config.DataSourceServiceNow:
@@ -1139,12 +1219,17 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	}
 	groupHandler := handler.NewGroupHandler(activeGroupSvc)
 
+	// Same gap as the outage handler above, and the outage form depends on
+	// it: its configuration-item picker is this search, so a nil handler here
+	// makes the create page unusable even once the outage routes exist.
 	var configurationItemHandler *handler.ConfigurationItemHandler
 	if cfg.DataSource == config.DataSourceServiceNow {
 		configurationItemHandler = handler.NewConfigurationItemHandler(service.NewServiceNowConfigurationItemService(serviceNowIntegrationServiceClient))
+	} else if cfg.HasDatabase() {
+		configurationItemHandler = handler.NewConfigurationItemHandler(service.NewConfigurationItemService(db))
 	}
 
-	commentRepo := repository.NewCommentRepository(db)
+	commentRepo := repository.NewCommentRepository(repository.NewScoped(db))
 	var activeCommentSvc service.CommentService
 	switch cfg.DataSource {
 	case config.DataSourceServiceNow:
@@ -1161,7 +1246,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	}
 	commentHandler := handler.NewCommentHandler(activeCommentSvc)
 
-	taskSlaRepo := repository.NewTaskSlaRepository(db)
+	taskSlaRepo := repository.NewTaskSlaRepository(repository.NewScoped(db))
 	var activeTaskSlaSvc service.TaskSlaService
 	if cfg.DataSource == config.DataSourceServiceNow {
 		activeTaskSlaSvc = service.NewServiceNowTaskSlaService(serviceNowIntegrationServiceClient)
@@ -1198,6 +1283,9 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	if salesforcePartnerHandler != nil {
 		mux.HandleFunc("POST /salesforce/accounts/{sfId}/refresh-partners", salesforcePartnerHandler.RefreshPartners)
 	}
+	if customerEngagementAllocationHandler != nil {
+		mux.HandleFunc("POST /customer-engagements/allocation-events", customerEngagementAllocationHandler.ProcessAllocationEvent)
+	}
 	if onboardingStepHandler != nil {
 		mux.HandleFunc("PUT /onboarding-steps/{membershipSfId}/{step}", onboardingStepHandler.UpsertOnboardingStep)
 		mux.HandleFunc("GET /onboarding-steps/{membershipSfId}", onboardingStepHandler.GetOnboardingSteps)
@@ -1218,8 +1306,8 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	if slaStatusHandler != nil {
 		mux.HandleFunc("GET /sla-status", slaStatusHandler.SearchActiveSLAStatuses)
 	}
-	if githubWebhookHandler != nil {
-		mux.HandleFunc("POST /webhooks/github", githubWebhookHandler.Handle)
+	if githubDeliveryHandler != nil {
+		mux.HandleFunc("POST /github/deliveries", githubDeliveryHandler.Handle)
 		mux.HandleFunc("POST /github/service-requests", githubServiceRequestHandler.Create)
 	}
 
@@ -1289,22 +1377,23 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	} else {
 		mux.HandleFunc("GET /users/{id}", userHandler.GetUser)
 		mux.HandleFunc("GET /users/me", userHandler.GetMe)
+		mux.HandleFunc("PATCH /users/me", userHandler.PatchMe)
 		mux.HandleFunc("POST /users/search", userHandler.SearchUsers)
 	mux.HandleFunc("POST /users/by-ids", userHandler.GetUsersByIDs)
 	mux.HandleFunc("POST /users", userHandler.CreateUser)
 	}
 	if snAccountHandler != nil {
-		mux.HandleFunc("GET /accounts/{id}", snAccountHandler.GetAccount)
-		mux.HandleFunc("POST /accounts/search", snAccountHandler.SearchAccounts)
+		mux.HandleFunc("GET /accounts/{id}", internalOnly(accessSvc, snAccountHandler.GetAccount))
+		mux.HandleFunc("POST /accounts/search", internalOnly(accessSvc, snAccountHandler.SearchAccounts))
 	} else {
-		mux.HandleFunc("GET /accounts/{id}", accountHandler.GetAccount)
-		mux.HandleFunc("POST /accounts/search", accountHandler.SearchAccounts)
-		mux.HandleFunc("PATCH /accounts/{id}", accountHandler.PatchAccountTeams)
+		mux.HandleFunc("GET /accounts/{id}", internalOnly(accessSvc, accountHandler.GetAccount))
+		mux.HandleFunc("POST /accounts/search", internalOnly(accessSvc, accountHandler.SearchAccounts))
+		mux.HandleFunc("PATCH /accounts/{id}", internalOnly(accessSvc, accountHandler.PatchAccountTeams))
 	}
 	if teamHandler != nil {
 		mux.HandleFunc("GET /teams/{id}/members", teamHandler.GetTeamMembers)
 	}
-	mux.HandleFunc("POST /accounts/{id}/contacts/search", accountContactHandler.SearchAccountContacts)
+	mux.HandleFunc("POST /accounts/{id}/contacts/search", internalOnly(accessSvc, accountContactHandler.SearchAccountContacts))
 	if opportunityHandler != nil {
 		mux.HandleFunc("POST /opportunities/search", opportunityHandler.SearchOpportunities)
 		mux.HandleFunc("GET /opportunities/{id}", opportunityHandler.GetOpportunity)
@@ -1318,8 +1407,8 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	}
 	mux.HandleFunc("GET /projects/{id}", projectHandler.GetProject)
 	mux.HandleFunc("POST /projects/search", projectHandler.SearchProjects)
-	mux.HandleFunc("POST /projects/{id}/contacts/search", projectContactHandler.SearchProjectContacts)
-	mux.HandleFunc("GET /projects/{id}/contacts/{contactId}", projectContactHandler.GetProjectContact)
+	mux.HandleFunc("POST /projects/{id}/contacts/search", projectMemberOnly(accessSvc, projectContactHandler.SearchProjectContacts))
+	mux.HandleFunc("GET /projects/{id}/contacts/{contactId}", projectMemberOnly(accessSvc, projectContactHandler.GetProjectContact))
 	if projectMembershipHandler != nil {
 		// Beside the search and get above, in the same namespace. {email}
 		// keys a membership; {contactId} on the GET above is a user id, and
@@ -1370,6 +1459,16 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	mux.HandleFunc("PATCH /cases/{id}", caseHandler.PatchCase)
 	mux.HandleFunc("POST /cases", caseHandler.CreateCase)
 	mux.HandleFunc("POST /cases/search", caseHandler.SearchCases)
+	// One-shot read of every announcement case for the CSM announcement
+	// registry (it groups the whole set, so paging 50 at a time through
+	// /cases/search was ~100 slow queries). Postgres-backed case data only;
+	// where this route is absent the registry falls back to paging
+	// /cases/search. Internal callers only.
+	if cfg.DataSource != config.DataSourceServiceNow {
+		announcementRegistryHandler := handler.NewAnnouncementRegistryHandler(
+			service.NewAnnouncementRegistryService(repository.NewAnnouncementRegistryRepository(repository.NewScoped(db)), accessSvc))
+		mux.HandleFunc("POST /announcements/registry/cases", internalOnly(accessSvc, announcementRegistryHandler.SearchRegistryCases))
+	}
 	mux.HandleFunc("POST /cases/aggregate", caseHandler.AggregateCases)
 	mux.HandleFunc("POST /cases/feedback/search", feedbackHandler.SearchFeedback)
 	mux.HandleFunc("POST /cases/feedback/aggregate", feedbackHandler.AggregateFeedback)
@@ -1429,7 +1528,16 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	mux.HandleFunc("GET /cases/{id}/escalations", caseEscalationHandler.SearchCaseEscalations)
 	mux.HandleFunc("POST /cases/{id}/escalations", caseEscalationHandler.CreateCaseEscalation)
 
-	mux.HandleFunc("POST /change-requests", changeRequestHandler.CreateChangeRequest)
+	// internalOnly: migration 0145's change_request_write_internal_only RLS
+	// policy only ever permits an internal caller to INSERT into
+	// change_request (CreateChangeRequestRequest has no projectId field at
+	// all to check membership against) -- same posture already established
+	// for POST /incidents and POST /problems below. A non-internal caller
+	// reaching changeRequestService.CreateChangeRequest's plain-Postgres
+	// path would otherwise fail the RLS check with a raw 42501 (mapped to a
+	// clean NotFoundError, but still a request that was never going to
+	// succeed) -- gating here rejects it before any write is attempted.
+	mux.HandleFunc("POST /change-requests", internalOnly(accessSvc, changeRequestHandler.CreateChangeRequest))
 	mux.HandleFunc("POST /change-requests/search", changeRequestHandler.SearchChangeRequests)
 	mux.HandleFunc("POST /change-requests/aggregate", changeRequestHandler.AggregateChangeRequests)
 	mux.HandleFunc("GET /change-requests/{id}", changeRequestHandler.GetChangeRequest)
@@ -1438,10 +1546,16 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	mux.HandleFunc("POST /change-requests/{id}/approvals/decision", changeRequestHandler.DecideChangeRequestApproval)
 
 	mux.HandleFunc("POST /time-cards/search", timeCardHandler.SearchTimeCards)
-	mux.HandleFunc("POST /time-cards", timeCardHandler.CreateTimeCard)
-	mux.HandleFunc("PATCH /time-cards/{id}", timeCardHandler.UpdateTimeCard)
+	// Time cards are logged, edited and deleted by internal staff only;
+	// customers can read them (the two search routes) but never write. The
+	// gate makes that a property of entity-service itself rather than of
+	// whichever caller happens to sit in front of it. It costs no extra
+	// query: callerIdentityMiddleware has already resolved the caller's scope
+	// and internalOnly reads it back from the request context.
+	mux.HandleFunc("POST /time-cards", internalOnly(accessSvc, timeCardHandler.CreateTimeCard))
+	mux.HandleFunc("PATCH /time-cards/{id}", internalOnly(accessSvc, timeCardHandler.UpdateTimeCard))
 	mux.HandleFunc("POST /cases/time-cards/search", timeCardHandler.SearchCaseTimeCards)
-	mux.HandleFunc("DELETE /time-cards/{id}", timeCardHandler.DeleteTimeCard)
+	mux.HandleFunc("DELETE /time-cards/{id}", internalOnly(accessSvc, timeCardHandler.DeleteTimeCard))
 
 	mux.HandleFunc("POST /catalogs/search", catalogHandler.SearchCatalogs)
 	mux.HandleFunc("GET /catalogs/{catalogId}/items/{catalogItemId}/variables", catalogHandler.GetCatalogItemVariables)
@@ -1467,8 +1581,8 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	mux.HandleFunc("DELETE /comments/{id}", commentHandler.DeleteComment)
 	mux.HandleFunc("GET /comments/{id}/history", commentHandler.GetCommentEditHistory)
 
-	mux.HandleFunc("GET /slas/{id}", taskSlaHandler.GetTaskSla)
-	mux.HandleFunc("POST /slas/search", taskSlaHandler.SearchTaskSlas)
+	mux.HandleFunc("GET /slas/{id}", internalOnly(accessSvc, taskSlaHandler.GetTaskSla))
+	mux.HandleFunc("POST /slas/search", internalOnly(accessSvc, taskSlaHandler.SearchTaskSlas))
 
 	// Registered unconditionally; the non-ServiceNow data source is served by
 	// service.NewUnavailableTaskService, which answers 503 (see above).
@@ -1478,13 +1592,13 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	mux.HandleFunc("POST /cases/{id}/tasks", taskHandler.CreateCaseTask)
 	mux.HandleFunc("PATCH /tasks/{id}", taskHandler.UpdateTask)
 
-	mux.HandleFunc("GET /incidents/{id}", incidentHandler.GetIncident)
-	mux.HandleFunc("PATCH /incidents/{id}", incidentHandler.PatchIncident)
-	mux.HandleFunc("POST /incidents", incidentHandler.CreateIncident)
-	mux.HandleFunc("POST /incidents/search", incidentHandler.SearchIncidents)
-	mux.HandleFunc("POST /incidents/aggregate", incidentHandler.AggregateIncidents)
-	mux.HandleFunc("POST /incidents/{id}/activities/search", incidentHandler.SearchIncidentActivities)
-	mux.HandleFunc("POST /incidents/{id}/specialist-handoffs", incidentHandler.HandOffIncidentToSpecialist)
+	mux.HandleFunc("GET /incidents/{id}", internalOnly(accessSvc, incidentHandler.GetIncident))
+	mux.HandleFunc("PATCH /incidents/{id}", internalOnly(accessSvc, incidentHandler.PatchIncident))
+	mux.HandleFunc("POST /incidents", internalOnly(accessSvc, incidentHandler.CreateIncident))
+	mux.HandleFunc("POST /incidents/search", internalOnly(accessSvc, incidentHandler.SearchIncidents))
+	mux.HandleFunc("POST /incidents/aggregate", internalOnly(accessSvc, incidentHandler.AggregateIncidents))
+	mux.HandleFunc("POST /incidents/{id}/activities/search", internalOnly(accessSvc, incidentHandler.SearchIncidentActivities))
+	mux.HandleFunc("POST /incidents/{id}/specialist-handoffs", internalOnly(accessSvc, incidentHandler.HandOffIncidentToSpecialist))
 
 	// Postgres-backed, and deliberately separate from outageHandler above:
 	// that one is the ServiceNow-backed outage entity API, this is only the
@@ -1493,6 +1607,20 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	if outageNotificationHandler != nil {
 		mux.HandleFunc("POST /outage-notifications/sweep", outageNotificationHandler.SweepOutageNotifications)
 		mux.HandleFunc("GET /outages/{id}/notification-state", outageNotificationHandler.GetOutageNotificationState)
+	}
+
+	// The SECOND outage notifier, and a different flow from the one above.
+	// That is the internal-STAKEHOLDER notice; this is the SRE-facing
+	// declaration/resolution pair (ServiceNow's `Outage Communication`).
+	// They share the outage table and nothing else -- different audience,
+	// different content, different idempotency mechanism.
+	//
+	// Keyed on the outage NUMBER rather than its id, because the
+	// communication log has never carried anything else: ServiceNow's own
+	// table has a reference column that is empty on all 336 rows.
+	if outageCommunicationHandler != nil {
+		mux.HandleFunc("POST /outage-communications/sweep", outageCommunicationHandler.SweepOutageCommunications)
+		mux.HandleFunc("GET /outages/{number}/communication-log", outageCommunicationHandler.GetOutageCommunicationLog)
 	}
 
 	if outageHandler != nil {
@@ -1513,21 +1641,28 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		mux.HandleFunc("GET /cloud-status/availability-history", cloudStatusDashboardHandler.AvailabilityHistory)
 		mux.HandleFunc("GET /cloud-status/incidents/{id}", cloudStatusDashboardHandler.IncidentDetail)
 	}
+	if availabilityHandler != nil {
+		// Internal, and it WRITES: every other /cloud-status route is a read
+		// the dashboard makes, this one recomputes and replaces rows.
+		// internalOnly: auth.Middleware only validates a token, so without
+		// this a customer's user token could trigger the recompute.
+		mux.HandleFunc("POST /internal/availability/sweep", internalOnly(accessSvc, availabilityHandler.Sweep))
+	}
 	if cloudStatusHandler != nil {
 		mux.HandleFunc("POST /internal/cloud-status/sweep", cloudStatusHandler.Sweep)
 		mux.HandleFunc("GET /internal/cloud-status/pending", cloudStatusHandler.Pending)
 		mux.HandleFunc("POST /internal/cloud-status/{id}/delivery", cloudStatusHandler.RecordDelivery)
 	}
 
-	mux.HandleFunc("POST /problems", problemHandler.CreateProblem)
-	mux.HandleFunc("POST /problems/search", problemHandler.SearchProblems)
-	mux.HandleFunc("POST /problems/aggregate", problemHandler.AggregateProblems)
-	mux.HandleFunc("GET /problems/{id}", problemHandler.GetProblem)
-	mux.HandleFunc("PATCH /problems/{id}", problemHandler.PatchProblem)
+	mux.HandleFunc("POST /problems", internalOnly(accessSvc, problemHandler.CreateProblem))
+	mux.HandleFunc("POST /problems/search", internalOnly(accessSvc, problemHandler.SearchProblems))
+	mux.HandleFunc("POST /problems/aggregate", internalOnly(accessSvc, problemHandler.AggregateProblems))
+	mux.HandleFunc("GET /problems/{id}", internalOnly(accessSvc, problemHandler.GetProblem))
+	mux.HandleFunc("PATCH /problems/{id}", internalOnly(accessSvc, problemHandler.PatchProblem))
 
-	mux.HandleFunc("POST /incident-tasks/search", incidentTaskHandler.SearchIncidentTasks)
-	mux.HandleFunc("POST /incident-tasks/aggregate", incidentTaskHandler.AggregateIncidentTasks)
-	mux.HandleFunc("GET /incident-tasks/{id}", incidentTaskHandler.GetIncidentTask)
+	mux.HandleFunc("POST /incident-tasks/search", internalOnly(accessSvc, incidentTaskHandler.SearchIncidentTasks))
+	mux.HandleFunc("POST /incident-tasks/aggregate", internalOnly(accessSvc, incidentTaskHandler.AggregateIncidentTasks))
+	mux.HandleFunc("GET /incident-tasks/{id}", internalOnly(accessSvc, incidentTaskHandler.GetIncidentTask))
 
 	if alertHandler != nil {
 		mux.HandleFunc("GET /alerts/{id}", alertHandler.GetAlert)
@@ -1604,7 +1739,13 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 			middleware.Logger(
 				middleware.UserIDToken(
 					auth.Middleware(tokenValidator)(
-						middleware.Timeout(30 * time.Second)(mux),
+						// Timeout wraps the identity lookup too: for an external caller
+						// with no cached identity, ResolveScope runs two database
+						// queries on the request context, and they must share the
+						// same 30s deadline as the handler instead of running unbounded.
+						middleware.Timeout(30 * time.Second)(
+							callerIdentityMiddleware(accessSvc)(mux),
+						),
 					),
 				),
 			),

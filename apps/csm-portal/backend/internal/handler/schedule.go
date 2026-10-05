@@ -362,33 +362,33 @@ func (h *ScheduleHandler) GetScheduleEditMarkers(w http.ResponseWriter, r *http.
 	writeJSON(w, http.StatusOK, result)
 }
 
-// splScheduleClient abstracts the ServiceNow ABT team schedule operation
-// used by SplScheduleHandler.
-type splScheduleClient interface {
+// viewerScheduleClient abstracts the ServiceNow ABT team schedule operation
+// used by ViewerScheduleHandler.
+type viewerScheduleClient interface {
 	GetABTTeamSchedule(ctx context.Context, from, duration, teamID, eventType, teamScheduleURL string) (servicenow.ABTTeamScheduleData, error)
 }
 
-// SplScheduleHandler handles HTTP requests for the ABT team schedule,
+// ViewerScheduleHandler handles HTTP requests for the ABT team schedule,
 // delegating to the ServiceNow service.
-type SplScheduleHandler struct {
-	servicenow      splScheduleClient
+type ViewerScheduleHandler struct {
+	servicenow      viewerScheduleClient
 	accessGuard     *AccessGuard
 	teamScheduleURL string
 }
 
-// NewSplScheduleHandler creates a SplScheduleHandler backed by the given
-// ServiceNow client. accessGuard enforces PermSPLAccess, SupportPortalLite's
+// NewViewerScheduleHandler creates a ViewerScheduleHandler backed by the given
+// ServiceNow client. accessGuard enforces PermViewerAccess, SupportPortalLite's
 // blanket audience gate; teamScheduleURL is the static URL echoed back in
 // every response (TEAM_SCHEDULE_URL).
-func NewSplScheduleHandler(sn splScheduleClient, accessGuard *AccessGuard, teamScheduleURL string) *SplScheduleHandler {
-	return &SplScheduleHandler{servicenow: sn, accessGuard: accessGuard, teamScheduleURL: teamScheduleURL}
+func NewViewerScheduleHandler(sn viewerScheduleClient, accessGuard *AccessGuard, teamScheduleURL string) *ViewerScheduleHandler {
+	return &ViewerScheduleHandler{servicenow: sn, accessGuard: accessGuard, teamScheduleURL: teamScheduleURL}
 }
 
 // GetABTTeamSchedule handles GET /abt-team-schedule. All query
 // parameters are optional, mirroring the Ballerina resource function's
 // `string?` parameters.
-func (h *SplScheduleHandler) GetABTTeamSchedule(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+func (h *ViewerScheduleHandler) GetABTTeamSchedule(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}

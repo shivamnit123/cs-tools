@@ -106,6 +106,29 @@ func watchListUserEmails(watchList []domain.WatchListUser) []string {
 	return recipients
 }
 
+// resolveCaseDefaultWatcherEmails resolves cv's account's four default-
+// watcher stakeholder emails fresh, for every case.* publisher below to
+// union into its own WatchList-derived recipients — see
+// CaseRepository.AccountDefaultWatcherEmails' own doc comment for why these
+// are resolved at publish time rather than read from a persisted watch list.
+// cv.ProjectDetails nil (a case with no linked project) or resolve itself
+// failing both return an empty slice rather than failing the whole publish:
+// the case's own WatchList recipients (if any) must still go out — a
+// default-watcher lookup hiccup is exactly that, a hiccup, not a reason to
+// notify no one. logContext names the caller for its own error log line
+// (e.g. "create case", "update case").
+func resolveCaseDefaultWatcherEmails(ctx context.Context, resolve func(context.Context, string) ([]string, error), cv domain.CaseView, logContext string) []string {
+	if resolve == nil || cv.ProjectDetails == nil {
+		return nil
+	}
+	emails, err := resolve(ctx, cv.ProjectDetails.ID)
+	if err != nil {
+		slog.ErrorContext(ctx, logContext+": resolving account default watchers failed", "error", err)
+		return nil
+	}
+	return emails
+}
+
 // caseProductName returns cv's deployed product's display name (e.g. "WSO2
 // API Manager"), "" when the case has no deployed product. Shared by every
 // publisher that needs it for a case.* payload's Product field (Google
@@ -1134,7 +1157,7 @@ func registerCaseSLAClocksEvent(ctx context.Context, slaEngine SLAEngineService,
 // reasoning — this is now a thin wrapper around it, same shape as
 // snIncidentService.publishIncidentCreated/publishIncidentCreatedEvent.
 func (s *snCaseService) publishCaseCreated(ctx context.Context, req domain.CreateCaseRequest, caseID string) {
-	publishCaseCreatedEvent(ctx, s.publisher, s.GetCaseByID, s.ProjectContactEmailsByRole, req, caseID)
+	publishCaseCreatedEvent(ctx, s.publisher, s.GetCaseByID, s.ProjectContactEmailsByRole, s.AccountDefaultWatcherEmails, req, caseID)
 }
 
 // publishCaseCreatedEvent is publishCaseCreated's actual body, factored out
@@ -1173,20 +1196,22 @@ func (s *snCaseService) publishCaseCreated(ctx context.Context, req domain.Creat
 // Recipients depends on req.Type:
 //   - "case"/"engagement"/"service_request"/"security_report_analysis": the
 //     case's own WatchList emails (per explicit decision — this service has
-//     no other notion of "who should be emailed" for these types), which
-//     already includes the account's four default-watcher stakeholders (see
-//     CaseRepository.AccountDefaultWatcherIDs) once addAccountDefaultWatchers
-//     has run for the case (Postgres/dual-write data source only — see that
-//     function's own doc comment).
+//     no other notion of "who should be emailed" for these types), unioned
+//     with the account's four default-watcher stakeholders resolved fresh via
+//     resolveAccountDefaultWatcherEmails — see CaseRepository.
+//     AccountDefaultWatcherEmails' own doc comment for why these are never
+//     persisted into WatchList/work_item_watcher at all (so a later
+//     stakeholder reassignment is reflected on the very next notification).
 //   - "announcement": every project_contact holding the SECURITY_CONTACT
 //     project role (req.IsSecurityAnnouncement true) or PORTAL_USER (false),
 //     via resolveProjectContactEmailsByRole — bypassing the watch-list
 //     mechanism entirely, since a project contact often has no matching
 //     "user" row to add as a work_item_watcher (work_item_watcher.user_id is
-//     NOT NULL). Falls back to the case's own WatchList emails (the account's
-//     default watchers) when no contact holds the requested role for that
-//     project — a project with no security contacts must still notify
-//     someone for a security announcement, not silently notify no one.
+//     NOT NULL). Falls back to the case's own WatchList emails (still unioned
+//     with the account's default watchers) when no contact holds the
+//     requested role for that project — a project with no security contacts
+//     must still notify someone for a security announcement, not silently
+//     notify no one.
 //
 // A case created with no recipients either way is a real, expected state
 // (watchers/contacts are often added or invited after creation), not an
@@ -1211,6 +1236,7 @@ func publishCaseCreatedEvent(
 	publisher EventPublisherService,
 	getCaseByID func(context.Context, string) (domain.CaseView, error),
 	resolveProjectContactEmailsByRole func(context.Context, string, string) ([]string, error),
+	resolveAccountDefaultWatcherEmails func(context.Context, string) ([]string, error),
 	req domain.CreateCaseRequest,
 	caseID string,
 ) {
@@ -1235,6 +1261,8 @@ func publishCaseCreatedEvent(
 		return
 	}
 
+	defaultWatchers := resolveCaseDefaultWatcherEmails(ctx, resolveAccountDefaultWatcherEmails, cv, "create case")
+
 	var recipients []string
 	if req.Type == "announcement" {
 		role := "PORTAL_USER"
@@ -1248,12 +1276,14 @@ func publishCaseCreatedEvent(
 		}
 		if len(recipients) == 0 {
 			// No project contact holds the requested role -- fall back to
-			// the account's default watchers rather than notifying no one.
+			// the case's own WatchList (plus the account's default watchers,
+			// unioned below) rather than notifying no one.
 			recipients = watchListUserEmails(cv.WatchList)
 		}
 	} else {
 		recipients = watchListUserEmails(cv.WatchList)
 	}
+	recipients = mergeUnique(recipients, defaultWatchers)
 	if len(recipients) == 0 {
 		slog.InfoContext(ctx, "create case: case.created not published, case has no watchers to email", "caseId", caseID)
 		return
@@ -1291,7 +1321,9 @@ func publishCaseCreatedEvent(
 		// the full error is already durably recorded in
 		// event_publish_failures by Publish itself).
 		slog.ErrorContext(ctx, "create case: publish case.created failed", "caseId", caseID)
+		return
 	}
+	slog.InfoContext(ctx, "create case: case.created published", "caseId", caseID)
 }
 
 // resolveCommentAuthorSearchLimit bounds resolveCommentAuthor's lookup —
@@ -1379,7 +1411,8 @@ func (s *snCaseService) publishCommentAdded(ctx context.Context, req domain.Crea
 		slog.ErrorContext(ctx, "sn create comment: enrich case for case.comment_added publish failed", "caseId", req.CaseID)
 		return
 	}
-	recipients := watchListUserEmails(cv.WatchList)
+	defaultWatchers := resolveCaseDefaultWatcherEmails(ctx, s.AccountDefaultWatcherEmails, cv, "sn create comment")
+	recipients := mergeUnique(watchListUserEmails(cv.WatchList), defaultWatchers)
 	if req.Type == domain.CommentTypeWorkNote {
 		recipients = filterWso2Emails(recipients)
 	}
@@ -1395,7 +1428,7 @@ func (s *snCaseService) publishCommentAdded(ctx context.Context, req domain.Crea
 		slog.InfoContext(ctx, "sn create comment: case.comment_added not published, could not resolve comment author's display name", "caseId", req.CaseID)
 		return
 	}
-	publishCommentAddedEvent(ctx, s.publisher, cv, req, commentID, author.Name)
+	publishCommentAddedEvent(ctx, s.publisher, s.AccountDefaultWatcherEmails, cv, req, commentID, author.Name)
 }
 
 // publishCommentAddedEvent is publishCommentAdded's actual body, factored
@@ -1411,14 +1444,15 @@ func (s *snCaseService) publishCommentAdded(ctx context.Context, req domain.Crea
 // function even runs (to decide whether there are recipients worth an
 // author lookup for — see publishCommentAdded's own doc comment), so a
 // callback here would only risk double-fetching.
-func publishCommentAddedEvent(ctx context.Context, publisher EventPublisherService, cv domain.CaseView, req domain.CreateCaseCommentRequest, commentID, authorName string) {
+func publishCommentAddedEvent(ctx context.Context, publisher EventPublisherService, resolveAccountDefaultWatcherEmails func(context.Context, string) ([]string, error), cv domain.CaseView, req domain.CreateCaseCommentRequest, commentID, authorName string) {
 	if publisher == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(ctx, publishCommentAddedTimeout)
 	defer cancel()
 
-	recipients := watchListUserEmails(cv.WatchList)
+	defaultWatchers := resolveCaseDefaultWatcherEmails(ctx, resolveAccountDefaultWatcherEmails, cv, "create comment")
+	recipients := mergeUnique(watchListUserEmails(cv.WatchList), defaultWatchers)
 	if req.Type == domain.CommentTypeWorkNote {
 		recipients = filterWso2Emails(recipients)
 	}
@@ -1447,7 +1481,9 @@ func publishCommentAddedEvent(ctx context.Context, publisher EventPublisherServi
 		// Not logging err itself — see publishCaseCreatedEvent's matching
 		// log line for why.
 		slog.ErrorContext(ctx, "create comment: publish case.comment_added failed", "caseId", req.CaseID)
+		return
 	}
+	slog.InfoContext(ctx, "create comment: case.comment_added published", "caseId", req.CaseID)
 }
 
 // applyCustomerReplyStateTransition moves a case back to Waiting on WSO2
@@ -1651,16 +1687,18 @@ func (s *snCaseService) applyCustomerReplyStateTransition(ctx context.Context, r
 // GetCaseByID call after the PATCH: neither value depends on the update
 // that just happened.
 //
-// Recipients is the case's WatchList emails only — see publishCaseCreated's
-// own doc comment for why, and why an empty list silently skips
-// publishing.
+// Recipients is the case's WatchList emails, unioned with the account's
+// default-watcher stakeholders resolved fresh (see publishCaseCreatedEvent's
+// own doc comment for why those are never persisted into WatchList) — see
+// publishCaseCreated's own doc comment for why, and why an empty list
+// silently skips publishing.
 //
 // Runs synchronously, bounded by publishStatusChangedTimeout — see
 // publishCaseCreated's own doc comment for why (same reasoning). Now a thin
 // wrapper around publishStatusChangedEvent — see that function's own doc
 // comment for why.
 func (s *snCaseService) publishStatusChanged(ctx context.Context, caseID, newStatus string, before domain.CaseView) {
-	publishStatusChangedEvent(ctx, s.publisher, caseID, newStatus, before)
+	publishStatusChangedEvent(ctx, s.publisher, s.AccountDefaultWatcherEmails, caseID, newStatus, before)
 }
 
 // caseStateDisplayLabel maps domain.CaseState to ServiceNow's own display
@@ -1700,14 +1738,15 @@ var caseStateDisplayLabel = map[domain.CaseState]string{
 // caller has already used it (or the equivalent pre-update value) to
 // confirm the state is actually transitioning, not a caller re-PATCHing
 // the current value.
-func publishStatusChangedEvent(ctx context.Context, publisher EventPublisherService, caseID, newStatus string, before domain.CaseView) {
+func publishStatusChangedEvent(ctx context.Context, publisher EventPublisherService, resolveAccountDefaultWatcherEmails func(context.Context, string) ([]string, error), caseID, newStatus string, before domain.CaseView) {
 	if publisher == nil || newStatus == "" {
 		return
 	}
 	ctx, cancel := context.WithTimeout(ctx, publishStatusChangedTimeout)
 	defer cancel()
 
-	recipients := watchListUserEmails(before.WatchList)
+	defaultWatchers := resolveCaseDefaultWatcherEmails(ctx, resolveAccountDefaultWatcherEmails, before, "update case")
+	recipients := mergeUnique(watchListUserEmails(before.WatchList), defaultWatchers)
 	if len(recipients) == 0 {
 		slog.InfoContext(ctx, "update case: case.status_changed not published, case has no watchers to email", "caseId", caseID)
 		return
@@ -1730,7 +1769,9 @@ func publishStatusChangedEvent(ctx context.Context, publisher EventPublisherServ
 		// Not logging err itself — see publishCaseCreatedEvent's matching
 		// log line for why.
 		slog.ErrorContext(ctx, "update case: publish case.status_changed failed", "caseId", caseID)
+		return
 	}
+	slog.InfoContext(ctx, "update case: case.status_changed published", "caseId", caseID)
 }
 
 // publishSeverityChanged best-effort publishes a case.severity_changed
@@ -1762,7 +1803,7 @@ func publishStatusChangedEvent(ctx context.Context, publisher EventPublisherServ
 // wrapper around publishSeverityChangedEvent — see that function's own doc
 // comment for why.
 func (s *snCaseService) publishSeverityChanged(ctx context.Context, caseID, oldSeverity, newSeverity string, before domain.CaseView) {
-	publishSeverityChangedEvent(ctx, s.publisher, caseID, oldSeverity, newSeverity, before)
+	publishSeverityChangedEvent(ctx, s.publisher, s.AccountDefaultWatcherEmails, caseID, oldSeverity, newSeverity, before)
 }
 
 // publishSeverityChangedEvent is publishSeverityChanged's actual body,
@@ -1772,14 +1813,15 @@ func (s *snCaseService) publishSeverityChanged(ctx context.Context, caseID, oldS
 // plain severity strings (either case; upper-cased here) — the caller has
 // already confirmed they actually differ, not a caller re-PATCHing the
 // case's current severity.
-func publishSeverityChangedEvent(ctx context.Context, publisher EventPublisherService, caseID, oldSeverity, newSeverity string, before domain.CaseView) {
+func publishSeverityChangedEvent(ctx context.Context, publisher EventPublisherService, resolveAccountDefaultWatcherEmails func(context.Context, string) ([]string, error), caseID, oldSeverity, newSeverity string, before domain.CaseView) {
 	if publisher == nil || newSeverity == "" {
 		return
 	}
 	ctx, cancel := context.WithTimeout(ctx, publishSeverityChangedTimeout)
 	defer cancel()
 
-	recipients := watchListUserEmails(before.WatchList)
+	defaultWatchers := resolveCaseDefaultWatcherEmails(ctx, resolveAccountDefaultWatcherEmails, before, "update case")
+	recipients := mergeUnique(watchListUserEmails(before.WatchList), defaultWatchers)
 	if len(recipients) == 0 {
 		slog.InfoContext(ctx, "update case: case.severity_changed not published, case has no watchers to email", "caseId", caseID)
 		return
@@ -1813,7 +1855,9 @@ func publishSeverityChangedEvent(ctx context.Context, publisher EventPublisherSe
 		// Not logging err itself — see publishCaseCreatedEvent's matching
 		// log line for why.
 		slog.ErrorContext(ctx, "update case: publish case.severity_changed failed", "caseId", caseID)
+		return
 	}
+	slog.InfoContext(ctx, "update case: case.severity_changed published", "caseId", caseID)
 }
 
 // publishCaseAssigned best-effort publishes a case.assigned event after
@@ -1845,7 +1889,8 @@ func (s *snCaseService) publishCaseAssigned(ctx context.Context, caseID, assigne
 	ctx, cancel := context.WithTimeout(ctx, publishCaseAssignedTimeout)
 	defer cancel()
 
-	recipients := watchListUserEmails(before.WatchList)
+	defaultWatchers := resolveCaseDefaultWatcherEmails(ctx, s.AccountDefaultWatcherEmails, before, "sn update case")
+	recipients := mergeUnique(watchListUserEmails(before.WatchList), defaultWatchers)
 	if len(recipients) == 0 {
 		slog.InfoContext(ctx, "sn update case: case.assigned not published, case has no watchers to email", "caseId", caseID)
 		return
@@ -1869,7 +1914,9 @@ func (s *snCaseService) publishCaseAssigned(ctx context.Context, caseID, assigne
 		// Not logging err itself — see publishCaseCreated's matching log
 		// line for why.
 		slog.ErrorContext(ctx, "sn update case: publish case.assigned failed", "caseId", caseID)
+		return
 	}
+	slog.InfoContext(ctx, "sn update case: case.assigned published", "caseId", caseID)
 }
 
 // publishCaseAcknowledged best-effort publishes a case.acknowledged event
@@ -1920,7 +1967,9 @@ func (s *snCaseService) publishCaseAcknowledged(ctx context.Context, caseID, ack
 		// Not logging err itself — see publishCaseCreated's matching log
 		// line for why.
 		slog.ErrorContext(ctx, "sn update case: publish case.acknowledged failed", "caseId", caseID)
+		return
 	}
+	slog.InfoContext(ctx, "sn update case: case.acknowledged published", "caseId", caseID)
 }
 
 // ProjectContactEmailsByRole implements CaseService. project_contact/
@@ -1936,6 +1985,27 @@ func (s *snCaseService) ProjectContactEmailsByRole(ctx context.Context, projectI
 		return nil, nil
 	}
 	return s.pgFallback.ProjectContactEmailsByRole(ctx, projectID, role)
+}
+
+// AccountDefaultWatcherEmails implements CaseService. account/project are
+// Postgres-only concepts, same reasoning as ProjectContactEmailsByRole just
+// above — delegates to pgFallback when configured, empty/no-error otherwise.
+func (s *snCaseService) AccountDefaultWatcherEmails(ctx context.Context, projectID string) ([]string, error) {
+	if s.pgFallback == nil {
+		return nil, nil
+	}
+	return s.pgFallback.AccountDefaultWatcherEmails(ctx, projectID)
+}
+
+// GetCaseEtaSharedOn implements CaseService. eta_shared_on is a
+// Postgres-only column (see domain.CaseView.EtaSharedOn's own doc
+// comment) -- same pgFallback delegation as AccountDefaultWatcherEmails
+// just above, for the same reason.
+func (s *snCaseService) GetCaseEtaSharedOn(ctx context.Context, caseID string) (*time.Time, error) {
+	if s.pgFallback == nil {
+		return nil, nil
+	}
+	return s.pgFallback.GetCaseEtaSharedOn(ctx, caseID)
 }
 
 func (s *snCaseService) GetCaseByID(ctx context.Context, id string) (domain.CaseView, error) {
@@ -2214,6 +2284,16 @@ func (s *snCaseService) GetCaseByID(ctx context.Context, id string) (domain.Case
 		slog.WarnContext(ctx, "sn get case: case tags lookup failed", "caseId", id, "error", err)
 	} else {
 		cv.Tags = tags
+	}
+
+	// EtaSharedOn has no ServiceNow equivalent at all (see its own doc
+	// comment) -- merged in from Postgres, best-effort, same "log and
+	// leave nil" posture as the tags lookup just above: a lookup hiccup
+	// must not fail the whole case read.
+	if etaSharedOn, err := s.GetCaseEtaSharedOn(ctx, id); err != nil {
+		slog.WarnContext(ctx, "sn get case: eta shared on lookup failed", "caseId", id, "error", err)
+	} else {
+		cv.EtaSharedOn = etaSharedOn
 	}
 
 	return cv, nil
@@ -3403,6 +3483,31 @@ func (s *snCaseService) UpdateCase(ctx context.Context, req domain.UpdateCaseReq
 	// doc comment.
 	if s.slaEngine != nil && req.WorkaroundProvided != nil && *req.WorkaroundProvided {
 		s.slaEngine.CompleteWorkaroundClock(ctx, req.ID)
+	}
+	// Independent of the WorkaroundProvided check above, same "no Event Hub
+	// dependency" reasoning -- a caller can set workaroundProvided and
+	// addPublicComment together (CompleteWorkaroundClock would then simply
+	// be redundant for that one clock, see CompleteFixEtaSharedClocks' own
+	// doc comment).
+	//
+	// Checked via GetCaseEtaSharedOn, not req.AddPublicComment directly:
+	// eta_shared_on (work_item.eta_shared_on) is the actual record of a
+	// shared fix ETA, and it has no guaranteed connection to this specific
+	// PATCH -- it has no ServiceNow equivalent field at all (see
+	// domain.CaseView.EtaSharedOn's own doc comment), so nothing about
+	// *when* ServiceNow's own "Share Fix ETA" action actually lands in
+	// Postgres is guaranteed to line up with this request's own
+	// AddPublicComment flag. Checking the persisted fact on every UpdateCase
+	// call instead (cheap, idempotent, same CompleteClock safety net as
+	// every other completion path) means a case's clocks still get
+	// completed the next time anything about it changes, even if this
+	// specific PATCH wasn't the one that shared the ETA.
+	if s.slaEngine != nil {
+		if etaSharedOn, err := s.GetCaseEtaSharedOn(ctx, req.ID); err != nil {
+			slog.WarnContext(ctx, "sn update case: eta shared on lookup failed", "caseId", req.ID, "error", err)
+		} else if etaSharedOn != nil {
+			s.slaEngine.CompleteFixEtaSharedClocks(ctx, req.ID)
+		}
 	}
 	if publishCaseAssign {
 		assigneeName := assigneeEmail

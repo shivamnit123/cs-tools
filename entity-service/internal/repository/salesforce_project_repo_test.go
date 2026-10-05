@@ -124,7 +124,7 @@ func (q *projectQuerier) QueryRow(_ context.Context, sql string, args ...any) pg
 			return scanRow{err: pgx.ErrNoRows}
 		}
 		st := q.ledgerRow
-		return scanRow{vals: []any{st.Entity, st.SfID, st.EventModifiedOn, st.EventType, string(st.Status), st.LastError, st.AttemptCount, st.CreatedOn, st.UpdatedOn}}
+		return scanRow{vals: []any{st.Entity, st.SfID, st.EventModifiedOn, st.EventType, string(st.Status), st.LastError, st.AttemptCount, st.CreatedOn, st.UpdatedOn, st.RetryCount}}
 	}
 	return scanRow{err: fmt.Errorf("unexpected QueryRow: %.60s", sql)}
 }
@@ -154,6 +154,8 @@ func (r scanRow) Scan(dest ...any) error {
 			*d = v.(*string)
 		case *int:
 			*d = v.(int)
+		case *int64:
+			*d = v.(int64)
 		}
 	}
 	return nil

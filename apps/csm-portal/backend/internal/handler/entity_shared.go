@@ -138,7 +138,7 @@ type entityProjectDetailsView struct {
 // caseStateToDisplay translates entity-service's domain.CaseState wire
 // values (lowercase snake_case, e.g. "work_in_progress") to the six display
 // labels SPL's UI has always used, which are exactly ServiceNow's own state
-// labels (e.g. "Work In Progress") -- see CaseStateCard.tsx/SplCasesPage.tsx
+// labels (e.g. "Work In Progress") -- see CaseStateCard.tsx/CasesPage.tsx
 // on the frontend, which are NOT changing as part of this.
 var caseStateToDisplay = map[string]string{
 	"open":              "Open",

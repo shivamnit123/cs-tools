@@ -134,7 +134,10 @@ func TestDeactivatedMembershipReadersIntegration(t *testing.T) {
 	}
 	exec(`INSERT INTO user_role (id, created_on, updated_on, user_id, role_id) VALUES ($1, now(), now(), $2, $3)`, dciUserRoleID, dciGoneUserID, roleID)
 
-	emails, err := (&crNoticeRepository{db: pool}).ProjectContactEmails(ctx, dciProjectID)
+	// The repositories under test run every statement under a caller identity
+	// (Scoped); these are background-style reads, so stamp a system identity.
+	sysCtx := WithSystemIdentity(ctx)
+	emails, err := (&crNoticeRepository{db: NewScoped(pool)}).ProjectContactEmails(sysCtx, dciProjectID)
 	if err != nil {
 		t.Fatalf("ProjectContactEmails: %v", err)
 	}
@@ -142,8 +145,8 @@ func TestDeactivatedMembershipReadersIntegration(t *testing.T) {
 		t.Errorf("recipients = %v, want %v (the DEACTIVATED contact left out)", emails, want)
 	}
 
-	stats := &projectStatsRepo{db: pool}
-	in, err := stats.SLAStatusInputs(ctx, dciProjectID)
+	stats := &projectStatsRepo{db: NewScoped(pool)}
+	in, err := stats.SLAStatusInputs(sysCtx, dciProjectID)
 	if err != nil {
 		t.Fatalf("SLAStatusInputs: %v", err)
 	}
@@ -153,7 +156,7 @@ func TestDeactivatedMembershipReadersIntegration(t *testing.T) {
 
 	// The same person re-registered on the project counts again.
 	exec(`UPDATE project_contact SET state = 'REGISTERED' WHERE id = $1`, dciGonePCID)
-	if in, err = stats.SLAStatusInputs(ctx, dciProjectID); err != nil {
+	if in, err = stats.SLAStatusInputs(sysCtx, dciProjectID); err != nil {
 		t.Fatalf("SLAStatusInputs: %v", err)
 	}
 	if !in.HasCustomerAdminContact {

@@ -21,28 +21,28 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 )
 
-// updateTagQuerier answers the by-sf_id UPDATE with rows, everything else
-// with one row, recording the statements.
+// updateTagQuerier answers the one-row UPDATE ... RETURNING with rows copies
+// (none: no row), everything else with one row, recording the statements.
 type updateTagQuerier struct {
 	partnerQuerier
 	update string
 	rows   int64
 }
 
-func (q *updateTagQuerier) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+func (q *updateTagQuerier) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	if sql == q.update {
 		q.statements = append(q.statements, sql)
 		q.args = append(q.args, args)
 		if q.rows == 0 {
-			return pgconn.NewCommandTag("UPDATE 0"), nil
+			return scanRow{err: pgx.ErrNoRows}
 		}
-		return pgconn.NewCommandTag("UPDATE 1"), nil
+		return scanRow{vals: []any{"row", q.rows}}
 	}
-	return q.partnerQuerier.Exec(ctx, sql, args...)
+	return q.partnerQuerier.QueryRow(ctx, sql, args...)
 }
 
 func TestWriteSfInvoice_UpdateElseInsertThenLedger(t *testing.T) {

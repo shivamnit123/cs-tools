@@ -22,7 +22,7 @@
 // csm-portal-backend main.go SPL route registration comment. Attachments
 // keep calling /cases/*: no entity-service storage/backfill path exists
 // yet, so nothing to merge onto.
-import { useQuery, type UseQueryResult } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, type UseMutationResult, type UseQueryResult } from "@tanstack/react-query";
 import { useBackendApi, BackendApiError } from "@api/backend/client";
 import type { CaseCommentDetails, CaseDetails, CaseDetailsWithCount } from "./caseTypes";
 
@@ -214,8 +214,35 @@ export function useGetCaseAttachments(caseId: string) {
   });
 }
 
-// usePostWorkNote (POST /cases/{id}/comments) was removed along with its
-// only caller, CaseDetailPage.tsx's add-work-note composer: no SPL-side
-// role grants canAddWorkNotes (permanently false, see PermissionProvider.tsx)
-// and the endpoint requires PermWrite regardless, so the form and this
-// mutation were unreachable dead code.
+interface CreateCaseCommentPayload {
+  type: "work_note";
+  content: string;
+}
+
+/**
+ * Post a work_note-type comment on a case via `POST /cases/{id}/comments` --
+ * the only comment type a `worknote_creator`-only caller may ever send (see
+ * PermCreateWorkNote's own doc comment on the backend; a full-PermWrite
+ * caller could post any type, but this hook is only ever used for work
+ * notes). On success, invalidates this case's comments list so the new note
+ * shows without a manual refetch -- the mutation's own response isn't typed
+ * further than that, since CaseBox's own query is the source of truth for
+ * display.
+ */
+export function usePostWorkNote(caseId: string): UseMutationResult<unknown, Error, string> {
+  const api = useBackendApi();
+  const queryClient = useQueryClient();
+
+  return useMutation<unknown, Error, string>({
+    mutationFn: async (content: string) => {
+      const payload: CreateCaseCommentPayload = { type: "work_note", content };
+      return api.post<CreateCaseCommentPayload, unknown>(
+        `/cases/${encodeURIComponent(caseId)}/comments`,
+        payload,
+      );
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["case-comments", caseId] });
+    },
+  });
+}

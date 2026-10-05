@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/repository"
 )
 
 type fakeReingester struct {
@@ -47,10 +48,10 @@ func (f *fakeReingester) called() []string {
 	return append([]string{}, f.calls...)
 }
 
-func failedDatabaseStep(membershipSfID, lastError string, attempts int) domain.OnboardingStep {
+func failedDatabaseStep(membershipSfID, lastError string, retries int) domain.OnboardingStep {
 	return domain.OnboardingStep{
 		MembershipSfID: membershipSfID, Step: domain.OnboardingStepDatabase, Status: domain.OnboardingStepFailed,
-		LastError: sampleStr(lastError), AttemptCount: attempts, EventType: domain.SalesforceEventCreated,
+		LastError: sampleStr(lastError), AttemptCount: retries + 1, RetryCount: retries, EventType: domain.SalesforceEventCreated,
 		EventModifiedOn: time.Now().Add(-time.Hour), UpdatedOn: time.Now().Add(-time.Hour),
 	}
 }
@@ -65,7 +66,7 @@ func newRetryWorker(steps *fakeStepRepo, re *fakeReingester, states *fakeIngestS
 
 // TestRetryWorker_ReRunsOnlyMissingParentFailures: of the FAILED DATABASE
 // steps, only the ones whose error is a missing project / account and that
-// are under the attempt cap are re-run; other failures are someone else's
+// are under the retry cap are re-run; other failures are someone else's
 // problem and SUCCEEDED rows are not touched.
 func TestRetryWorker_ReRunsOnlyMissingParentFailures(t *testing.T) {
 	steps := &fakeStepRepo{existing: []domain.OnboardingStep{
@@ -105,13 +106,13 @@ func TestRetryWorker_NothingWiredIsNoOp(t *testing.T) {
 }
 
 // TestRetryWorker_Ledger: FAILED ledger rows go to the retrier registered for
-// their entity, under the same missing-parent and attempt-cap filter; an
+// their entity, under the same missing-parent and retry-cap filter; an
 // entity with no retrier (nothing records into the ledger yet) is skipped.
 func TestRetryWorker_Ledger(t *testing.T) {
 	states := &fakeIngestStateRepo{failed: []domain.SalesforceIngestState{
 		{Entity: "widget", SfID: "w-1", Status: domain.SalesforceIngestFailed, LastError: sampleStr(`account not found for sfId "0011"`), AttemptCount: 2},
 		{Entity: "widget", SfID: "w-other", Status: domain.SalesforceIngestFailed, LastError: sampleStr("customer is missing Name"), AttemptCount: 1},
-		{Entity: "widget", SfID: "w-capped", Status: domain.SalesforceIngestFailed, LastError: sampleStr("project not found"), AttemptCount: salesforceIngestRetryMaxAttempts},
+		{Entity: "widget", SfID: "w-capped", Status: domain.SalesforceIngestFailed, LastError: sampleStr("project not found"), RetryCount: salesforceIngestRetryMaxAttempts},
 		{Entity: domain.SalesforceIngestEntityAccount, SfID: "no-retrier", Status: domain.SalesforceIngestFailed, LastError: sampleStr("project not found"), AttemptCount: 1},
 	}}
 	var retried []string
@@ -190,11 +191,9 @@ func TestRetryMembershipIngest_ReRunsAsUpdated(t *testing.T) {
 	}
 }
 
-// TestRetryWorker_FailedReRunCountsTheAttempt: a re-run that fails before
-// the ingest records anything (the Sales Entity fetch) still counts, keyed by
-// the updated_on the job read, so the step reaches the cap and waits an
-// interval instead of being re-run on every tick. A re-run that succeeds
-// records nothing extra.
+// TestRetryWorker_FailedReRunCountsTheAttempt: every failed re-run counts
+// toward the job's cap, also one that failed before the ingest recorded
+// anything (the Sales Entity fetch); a re-run that succeeds records nothing.
 func TestRetryWorker_FailedReRunCountsTheAttempt(t *testing.T) {
 	failing := failedDatabaseStep("m-fetch-fails", "project not found", 3)
 	failing.ID = "step-1"
@@ -206,7 +205,7 @@ func TestRetryWorker_FailedReRunCountsTheAttempt(t *testing.T) {
 
 	w.RunOnce(context.Background())
 
-	if want := []string{"step-1@" + failing.UpdatedOn.Format(time.RFC3339)}; !reflect.DeepEqual(steps.retryAttempts, want) {
+	if want := []string{"step-1"}; !reflect.DeepEqual(steps.retryAttempts, want) {
 		t.Errorf("recorded attempts = %v, want %v", steps.retryAttempts, want)
 	}
 }
@@ -222,7 +221,7 @@ func TestRetryWorker_LedgerFailedReRunCountsTheAttempt(t *testing.T) {
 
 	w.RunOnce(context.Background())
 
-	if want := []string{"widget/w-1@" + at.Format(time.RFC3339)}; !reflect.DeepEqual(states.retryAttempts, want) {
+	if want := []string{"widget/w-1"}; !reflect.DeepEqual(states.retryAttempts, want) {
 		t.Errorf("recorded attempts = %v, want %v", states.retryAttempts, want)
 	}
 }
@@ -269,5 +268,72 @@ func TestRetryWorker_IneligibleBacklogDoesNotStarve(t *testing.T) {
 
 	if !reflect.DeepEqual(retried, []string{"w-new"}) {
 		t.Errorf("retried = %v, want the eligible row despite the backlog", retried)
+	}
+}
+
+// TestRetryWorker_RedeliveriesDoNotUseTheBudget: the cap is on the job's own
+// retry_count, so a row whose attempt_count was driven past it by Service
+// Bus redeliveries is still re-run.
+func TestRetryWorker_RedeliveriesDoNotUseTheBudget(t *testing.T) {
+	step := failedDatabaseStep("m-redelivered", `project not found for key "ACME" / sfId "a0p1"`, 0)
+	step.AttemptCount = salesforceIngestRetryMaxAttempts + 1
+	steps := &fakeStepRepo{existing: []domain.OnboardingStep{step}}
+	states := &fakeIngestStateRepo{failed: []domain.SalesforceIngestState{
+		{Entity: "widget", SfID: "w-1", Status: domain.SalesforceIngestFailed, LastError: sampleStr(`account not found for sfId "0011"`),
+			AttemptCount: salesforceIngestRetryMaxAttempts + 1, RetryCount: salesforceIngestRetryMaxAttempts - 1},
+	}}
+	re := &fakeReingester{}
+	var retried []string
+	w := newRetryWorker(steps, re, states)
+	w.EntityRetriers["widget"] = func(_ context.Context, id string) error { retried = append(retried, id); return nil }
+
+	w.RunOnce(context.Background())
+
+	if !reflect.DeepEqual(re.called(), []string{"m-redelivered"}) || !reflect.DeepEqual(retried, []string{"w-1"}) {
+		t.Errorf("re-ran memberships %v and ledger rows %v, want both despite attempt_count past the cap", re.called(), retried)
+	}
+}
+
+// TestParentIngest_RequeuesChildren: a successful project or account ingest
+// resets the retry budget of the memberships and ledger rows waiting for it.
+func TestParentIngest_RequeuesChildren(t *testing.T) {
+	t.Run("project", func(t *testing.T) {
+		states, steps := &fakeIngestStateRepo{}, &fakeStepRepo{}
+		svc := newProjectService(&fakeProjectSalesEntity{project: sampleProject()}, newProjectRepo(nil), states, true)
+		svc.membership = &MembershipIngest{Steps: steps}
+		if err := svc.RetryProjectIngest(context.Background(), testProjectSfID); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := []repository.MissingParent{{Kind: repository.MissingParentProject, SfID: testProjectSfID, Key: testProjectKey}}
+		if !reflect.DeepEqual(states.requeued, want) || !reflect.DeepEqual(steps.requeued, want) {
+			t.Errorf("requeued ledger %v, steps %v; want %v", states.requeued, steps.requeued, want)
+		}
+	})
+	t.Run("account", func(t *testing.T) {
+		states := &fakeIngestStateRepo{}
+		cust := sampleCustomer()
+		cust.ID = testAccountID
+		svc := NewSalesforceEventService(&stubSalesforceAccountRepo{states: states}, &stubSalesEntityClient{customer: cust}, SalesforceIngestSupport{States: states}).(*salesforceEventService)
+		if err := svc.upsertAccount(context.Background(), testAccountID, domain.SalesforceEventUpdated, true); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := []repository.MissingParent{{Kind: repository.MissingParentAccount, SfID: testAccountID}}
+		if !reflect.DeepEqual(states.requeued, want) {
+			t.Errorf("requeued %v, want %v", states.requeued, want)
+		}
+	})
+}
+
+// TestParentIngest_FailureRequeuesNothing: a parent that failed to land must
+// not hand its children a fresh budget.
+func TestParentIngest_FailureRequeuesNothing(t *testing.T) {
+	states := &fakeIngestStateRepo{}
+	repo := &stubSalesforceAccountRepo{states: states, upsertErr: errors.New("db down")}
+	svc := NewSalesforceEventService(repo, &stubSalesEntityClient{customer: sampleCustomer()}, SalesforceIngestSupport{States: states}).(*salesforceEventService)
+	if err := svc.upsertAccount(context.Background(), testAccountID, domain.SalesforceEventUpdated, true); err == nil {
+		t.Fatal("want the upsert error")
+	}
+	if len(states.requeued) != 0 {
+		t.Errorf("requeued %v after a failed ingest, want nothing", states.requeued)
 	}
 }

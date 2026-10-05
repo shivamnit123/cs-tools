@@ -18,12 +18,14 @@
 // features/spl/cases/pages/CaseDetailPage.tsx — rewritten against
 // useGetCase (React Query) instead of useSplApi's useGetApi. No SplShell
 // wrapper (RouteGuard in App.tsx already gates the route tree and mounts
-// PermissionProvider). The add-work-note composer the source app had here
-// is gone: no SPL-side role ever grants canAddWorkNotes (permanently false,
-// see PermissionProvider.tsx) and the backend endpoint it posted to
-// requires PermWrite regardless, so the form and its POST were unreachable
-// dead code.
-import { type ReactNode } from "react";
+// PermissionProvider). The add-work-note composer below is a rebuild, not a
+// restoration of the source app's own Quill-based one: that version posted
+// to a dedicated /worknote route this backend no longer has (see
+// useCases.ts's usePostWorkNote), and reused the app's own rich-text Editor
+// instead of Quill for visual consistency with the rest of this codebase
+// (e.g. CsmCaseCommentInput). It only existed as dead code here because no
+// SPL-side role used to grant canAddWorkNotes -- see PermissionProvider.tsx.
+import { useRef, useState, type ReactNode } from "react";
 import { useParams } from "react-router";
 import DOMPurify from "dompurify";
 import {
@@ -39,15 +41,23 @@ import {
   Tooltip,
   Typography,
 } from "@wso2/oxygen-ui";
-import { UserIcon, CalendarDaysIcon, PackageIcon, ListTodoIcon, ServerIcon, ListChecksIcon, FilePlusIcon } from "@wso2/oxygen-ui-icons-react";
+import { UserIcon, CalendarDaysIcon, PackageIcon, ListTodoIcon, ServerIcon, ListChecksIcon, FilePlusIcon, SendIcon } from "@wso2/oxygen-ui-icons-react";
+import Editor from "@components/rich-text-editor/Editor";
 import PathView from "../components/PathView";
 import { CaseBox } from "../components/CaseBox";
 import { AttachmentBox } from "../components/AttachmentBox";
 import { useCaseNotice } from "../utils/useCaseNotice";
-import { useGetCase } from "../api/useCases";
+import { useGetCase, usePostWorkNote } from "../api/useCases";
 import { CASE_CLOSED_STATE } from "../api/caseTypes";
 import { ErrorPanel, LinearLoadingPanel, NotFoundPanel } from "../components/StatePanels";
 import { BackendApiError } from "@api/backend/client";
+import { usePermissions } from "@features/spl/api/permissionsContext";
+
+/** Strip tags + collapse whitespace to decide if the editor is effectively empty -- same check CsmCaseCommentInput uses. */
+function isEmptyHtml(html: string): boolean {
+  const text = html.replace(/<[^>]*>/g, "").replace(/&nbsp;/g, " ").trim();
+  return text.length === 0;
+}
 
 const PRIORITY_COLOR: Record<string, string> = {
   "Critical (P1)": "#bf2600",
@@ -66,11 +76,47 @@ export default function CaseDetailPage() {
   const { caseId: rawCaseId } = useParams<{ caseId: string }>();
   const caseId = rawCaseId ? DOMPurify.sanitize(rawCaseId) : "";
 
-  const { notice, clear } = useCaseNotice();
+  const { notice, showSuccess, showWarning, showError, clear } = useCaseNotice();
+  const { canAddWorkNotes } = usePermissions();
+  const postWorkNote = usePostWorkNote(caseId);
+  // postWorkNote.isPending only reflects in a render once TanStack Query's
+  // notifyManager flushes it via setTimeout(0) -- not synchronously with the
+  // click that triggered it (unlike plain useState, which React 18 flushes
+  // before the next discrete event). A second rapid click on Post can still
+  // see isPending === false and double-submit. This ref is checked/set
+  // synchronously, so it closes that gap regardless of render timing.
+  const workNoteSubmissionInFlight = useRef(false);
+
+  const [composerOpen, setComposerOpen] = useState(false);
+  const [worknoteHtml, setWorknoteHtml] = useState("");
+  const [resetTrigger, setResetTrigger] = useState(0);
 
   const { data, isLoading, error } = useGetCase(caseId);
 
   const isStateClosed = data?.state === CASE_CLOSED_STATE;
+
+  const submitWorkNote = () => {
+    if (workNoteSubmissionInFlight.current) return;
+    if (isEmptyHtml(worknoteHtml)) {
+      showWarning("A work note cannot be empty.");
+      return;
+    }
+    const sanitized = DOMPurify.sanitize(worknoteHtml);
+    workNoteSubmissionInFlight.current = true;
+    postWorkNote.mutate(sanitized, {
+      onSuccess: () => {
+        workNoteSubmissionInFlight.current = false;
+        showSuccess("Work note added successfully.");
+        setWorknoteHtml("");
+        setResetTrigger((t) => t + 1);
+        setComposerOpen(false);
+      },
+      onError: () => {
+        workNoteSubmissionInFlight.current = false;
+        showError("Failed to add work note. Please try again.");
+      },
+    });
+  };
 
   if (isLoading) return <LinearLoadingPanel />;
   if (error) return error instanceof BackendApiError && error.status === 404 ? <NotFoundPanel /> : <ErrorPanel />;
@@ -138,12 +184,10 @@ export default function CaseDetailPage() {
                 </Button>
               </span>
             </Tooltip>
-          ) : (
-            // Backend enforcement (PermWrite, cs_engineer/admin only) has no
-            // SPL-side role that grants it -- see PermissionProvider.tsx's
-            // canAddWorkNotes, permanently false. This button stays
-            // permanently disabled until a role exists that can actually
-            // reach POST /cases/{id}/comments.
+          ) : !canAddWorkNotes ? (
+            // Mirrors the backend's own narrowing (PermCreateWorkNote):
+            // full write (cs_engineer/admin) or worknote_creator can reach
+            // this; every other role sees why this stays disabled.
             <Tooltip title="You don't have the permission">
               <span>
                 <Button variant="contained" disabled startIcon={<FilePlusIcon size={16} />}>
@@ -151,6 +195,49 @@ export default function CaseDetailPage() {
                 </Button>
               </span>
             </Tooltip>
+          ) : composerOpen ? (
+            <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
+              <Typography variant="caption" color="text.secondary">
+                Internal work note — not visible to the customer.
+              </Typography>
+              <Editor
+                value={worknoteHtml}
+                onChange={setWorknoteHtml}
+                resetTrigger={resetTrigger}
+                disabled={postWorkNote.isPending}
+                placeholder="Add a work note…"
+                minHeight={120}
+                showToolbar={false}
+              />
+              <Box sx={{ display: "flex", justifyContent: "flex-end", gap: 1 }}>
+                <Button
+                  onClick={() => {
+                    setComposerOpen(false);
+                    setWorknoteHtml("");
+                    setResetTrigger((t) => t + 1);
+                  }}
+                  disabled={postWorkNote.isPending}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  variant="contained"
+                  onClick={submitWorkNote}
+                  disabled={postWorkNote.isPending}
+                  startIcon={<SendIcon size={16} />}
+                >
+                  {postWorkNote.isPending ? "Posting…" : "Post"}
+                </Button>
+              </Box>
+            </Box>
+          ) : (
+            <Button
+              variant="contained"
+              startIcon={<FilePlusIcon size={16} />}
+              onClick={() => setComposerOpen(true)}
+            >
+              New Work Note
+            </Button>
           )}
 
           <Box sx={{ mt: 2 }}>

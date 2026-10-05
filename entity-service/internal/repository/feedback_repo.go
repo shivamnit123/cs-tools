@@ -22,7 +22,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 )
 
@@ -71,11 +70,13 @@ type FeedbackRepository interface {
 }
 
 type feedbackRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
-// NewFeedbackRepository constructs a FeedbackRepository backed by the given connection pool.
-func NewFeedbackRepository(db *pgxpool.Pool) FeedbackRepository {
+// NewFeedbackRepository constructs a FeedbackRepository backed by the given
+// Scoped wrapper: every query joins work_item, which is RLS-protected, so it
+// must run under the caller's identity (see Scoped).
+func NewFeedbackRepository(db *Scoped) FeedbackRepository {
 	return &feedbackRepo{db: db}
 }
 

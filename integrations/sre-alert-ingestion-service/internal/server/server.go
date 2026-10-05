@@ -208,6 +208,9 @@ func (s *Server) vendorRoute(w http.ResponseWriter, r *http.Request) {
 	// than up to server.max_body_bytes of allocation plus an integration_users lookup.
 	// Every credential position is in the headers, so nothing here needs the body.
 	if err := s.auth.Authenticate(r, vendor); err != nil {
+		// GCP only sends webhook credentials after a 401 carrying this header, and
+		// AWS SNS sends a subscription confirmation's first request without any.
+		w.Header().Set("WWW-Authenticate", `Basic realm="sre_alert_api", charset="UTF-8"`)
 		writeJSON(w, http.StatusUnauthorized, rejected("unauthorized"))
 		return
 	}

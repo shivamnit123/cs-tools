@@ -43,21 +43,21 @@ type entitySearchProductsResponse struct {
 	Total    int             `json:"total"`
 }
 
-// postgresSplLookupsClient implements splLookupsClient: GetProductList reads
+// postgresLookupsClient implements lookupsClient: GetProductList reads
 // from entity-service (Postgres) — entity-service's productService already
 // exists natively. GetABTTeamList is NOT migrated: it comes off ServiceNow's
 // sys_user_group table, and entity-service has no team/group domain object
 // yet, so it still delegates to the wrapped ServiceNow client.
-type postgresSplLookupsClient struct {
+type postgresLookupsClient struct {
 	entity entityProductsClient
-	sn     splLookupsClient
+	sn     lookupsClient
 }
 
-// NewPostgresSplLookupsClient builds a postgresSplLookupsClient. entity is
+// NewPostgresLookupsClient builds a postgresLookupsClient. entity is
 // the same *entity.CustomerEntityClient every other CS Portal handler uses;
 // sn is the existing ServiceNow client, kept only for ABT team names.
-func NewPostgresSplLookupsClient(entity entityProductsClient, sn splLookupsClient) *postgresSplLookupsClient {
-	return &postgresSplLookupsClient{entity: entity, sn: sn}
+func NewPostgresLookupsClient(entity entityProductsClient, sn lookupsClient) *postgresLookupsClient {
+	return &postgresLookupsClient{entity: entity, sn: sn}
 }
 
 // entityProductsPageLimit is entity-service's own hard cap (confirmed
@@ -73,8 +73,8 @@ const (
 	productListPageCap      = 25
 )
 
-// GetProductList implements splLookupsClient.
-func (c *postgresSplLookupsClient) GetProductList(ctx context.Context) ([]string, error) {
+// GetProductList implements lookupsClient.
+func (c *postgresLookupsClient) GetProductList(ctx context.Context) ([]string, error) {
 	seen := make(map[string]bool)
 	products := make([]string, 0, entityProductsPageLimit)
 
@@ -114,8 +114,8 @@ func (c *postgresSplLookupsClient) GetProductList(ctx context.Context) ([]string
 	return products, nil
 }
 
-// GetABTTeamList implements splLookupsClient by delegating to the wrapped
+// GetABTTeamList implements lookupsClient by delegating to the wrapped
 // ServiceNow client — see this type's own doc comment for why.
-func (c *postgresSplLookupsClient) GetABTTeamList(ctx context.Context) ([]string, error) {
+func (c *postgresLookupsClient) GetABTTeamList(ctx context.Context) ([]string, error) {
 	return c.sn.GetABTTeamList(ctx)
 }

@@ -54,9 +54,7 @@ type PollConfig struct {
 	ReadConcurrency int `toml:"read_concurrency"`
 	// MaxWindow caps how many alert ids a single poll cycle processes at once, bounding memory usage under large alert bursts.
 	MaxWindow int `toml:"max_window"`
-	// GapTimeout is how long an alert id may stay missing, measured from when the current leader
-	// first saw it missing, before it's skipped and logged loudly. Every missing id in the window
-	// ages at once, so a whole gap is skipped together after one GapTimeout.
+	// GapTimeout is how long an alert id may stay missing before it's skipped and logged loudly; a whole gap is skipped together after one GapTimeout.
 	GapTimeout Duration `toml:"gap_timeout"`
 }
 
@@ -87,8 +85,7 @@ type NotifyConfig struct {
 	MaxCSMAttempts int `toml:"max_csm_attempts"`
 	// ServiceCacheTTL bounds how long a label->CMDB-service-id resolution is reused before a fresh live /services/search call.
 	ServiceCacheTTL Duration `toml:"service_cache_ttl"`
-	// StateCheckInterval throttles how often a confirmed incident's status is re-checked against CSM;
-	// without it, a flapping alert costs one CSM search per duplicate during a storm.
+	// StateCheckInterval throttles how often a confirmed incident's status is re-checked against CSM, else a flapping alert costs one search per duplicate.
 	StateCheckInterval Duration `toml:"state_check_interval"`
 	// CSMRetryBaseDelay is the wait before the first RetrySweep-driven CSM retry after a failed attempt.
 	CSMRetryBaseDelay Duration `toml:"csm_retry_base_delay"`
@@ -96,8 +93,8 @@ type NotifyConfig struct {
 	CSMRetryMultiplier float64 `toml:"csm_retry_multiplier"`
 	// CSMRetryMaxDelay caps how long the exponential CSM retry wait can grow to.
 	CSMRetryMaxDelay Duration `toml:"csm_retry_max_delay"`
-	// Gates CreateIncidentRequest.Environment; off by default since the live connector 400s on it (verified 2026-09-28).
-	SendEnvironmentField bool `toml:"send_environment_field"`
+	// ChatThreadingEnabled threads every Chat fallback message for the same alert fingerprint into one Google Chat thread, instead of posting a new top-level message each time the incident recurs.
+	ChatThreadingEnabled bool `toml:"chat_threading_enabled"`
 }
 
 // ServerConfig tunes how long the HTTP server waits for in-flight requests to drain during a graceful shutdown before forcing the process to exit.
@@ -123,8 +120,7 @@ func (d Duration) Duration() time.Duration {
 	return time.Duration(d)
 }
 
-// defaults holds every tunable's production value, matching config.toml. Used as-is when
-// config.toml is absent, and as the base a present config.toml overrides field by field.
+// defaults holds every tunable's production value, used as-is when config.toml is absent, or as the base a present config.toml overrides field by field.
 func defaults() Config {
 	return Config{
 		Poll: PollConfig{
@@ -155,7 +151,7 @@ func defaults() Config {
 			CSMRetryBaseDelay:    Duration(30 * time.Second),
 			CSMRetryMultiplier:   3,
 			CSMRetryMaxDelay:     Duration(time.Hour),
-			SendEnvironmentField: false,
+			ChatThreadingEnabled: true,
 		},
 		Server: ServerConfig{
 			ShutdownGrace: Duration(15 * time.Second),

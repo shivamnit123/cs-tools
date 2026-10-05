@@ -341,7 +341,7 @@ type snSysIDResultList struct {
 // already-active escalation for that account. Mirrors Ballerina
 // operations:escalateCase (its addEscalationGroups authorization check is
 // the caller's responsibility — see handler/auth.go's
-// requireSPLPermission). Returns ErrEscalationConflict when caseNumber is
+// requireViewerPermission). Returns ErrEscalationConflict when caseNumber is
 // already linked to the account's active escalation.
 //
 // The active-escalation read and the create-new-escalation write below are

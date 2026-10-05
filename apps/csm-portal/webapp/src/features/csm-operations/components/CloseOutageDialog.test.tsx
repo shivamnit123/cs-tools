@@ -41,7 +41,7 @@ describe("CloseOutageDialog — UTC end time", () => {
       <CloseOutageDialog begin="2026-03-01 10:00:00" isSaving={false} onClose={vi.fn()} onConfirm={onConfirm} />,
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Close outage" }));
+    fireEvent.click(screen.getByRole("button", { name: "End outage" }));
 
     expect(onConfirm).toHaveBeenCalledWith("2026-03-01 12:00:00");
   });
@@ -55,6 +55,6 @@ describe("CloseOutageDialog — UTC end time", () => {
     );
 
     expect(screen.getByText(/must not be before the outage's begin time/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Close outage" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "End outage" })).toBeDisabled();
   });
 });

@@ -180,6 +180,76 @@ func (c *Client) UpdateUserPhone(ctx context.Context, userID, mobile string) (*s
 	return extractMobilePhone(updatedUser), nil
 }
 
+// GetRole fetches the role with the given Asgardeo role ID and returns its
+// member users. roleID is deployment configuration set once, out of band
+// (e.g. TIMECARD_APPROVER_ASGARDEO_ROLE_ID) -- not looked up by name on every
+// call, since the SCIM operations service's role endpoint is a plain
+// get-by-id, not a search.
+func (c *Client) GetRole(ctx context.Context, roleID string) ([]RoleMember, error) {
+	path := "/organizations/" + org + "/roles/" + url.PathEscape(roleID)
+	raw, err := c.do(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var role scimRole
+	if err := json.Unmarshal(raw, &role); err != nil {
+		return nil, fmt.Errorf("scim: decode role response: %w", err)
+	}
+
+	members := make([]RoleMember, 0, len(role.Users))
+	for _, u := range role.Users {
+		members = append(members, RoleMember{ID: u.Value, Email: emailFromDisplay(u.Display)})
+	}
+	return members, nil
+}
+
+// AddRoleMembers grants the given role to one or more users, by email, via
+// the SCIM operations service's POST /organizations/internal/roles/{id}/users
+// (see digiops-infra's scim-operations-service, modules/scim/scim.bal's
+// addRoleMembers) -- the service resolves each email to its own user ID on
+// the identity provider and performs the real role-membership update, so
+// this client never handles user IDs directly. roleID is deployment
+// configuration, resolved once at startup (see
+// directory.ParseRoleIDs/handler.ResolveGrantableRoles), the same "already
+// know the ID, never looked up by name" posture GetRole documents.
+//
+// An email the SCIM service couldn't resolve to a real user comes back in
+// the response's own failedUsers list rather than as a transport error --
+// surfaced here as an error naming the failed email(s), so a caller
+// (CreateUser) can log a role grant that silently didn't take.
+func (c *Client) AddRoleMembers(ctx context.Context, roleID string, emails []string) error {
+	reqBody, err := json.Marshal(scimAddRoleMembersRequest{Emails: emails})
+	if err != nil {
+		return fmt.Errorf("scim: encode add-role-members request: %w", err)
+	}
+
+	path := "/organizations/" + org + "/roles/" + url.PathEscape(roleID) + "/users"
+	raw, err := c.do(ctx, http.MethodPost, path, reqBody)
+	if err != nil {
+		return err
+	}
+
+	var result scimAddRoleMembersResponse
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return fmt.Errorf("scim: decode add-role-members response: %w", err)
+	}
+	if len(result.FailedUsers) > 0 {
+		return fmt.Errorf("scim: role %s did not accept these emails: %s", roleID, strings.Join(result.FailedUsers, ", "))
+	}
+	return nil
+}
+
+// emailFromDisplay strips a SCIM role member's "<domain>/" prefix (e.g.
+// "DEFAULT/jane@wso2.com" -> "jane@wso2.com"). Falls back to the raw value
+// when it carries no "/", rather than returning an empty string.
+func emailFromDisplay(display string) string {
+	if idx := strings.Index(display, "/"); idx >= 0 && idx+1 < len(display) {
+		return display[idx+1:]
+	}
+	return display
+}
+
 // extractMobilePhone returns the first phone number of type "mobile", or nil.
 // Mirrors processPhoneNumber in the Ballerina SCIM utils.
 func extractMobilePhone(u scimUser) *string {

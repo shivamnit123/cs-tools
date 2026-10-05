@@ -35,6 +35,15 @@ func (c *CustomerEntityClient) SearchCases(ctx context.Context, body []byte) ([]
 	return c.do(ctx, http.MethodPost, "/cases/search", body)
 }
 
+// SearchAnnouncementRegistryCases calls POST /announcements/registry/cases on
+// the entity service: every announcement case matching the filters in one
+// response (the registry groups the whole set, so paging /cases/search 50 rows
+// at a time cost about 100 slow requests). Entity services that predate the
+// route answer 404; callers fall back to paging /cases/search.
+func (c *CustomerEntityClient) SearchAnnouncementRegistryCases(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/announcements/registry/cases", body)
+}
+
 // AggregateCases calls POST /cases/aggregate on the entity service: a
 // server-side aggregation of cases by a single field (e.g. account, state),
 // capped to the top maxGroups buckets with the remainder folded into

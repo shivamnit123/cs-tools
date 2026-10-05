@@ -295,20 +295,20 @@ func TestSearchScheduleAbsences(t *testing.T) {
 	})
 }
 
-type mockSplScheduleClient struct {
+type mockViewerScheduleClient struct {
 	schedule                                              servicenow.ABTTeamScheduleData
 	err                                                   error
 	gotFrom, gotDuration, gotTeamID, gotEventType, gotURL string
 }
 
-func (m *mockSplScheduleClient) GetABTTeamSchedule(ctx context.Context, from, duration, teamID, eventType, teamScheduleURL string) (servicenow.ABTTeamScheduleData, error) {
+func (m *mockViewerScheduleClient) GetABTTeamSchedule(ctx context.Context, from, duration, teamID, eventType, teamScheduleURL string) (servicenow.ABTTeamScheduleData, error) {
 	m.gotFrom, m.gotDuration, m.gotTeamID, m.gotEventType, m.gotURL = from, duration, teamID, eventType, teamScheduleURL
 	return m.schedule, m.err
 }
 
 func TestGetABTTeamSchedule_PassesParamsAndConfiguredURL(t *testing.T) {
-	mock := &mockSplScheduleClient{schedule: servicenow.ABTTeamScheduleData{SnURL: "https://sn.example.com"}}
-	h := NewSplScheduleHandler(mock, splAccessGuard, "https://sn.example.com")
+	mock := &mockViewerScheduleClient{schedule: servicenow.ABTTeamScheduleData{SnURL: "https://sn.example.com"}}
+	h := NewViewerScheduleHandler(mock, viewerAccessGuard, "https://sn.example.com")
 	req := withUser(httptest.NewRequest(http.MethodGet, "/spl/abt-team-schedule?from=2024-01-01&duration=7d&teamId=team-1&eventType=oncall", nil))
 	w := httptest.NewRecorder()
 
@@ -321,8 +321,8 @@ func TestGetABTTeamSchedule_PassesParamsAndConfiguredURL(t *testing.T) {
 }
 
 func TestGetABTTeamSchedule_AllParamsOptional(t *testing.T) {
-	mock := &mockSplScheduleClient{}
-	h := NewSplScheduleHandler(mock, splAccessGuard, "https://sn.example.com")
+	mock := &mockViewerScheduleClient{}
+	h := NewViewerScheduleHandler(mock, viewerAccessGuard, "https://sn.example.com")
 	req := withUser(httptest.NewRequest(http.MethodGet, "/spl/abt-team-schedule", nil))
 	w := httptest.NewRecorder()
 
@@ -332,7 +332,7 @@ func TestGetABTTeamSchedule_AllParamsOptional(t *testing.T) {
 }
 
 func TestGetABTTeamSchedule_RejectsUnsafeTeamID(t *testing.T) {
-	h := NewSplScheduleHandler(&mockSplScheduleClient{}, splAccessGuard, "")
+	h := NewViewerScheduleHandler(&mockViewerScheduleClient{}, viewerAccessGuard, "")
 	req := withUser(httptest.NewRequest(http.MethodGet, "/spl/abt-team-schedule?teamId=team%5E1", nil))
 	w := httptest.NewRecorder()
 
@@ -342,9 +342,9 @@ func TestGetABTTeamSchedule_RejectsUnsafeTeamID(t *testing.T) {
 }
 
 func TestGetABTTeamSchedule_RejectsMissingSPLAccess(t *testing.T) {
-	h := NewSplScheduleHandler(&mockSplScheduleClient{}, splAccessGuard, "")
+	h := NewViewerScheduleHandler(&mockViewerScheduleClient{}, viewerAccessGuard, "")
 	req := httptest.NewRequest(http.MethodGet, "/spl/abt-team-schedule", nil)
-	// Authenticated but holds no role granting PermSPLAccess.
+	// Authenticated but holds no role granting PermViewerAccess.
 	req = req.WithContext(middleware.WithUserInfo(req.Context(), &middleware.UserInfo{Email: "nobody@example.com", UserID: "u-nobody"}))
 	w := httptest.NewRecorder()
 

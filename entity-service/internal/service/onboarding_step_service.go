@@ -58,7 +58,7 @@ type onboardingStepService struct {
 }
 
 // NewOnboardingStepService constructs an OnboardingStepService. access gates
-// every method to internal callers (AUTH_INTERNAL_CLIENT_IDS): onboarding
+// every method to internal callers (an Unrestricted AccessScope): onboarding
 // steps carry other people's e-mail addresses and Salesforce Ids, and an
 // external portal user has no business reading or writing them.
 func NewOnboardingStepService(repo repository.OnboardingStepRepository, access AccessService) OnboardingStepService {
@@ -68,14 +68,7 @@ func NewOnboardingStepService(repo repository.OnboardingStepRepository, access A
 // requireInternalCaller rejects anyone whose AccessScope is not Unrestricted,
 // i.e. every caller that is not an allow-listed internal service.
 func (s *onboardingStepService) requireInternalCaller(ctx context.Context) error {
-	scope, err := s.access.ResolveScope(ctx)
-	if err != nil {
-		return err
-	}
-	if !scope.Unrestricted {
-		return &apierror.ForbiddenError{Msg: "onboarding steps are only available to internal services"}
-	}
-	return nil
+	return RequireInternalCaller(ctx, s.access, "onboarding steps are only available to internal services")
 }
 
 // Upsert implements OnboardingStepService.

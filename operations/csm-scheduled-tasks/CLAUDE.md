@@ -168,6 +168,80 @@ query run) if empty. Shares `internal/entitycases.Client` and the row-rendering 
 (`internal/notify/templates/open_cases_report.html`) per this component's own "Per-task report
 emails" below.
 
+## Availability recalculation
+
+Recomputes every committed service offering's uptime and rewrites
+`service_availability`. Task name **`availability_recalculation`**, default
+schedule `0 3 * * *`. The Go port of ServiceNow's `Calculate Availability`
+job, which has run nightly since 2022-11-01 and whose 212,904 rows the Cloud
+Status Dashboard reads on every page load.
+
+**Off unless `AVAILABILITY_RECALC_ENABLED=true`** (default false): neither the client nor the
+task is created otherwise. ServiceNow's "Calculate Availability" job keeps writing the same
+table through csm-sync-service, and `service_availability` has no unique constraint on a
+period's natural key, so both running can leave two rows for one period. Turn it on in the
+same change that switches ServiceNow's job off (the `CLOUD_STATUS_ENABLED` pattern).
+
+*** THIS IS THE PRODUCER FOR THREE ALREADY-PORTED ENDPOINTS. ***
+`/cloud-status/monitors`, `/availabilities` and `/availability-history` all
+read that table and were ported long before anything wrote it: the rows come
+from csm-sync-service mirroring ServiceNow's output. At cutover the
+dashboard's uptime figures would simply stop advancing, with no error
+anywhere — reading a table nobody updates looks exactly like reading a table
+where nothing happened. This task is what takes over.
+
+**The arithmetic is in entity-service, not here.** This task is a trigger.
+The sweep reads every outage for ~146 subjects and writes up to eight period
+rows each into a table the dashboard is concurrently reading; doing that over
+HTTP would pull the whole working set across the wire every night, and this
+component holds no database credentials. Same split as `outage_communication`
+and `cloud_status`.
+
+*** IT PORTS v2, AND THE INSTANCE RUNS v1. *** `com.snc.availability.v2` is
+false on wso2sndev, so every stored row was written by the legacy calculator.
+The two genuinely disagree — v1's "last 30 days" spans 29 under PRB1304264,
+v2's spans 30 — so **the existing table is not a baseline to diff against.**
+
+**It emits `LAST_90_DAYS`, which v2 does not define.** v2 registers seven
+period types and that is not one of them; v1 writes it. But `/monitors` and
+`/availabilities` both query it and both render a "Last 90 days" figure, so
+shipping pure v2 would delete a number from the customer-facing status page
+silently. `LAST_1_DAYS` is the mirror image — v1 writes it, nothing reads it,
+not emitted.
+
+**A partial run fails the task.** entity-service keeps going when one subject
+fails and still returns 200, so the handler checks the `failed` count and the
+subject count: a sweep that skipped offerings, or found none at all, is an
+alert rather than a quiet success. Zero subjects is what an unmapped
+`service_offering_commitment` looks like.
+
+**It is inert until digiops-cs mirrors `service_offering_commitment`.** That
+table is the join saying which offering answers to which commitment, and the
+calculator builds its entire subject list from it. Everything else in the
+family is already mirrored (`service_availability` migration 0084,
+`service_commitment`, `outage_affected_ci`, `schedule`, `schedule_span`).
+
+**Registering it is a paired change with disabling ServiceNow's `Calculate
+Availability` job.** Two writers on one table, keyed differently — the sync
+on the mirrored `sys_id`, this on the natural key — would double every
+subject's rows.
+
+Timeout is five minutes, not the sixty seconds the neighbouring sweeps use.
+Volume is the normal case here, and cutting a healthy run off partway leaves
+some subjects updated and the rest stale.
+
+## Outage emails (moved out)
+
+The two outage emails -- `outage_internal_notification` (internal
+stakeholders) and `outage_communication` (SRE declaration/resolution) -- used
+to be sub-crons here. They now run in entity-service's outage notice drainer,
+which publishes them on the `outage-events` topic, and csm-notification-service
+sends them: seconds after the change, as ServiceNow's record-triggered flows
+do, instead of on this component's tick. Their recipients moved with them
+(`OUTAGE_NOTIFICATION_RECIPIENTS` / `OUTAGE_COMMUNICATION_RECIPIENTS` on
+entity-service); `SUB_CRON_RECIPIENTS` entries for the two old task names are
+now ignored.
+
 ## Alerting
 
 Two layers, combined:
@@ -277,6 +351,33 @@ component's own code (entity-service's `Attempt` response doesn't report whether
 superseded something) — that's a real gap if a "period X was abandoned" notice is wanted later; it
 would need a small addition to the `ClaimScheduledTaskRunResponse` contract, not just to this
 component.
+
+## `cmd/server` is the ONLY package main in this component
+
+> **Do not add a second directory under `cmd/`, and do not add `package main`
+> anywhere else in this module. It breaks the Choreo build.**
+
+Choreo builds this with the Google Go buildpack, which picks the package to
+build by running
+
+```
+go list -f '{{if eq .Name "main"}}{{.Dir}}{{end}}' ./...
+```
+
+With exactly one result it builds that. With two it cannot choose, falls back
+to the module root, finds no `.go` files there and fails the build with
+
+```
+no Go files in /workspace
+```
+
+The failure names neither of the offending directories, so it reads like a
+broken build path rather than an extra main package. It has happened twice:
+`cmd/availdiff`, then `cmd/mockdashboard`.
+
+A development tool that needs its own entry point belongs outside this
+module, or as a test helper, or behind `GOOGLE_BUILDABLE=./cmd/server` set on
+the Choreo build — but the default assumption here is one `cmd/` directory.
 
 ## Running locally
 

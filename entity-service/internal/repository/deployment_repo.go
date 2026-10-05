@@ -25,7 +25,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"golang.org/x/sync/errgroup"
@@ -53,11 +52,13 @@ type DeploymentRepository interface {
 }
 
 type deploymentRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
-// NewDeploymentRepository constructs a DeploymentRepository backed by the given connection pool.
-func NewDeploymentRepository(db *pgxpool.Pool) DeploymentRepository {
+// NewDeploymentRepository constructs a DeploymentRepository whose every query
+// runs under the caller identity on ctx (deployment has row-level security,
+// migration 0176).
+func NewDeploymentRepository(db *Scoped) DeploymentRepository {
 	return &deploymentRepo{db: db}
 }
 

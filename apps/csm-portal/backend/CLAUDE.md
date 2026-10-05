@@ -37,14 +37,19 @@ Go HTTP server (`net/http`, Go 1.26+) that acts as a backend-for-frontend (BFF) 
 Admin-only (`PermAdmin`, see "Access control" above) — the CSM portal's Add User UI is the one
 caller. `UsersHandler.CreateUser` (`internal/handler/users.go`) validates `roles` against
 `Directory.IsValidRole` (the same startup-resolved `CSM_USER_ROLES` allow-list `POST /roles/search`
-serves) before forwarding the request body unchanged to the entity service's own `POST /users` —
-entity-service deliberately does not validate role names itself (see that repo's own `domain.UserRole`
-doc comment), so this is the one place that does. `roles` is optional; the Add User form's "User type"
-selector is the one caller-facing use of it today — it sends exactly one of `["internal"]`/`["external"]`,
-since entity-service derives `user_type` from role membership rather than a plain settable column (see
-that repo's own `recompute_user_type` trigger, migration 0011). There is still no Asgardeo-backed way
-to browse/assign a fuller role set at account-creation time, so nothing beyond that one required choice
-is exposed here.
+serves) before forwarding a rebuilt body (see `buildEntityCreateUserBody`) carrying just
+`firstName`/`lastName`/`email`/`roles` to the entity service's own `POST /users` — entity-service
+deliberately does not validate role names itself (see that repo's own `domain.UserRole` doc comment),
+so this is the one place that does. `roles` is optional; the Add User form's "User type" selector is
+the one caller-facing use of it — it sends exactly one of `["internal"]`/`["external"]`, since
+entity-service derives `user_type` from role membership rather than a plain settable column (see that
+repo's own `recompute_user_type` trigger, migration 0011). "External" is currently disabled in that
+selector and rejected server-side if sent anyway — see the constraint below.
+
+A separate, unrelated field on the same request, `grantRoles`, is the Asgardeo-backed way to also put
+the new user into one or more portal-permission roles (`cs_engineer`, `escalator`, ...) at creation
+time — see "Granting portal roles on user creation" below for the full mechanism. It is validated and
+acted on independently of `roles`/`CSM_USER_ROLES` and never reaches entity-service at all.
 
 **Constraint: an internal-type user must have a `@wso2.com` email.** Found live: the Add User form sent
 no `roles` at all, so every user it created resolved to `user_type = NOT_AVAILABLE` (the trigger's
@@ -60,6 +65,139 @@ identical check against `req.Roles`/`req.Email` and is what actually protects th
 `POST /users` is entity-service's own route and this backend is not its only conceivable caller. The
 two lists (`internalUserTypeRoles` here, its unexported twin there) are kept in sync by hand, the same
 way `wso2EmailDomain` itself already is between the two repos.
+
+**Constraint: creating an external-type user is temporarily disabled.** `requestsExternalUserType`
+(same file, `externalUserTypeRoles = ["external", "partner", "customer", "partner_admin",
+"customer_admin"]` — every role name entity-service's trigger maps to `user_type = EXTERNAL`) rejects
+the request with 400 regardless of email, mirroring entity-service's own identical, authoritative
+check. The Add User form's type selector disables its "External" option for the same reason rather
+than offering a choice the backend will reject. All three layers (here, entity-service, the webapp)
+are meant to come out together once external-type creation is ready.
+
+## Listing time card approvers via SCIM (GET /users/time-card-approvers)
+
+Who may approve a time card is granted by real Asgardeo role membership (see `AUTH_TIMECARD_APPROVER_ROLES`
+in "Access control" above), but `POST /users/search`'s `roleIds` filter — the only other way to list
+"who holds role X" — reads entity-service's own Postgres `role`/`user_role` tables instead, a separate,
+syncable mirror that is not guaranteed to agree with Asgardeo's real membership at any given moment.
+`GetTimeCardApprovers` (`internal/handler/users.go`) answers the question directly: it calls
+`scim.Client.GetRole` with a configured Asgardeo role id and returns that role's real `users` list
+(`{id, email}` per member), authoritative rather than a potentially-stale mirror.
+
+**`ASGARDEO_ROLE_IDS`** (`internal/directory.ParseRoleIDs`) is a JSON object string, e.g.
+`{"example-timecard-approver-role":"11111111-1111-1111-1111-111111111111"}` — a general
+real-role-name → role-id mapping, not a single-purpose env var, so a second SCIM-backed role lookup
+later is a config row plus a small handler, not a redesign. **Keyed by the real role name exactly as
+it appears on the token's `roles` claim** (the same strings `AUTH_<ROLE>_ROLES` already lists), not an
+invented portal-role key — `AUTH_<ROLE>_ROLES` can list more than one real name granting the same
+portal permission, and only a real name identifies a specific role an id can actually belong to.
+JSON rather than this package's usual flat `key|value,key|value` form specifically because the key
+here is an opaque, deployment-specific role name that may itself contain punctuation (e.g.
+`example.namespaced-role`) — delimiter-splitting that reliably would need its own escaping, which JSON
+already provides. Parsed once at startup (`cmd/server/main.go`, right after `loadDirectory()`) into a
+plain `map[string]string`; deliberately **not** folded into `directory.Directory` itself, since that
+type's own charter (team registry + assignable-role allow-list) is a different, narrower concept than
+"which roles have a SCIM-backed lookup wired up" — this is role *ids* for a specific feature, not
+organisation vocabulary every caller needs.
+
+`handler.ResolveGrantableRoles(accessCfg, roleIDsByName)` (`internal/handler/grantable_roles.go`) is
+what bridges this real-name-keyed map back to the portal-role vocabulary (`cs_engineer`, `escalator`,
+...): for each portal role, it checks `AccessConfig`'s own configured real name(s) against this map and
+keeps the portal role only if at least one resolves to a known id — the stable `[]handler.GrantableRole{Key,
+RoleID}` list every caller downstream actually works with. No default and no required keys: a real name
+with no entry here just means that role has no SCIM-backed feature wired up in this deployment —
+`timecardApproverRoleIDs` in `main.go` is derived from this same resolved list
+(`handler.RoleIDsForKey(grantableRoles, "timecard_approver")`), not a second, parallel lookup into the
+raw map. It is a slice, not a single id: `AUTH_TIMECARD_APPROVER_ROLES` can list more than one real role
+name, each resolved to its own id, and an approver holding any one of them must still show up — unlike
+granting (`RoleIDForKey`, singular, used by `CreateUser`), which only ever needs one specific role to add
+a new user to, reading membership must not silently miss someone who only holds the second configured
+role. `GetTimeCardApprovers` queries `scim.Client.GetRole` once per configured id and merges the results,
+deduplicated by member id. **`GET /users/time-card-approvers` is registered unconditionally**, deliberately
+unlike this file's other optionally-wired features (`ENGINEERING_ENTITY_BASE_URL`, the `CSM_MIGRATION_*`
+flags), which skip registration entirely when off: it collides with the wildcard `GET /users/{id}` route, so
+leaving it unregistered would have the request fall through to `GetUser`, which rejects the literal
+segment `"time-card-approvers"` as an invalid UUID with 400 — a confusing status for "this feature isn't
+configured." Registering it unconditionally and 404ing from inside the handler (when
+`timecardApproverRoleIDs` is empty) gives a clean, correct status either way.
+
+## Granting portal roles on user creation (`grantRoles`, `GET /roles/grantable`)
+
+`POST /users`' own `roles` field only ever controls entity-service's `user_type` (internal/external) —
+it has no connection to the Asgardeo-backed portal permissions `AUTH_<ROLE>_ROLES` grants
+(`cs_engineer`, `escalator`, ...). Before this, there was no way for the Add User flow to also put a new
+user into one of those roles; an admin had to do it by hand, outside the portal. `createUserRequest`'s
+separate `grantRoles` field (portal role keys, e.g. `["cs_engineer"]`) closes that gap:
+`CreateUser` resolves each key against `UsersHandler.grantableRoles` (set once at startup via
+`WithGrantableRoles`, the same `[]handler.GrantableRole` `ResolveGrantableRoles` produces) up front —
+before anything is created, so an unknown key is a clean 400 — then, once the entity-service user
+exists, calls `scim.Client.AddRoleMembers(ctx, roleID, []string{req.Email})` once per resolved role.
+
+**`grantRoles` never reaches entity-service.** `createUserRequest` is still parsed in full (so
+`grantRoles` can be validated), but the body actually forwarded to entity-service is rebuilt from
+scratch (`buildEntityCreateUserBody`) carrying only `firstName`/`lastName`/`email`/`roles` —
+entity-service's own decoder rejects unknown fields, so the raw request body (which does carry
+`grantRoles`) can't be forwarded unchanged the way most of this handler's other POST/PATCH bodies are.
+Same "rebuild from what was actually validated" precedent `CreateCaseComment`'s own work_note rebuild
+follows in `cases.go`.
+
+**The SCIM grant is best-effort, after the fact.** By the time `AddRoleMembers` runs, the platform user
+already exists — a SCIM failure (an unreachable SCIM service, a role the configured credentials can't
+write to) is logged and does **not** fail the create response, the same posture `ensureUserProvisioned`
+(`cases.go`) takes for the mirror-image direction of this same mechanism (provisioning a platform user
+on demand for a worknote/escalation author who already holds the Asgardeo role but has no platform row
+yet). A failed grant here leaves the user created but without the intended role — recoverable by hand,
+unlike a failed *create*, which leaves nothing to recover.
+
+**`GET /roles/grantable`** (`handler.GrantableRolesHandler`, admin-only — the same `PermAdmin` gate
+`POST /users` itself sits behind) reports just the resolved portal role keys, never the real role
+name/id behind them, so the webapp's Add User dialog can render a checkbox per grantable role without
+ever learning anything about the identity provider's own vocabulary. The webapp maps each key to a
+display label itself (`grantableRoleLabels.ts`) — this backend has no notion of a human-readable role
+name at all.
+
+**A SCIM 401/403 is never passed through to the caller as 401/403.** A failure fetching the role (e.g.
+this backend's own OAuth2 app lacking a roles-read scope on `SCIM_SCOPES` — see the "Operational
+follow-up" note on the PR that added the SCIM operations service's role endpoint) is this backend's own
+credentials problem, not anything about the calling portal user's permissions — `mapUpstreamErrorGeneric`'s
+usual 401/403 pass-through would otherwise tell an ordinary `viewer` "you don't have permission" for what
+is really a deployment misconfiguration. `GetTimeCardApprovers` checks for those two codes specifically
+and reports a sanitized 502 instead; every other SCIM failure status still goes through the normal
+`mapUpstreamErrorGeneric` mapping.
+
+## Provisioning a "user" row on demand (`ensureUserProvisioned`)
+
+A `worknote_creator`- or `escalator`-only caller reaches `POST /cases/{id}/comments`
+(the `!hasFullWrite` branch) or `POST /cases/{id}/escalations` purely on the strength
+of an Asgardeo role grant — unlike the admin-only "Add User" flow above, neither
+`AUTH_WORKNOTE_CREATOR_ROLES` nor `AUTH_ESCALATOR_ROLES` provisions a `"user"` row
+anywhere. Without one, entity-service's own identity resolution for the write
+(`emailFromJWT` → `GetUserByEmail`) fails it outright — a real gap for a caller whose
+only path onto the portal is one of these two narrow roles, since neither is routed
+through the entity-service-backed Salesforce membership ingest or the admin `POST
+/users` flow.
+
+`ensureUserProvisioned` (`internal/handler/ensure_user.go`) closes this: called
+immediately before the entity-service write in both `CreateCaseComment`'s
+worknote-only branch and `CreateCaseEscalation`, it calls `GetUserMe` first and, only
+on a `404` (no row at all — any other failure is logged and treated as best-effort,
+same posture as `caseIsClosed`'s own fail-open guard elsewhere in `cases.go`), creates
+one via `POST /users` using `FirstName`/`LastName`/`Email` straight off the caller's
+own validated token (`middleware.UserInfo`, which now also decodes `given_name`/
+`family_name` — see that struct's own doc comment) and `roles: ["internal"]`. Both
+work-note creation and escalation are internal-staff-only actions by construction
+(their own `AUTH_<ROLE>_ROLES` grants are organisation-internal role names), so
+`"internal"` is never a guess the way `CreateUser`'s admin-facing "User type" selector
+has to make.
+
+**`CreateCaseComment` skips calling this entirely for a caller who already holds full
+`PermWrite`** (`cs_engineer` or `admin`, via the same `hasFullWrite` the
+`PermCreateWorkNote`-narrowing check above already computes) — assumed already
+provisioned, so the overwhelmingly common path (a CS engineer's own work notes/replies)
+pays no extra `GetUserMe` round trip. `CreateCaseEscalation` has no equivalent skip:
+`cs_engineer` never holds `PermEscalate` at all (see `NewAccessGuard`'s own doc
+comment), so every caller who reaches that handler is, by construction, exactly the
+audience this exists for.
 
 ## Security Center access (PermViewSecurityCenter)
 
@@ -175,7 +313,7 @@ Each upstream service has its own client package under `internal/`:
 | Package | Upstream | Notes |
 |---------|----------|-------|
 | `entity` | Multiple entity services (see below) | Hosts `CustomerEntityClient` (this repo's entity-service; most case/account/project endpoints, raw `[]byte` passthrough) and `EngineeringEntityClient` (a separate internal engineering entity service; `CreateGitIssue`, typed request/response, plus `Health(ctx)` backing `GET /health/dependencies` — see "Health endpoints" above). `EngineeringEntityClient` is constructed in `cmd/server/main.go` only when `ENGINEERING_ENTITY_BASE_URL` is set, and then `CaseHandler.CreateCaseGithubIssue` uses it (via `WithEngineeringClient`) instead of the entity service: the target is the case product's `product_repo_mapping` row (looked up through the entity service's `GET /products/github-repo`; `repoOverride` is ignored), and after filing it writes the issue URL to the case as a best-effort work note |
-| `scim` | SCIM service | User/group lookups. Two orgs: `SearchUser` queries the "internal" org (WSO2 staff — phone number, last password update). `SearchExternalUser` queries the "external" org (customer/partner contacts — existence + lock status, mirroring `infra-operations/operations/asgardeo-user-check`'s `{exists, locked}` contract). `GetUser` calls the latter only when the entity response's `userType` isn't `internal`, and treats a lookup failure as best-effort — logged, response returned unchanged, never a failed request |
+| `scim` | SCIM service | User/group/role lookups. Two orgs: `SearchUser` queries the "internal" org (WSO2 staff — phone number, last password update). `SearchExternalUser` queries the "external" org (customer/partner contacts — existence + lock status, mirroring `infra-operations/operations/asgardeo-user-check`'s `{exists, locked}` contract). `GetUser` calls the latter only when the entity response's `userType` isn't `internal`, and treats a lookup failure as best-effort — logged, response returned unchanged, never a failed request. `GetRole(ctx, roleID)` fetches an Asgardeo role's real member users (internal org only) via the SCIM operations service's `GET /organizations/internal/roles/{id}` — a plain get-by-id, not a search, so the caller supplies the role's own Asgardeo id directly (see `ASGARDEO_ROLE_IDS` below); a member's SCIM `display` (`"<domain>/<email>"`, e.g. `"DEFAULT/jane@wso2.com"`) is unwrapped to a bare email |
 | `updates` | Updates service | Product update levels; returns typed structs (not raw passthrough) |
 | `csmnotification` | `integrations/csm-notification-service` | Health check only today (`Health(ctx)`, backing `GET /health/dependencies` — see "Health endpoints" below). Optional: unconfigured (`CSM_NOTIFICATION_SERVICE_BASE_URL` unset) means this dependency reports `not_configured` |
 | `csmintegration` | `integrations/csm-integration-service` | Same shape and same one purpose as `csmnotification` above, for `integrations/csm-integration-service` |
@@ -235,6 +373,7 @@ Follow these steps in order:
 - **Field naming**: case create/patch use bare names without `Key`/`Keys` suffix — `state`, `severity`, `workState`, `type`, `engagementType`, `catalogId`, `catalogItemId`, `variables` (PATCH — the latter four only meaningful transferring into `engagement`/`service_request` respectively), `type`, `severity`, `issueType` (POST); search filters use `states`, `severities`, `types`, `issueTypes`, `engagementTypes`; deployment search uses `deploymentTypes`; case comments use `type` (not `typeKey`); case create accepts `type: "case"`, `"service_request"`, or `"security_report_analysis"` (ServiceNow only for the latter two); case-type transfer via PATCH accepts `type: "case"`, `"engagement"`, `"security_report_analysis"`, or `"service_request"` (ServiceNow only)
 - **Deployment ID injection**: two helpers exist in `deployments.go` — `injectDeploymentID` (injects `deploymentIds: [id]` array, used by search) and `injectDeploymentIDField` (injects `deploymentId: id` string, used by create/update). Use the correct one for the endpoint's upstream contract.
 - **Upstream errors**: use `mapUpstreamErrorGeneric(w, err, "<fallback message>")` for every endpoint by default — never write custom status mappings inline. Only the ten PATCH/update handlers (`PatchCase`, `PatchCallRequest`, `PatchMe`, `UpdateProject`, `PatchDeployment`, `PatchDeployedProduct`, `PatchChangeRequest`, `UpdateTimeCard`, `UpdateTask`, `PatchIncident`) use `mapUpstreamError` instead, which surfaces the upstream 400/409/422 reason (e.g. "Invalid state transition") — appropriate there because the request body just submitted is what's being rejected. Every other endpoint (search/create/get/delete) forwards a payload that's only partially validated at this layer, so a 4xx from upstream isn't reliably something the caller could have avoided; `mapUpstreamErrorGeneric` returns the fixed fallback message for those instead of echoing upstream detail. Both log the full reason via the caller's `slog.ErrorContext(ctx, ..., "err", err)` regardless of which is used.
+- **`GetMe` maps an upstream 404 to 403, not 404.** A 404 here means the caller's own authenticated identity has no backing user row — not a missing resource the caller asked for by ID — and the webapp's data-fetching hook for this endpoint has no handling for a bare 404, so it spun forever instead of showing anything. Since "you don't have permission" is already a handled UI state, `GetMe` treats this upstream 404 as 403 for the response while still logging the real cause at `ERROR` (without the caller's email, to stay off the PII list above). Follow this same substitution if another identity-bound "fetch my own X" endpoint hits the same failure mode.
 - **Response**: return raw `[]byte` with `writeJSON` for simple passthroughs; unmarshal into typed structs only when the response shape needs to change
 
 ## OpenAPI spec

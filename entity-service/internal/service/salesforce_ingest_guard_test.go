@@ -40,6 +40,7 @@ type fakeIngestStateRepo struct {
 	// call asked for; retryAttempts each RecordRetryAttempt call.
 	listEntities  [][]string
 	retryAttempts []string
+	requeued      []repository.MissingParent
 }
 
 func (f *fakeIngestStateRepo) Get(_ context.Context, entity, sfID string) (*domain.SalesforceIngestState, error) {
@@ -97,16 +98,21 @@ func (f *fakeIngestStateRepo) ListMissingParentFailures(_ context.Context, entit
 			break
 		}
 		if st.Status == domain.SalesforceIngestFailed && slices.Contains(entities, st.Entity) &&
-			repository.IsMissingParentError(derefString(st.LastError)) && st.AttemptCount < maxAttempts {
+			repository.IsMissingParentError(derefString(st.LastError)) && st.RetryCount < maxAttempts {
 			out = append(out, st)
 		}
 	}
 	return out, nil
 }
 
-func (f *fakeIngestStateRepo) RecordRetryAttempt(_ context.Context, entity, sfID string, seenUpdatedOn time.Time) (bool, error) {
-	f.retryAttempts = append(f.retryAttempts, entity+"/"+sfID+"@"+seenUpdatedOn.Format(time.RFC3339))
+func (f *fakeIngestStateRepo) RecordRetryAttempt(_ context.Context, entity, sfID string) (bool, error) {
+	f.retryAttempts = append(f.retryAttempts, entity+"/"+sfID)
 	return true, nil
+}
+
+func (f *fakeIngestStateRepo) RequeueMissingParentFailures(_ context.Context, parent repository.MissingParent) (int64, error) {
+	f.requeued = append(f.requeued, parent)
+	return 0, nil
 }
 
 func ingestStateRow(status domain.SalesforceIngestStatus, eventType, modified string) domain.SalesforceIngestState {

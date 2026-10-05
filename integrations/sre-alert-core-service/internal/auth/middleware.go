@@ -79,8 +79,10 @@ func RequireAuth(repo *UserRepo, logger *slog.Logger) func(http.Handler) http.Ha
 
 // parseCredentials extracts username/secret from either Bearer base64("<username>:<secret>") or Basic (what -u sends, decoded via net/http's BasicAuth).
 func parseCredentials(r *http.Request) (username, secret string, ok bool) {
-	if header := r.Header.Get("Authorization"); strings.HasPrefix(header, bearerPrefix) {
-		token := strings.TrimPrefix(header, bearerPrefix)
+	// Case-insensitive per RFC 7235, as BasicAuth already is for Basic.
+	if header := r.Header.Get("Authorization"); len(header) >= len(bearerPrefix) &&
+		strings.EqualFold(header[:len(bearerPrefix)], bearerPrefix) {
+		token := header[len(bearerPrefix):]
 		decoded, err := base64.StdEncoding.DecodeString(token)
 		if err != nil {
 			return "", "", false

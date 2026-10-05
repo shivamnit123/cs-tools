@@ -410,25 +410,25 @@ func TestUpdateAccountTeams(t *testing.T) {
 	})
 }
 
-type mockSplAccountClient struct {
+type mockViewerAccountClient struct {
 	getEscalationsByAccountFn func(ctx context.Context, accountNumber string, offset, limit int) ([]servicenow.EscalationDetail, error)
 	escalateCaseFn            func(ctx context.Context, accountNumber, caseNumber string, request servicenow.EscalationRequest, submittedByEmail string) (servicenow.EscalationResponse, error)
 }
 
-func (m *mockSplAccountClient) GetEscalationsByAccount(ctx context.Context, accountNumber string, offset, limit int) ([]servicenow.EscalationDetail, error) {
+func (m *mockViewerAccountClient) GetEscalationsByAccount(ctx context.Context, accountNumber string, offset, limit int) ([]servicenow.EscalationDetail, error) {
 	return m.getEscalationsByAccountFn(ctx, accountNumber, offset, limit)
 }
-func (m *mockSplAccountClient) EscalateCase(ctx context.Context, accountNumber, caseNumber string, request servicenow.EscalationRequest, submittedByEmail string) (servicenow.EscalationResponse, error) {
+func (m *mockViewerAccountClient) EscalateCase(ctx context.Context, accountNumber, caseNumber string, request servicenow.EscalationRequest, submittedByEmail string) (servicenow.EscalationResponse, error) {
 	return m.escalateCaseFn(ctx, accountNumber, caseNumber, request, submittedByEmail)
 }
 
 func TestSplEscalateCase_RequiresEscalationPermission(t *testing.T) {
-	h := NewSplAccountHandler(&mockSplAccountClient{}, splAccessGuard)
+	h := NewViewerAccountHandler(&mockViewerAccountClient{}, viewerAccessGuard)
 
 	body := `{"justification":"urgent","requestSource":"Customer","reason":"Inactivity","severity":"High Severity"}`
 	r := httptest.NewRequest(http.MethodPost, "/spl/accounts/ACC1/cases/CS1/escalate", strings.NewReader(body))
 	// SPL access (sales_solutions) but no escalator/cs_engineer/admin — passes
-	// PermSPLAccess, fails the additional PermEscalate check.
+	// PermViewerAccess, fails the additional PermEscalate check.
 	r = r.WithContext(middleware.WithUserInfo(r.Context(), &middleware.UserInfo{
 		Email: "sales@example.com", UserID: "u-sales", Roles: []string{"test-sales-solutions"},
 	}))
@@ -440,7 +440,7 @@ func TestSplEscalateCase_RequiresEscalationPermission(t *testing.T) {
 }
 
 func TestSplEscalateCase_RejectsInvalidPayload(t *testing.T) {
-	h := NewSplAccountHandler(&mockSplAccountClient{}, splAccessGuard)
+	h := NewViewerAccountHandler(&mockViewerAccountClient{}, viewerAccessGuard)
 
 	tests := []string{
 		`{"justification":"","requestSource":"Customer","reason":"Inactivity","severity":"High Severity"}`,
@@ -460,12 +460,12 @@ func TestSplEscalateCase_RejectsInvalidPayload(t *testing.T) {
 }
 
 func TestSplEscalateCase_Conflict(t *testing.T) {
-	client := &mockSplAccountClient{
+	client := &mockViewerAccountClient{
 		escalateCaseFn: func(_ context.Context, _, _ string, _ servicenow.EscalationRequest, _ string) (servicenow.EscalationResponse, error) {
 			return servicenow.EscalationResponse{}, servicenow.ErrEscalationConflict
 		},
 	}
-	h := NewSplAccountHandler(client, splAccessGuard)
+	h := NewViewerAccountHandler(client, viewerAccessGuard)
 
 	body := `{"justification":"urgent","requestSource":"Customer","reason":"Inactivity","severity":"High Severity"}`
 	r := withUser(httptest.NewRequest(http.MethodPost, "/spl/accounts/ACC1/cases/CS1/escalate", strings.NewReader(body)))

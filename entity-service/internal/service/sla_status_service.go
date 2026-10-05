@@ -59,7 +59,7 @@ type slaStatusService struct {
 
 // NewSLAStatusService constructs an SLAStatusService backed by the given
 // repository. access gates every call to internal callers
-// (AUTH_INTERNAL_CLIENT_IDS) -- see requireInternalCaller's own doc comment
+// (an Unrestricted AccessScope) -- see requireInternalCaller's own doc comment
 // for why: unlike every other Postgres-backed read, this endpoint has no
 // per-project/per-case filtering of its own to scope by (it returns every
 // currently-active clock across every case in one bulk list, for its one
@@ -71,18 +71,9 @@ func NewSLAStatusService(repo repository.SLAStatusRepository, access AccessServi
 }
 
 // requireInternalCaller rejects anyone whose AccessScope is not Unrestricted
-// -- mirrors onboarding_step_service.go's own helper of the same name and
-// same reasoning; kept as its own unexported copy rather than a shared one
-// since AccessService itself has no natural home for a helper this small.
+// -- delegates to the shared RequireInternalCaller (require_internal.go).
 func (s *slaStatusService) requireInternalCaller(ctx context.Context) error {
-	scope, err := s.access.ResolveScope(ctx)
-	if err != nil {
-		return err
-	}
-	if !scope.Unrestricted {
-		return &apierror.ForbiddenError{Msg: "sla status is only available to internal services"}
-	}
-	return nil
+	return RequireInternalCaller(ctx, s.access, "sla status is only available to internal services")
 }
 
 // SearchActiveSLAStatuses implements SLAStatusService.

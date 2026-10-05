@@ -72,10 +72,13 @@ expires and resumes from the same durable cursor. Leadership and progress
 both live in Cassandra rather than in-memory, so replicas can be added,
 removed, or restarted freely, but note that duplicate or dropped alerts are
 not fully impossible: lease handoff, CSM's own dedup-by-tag lookup (used
-before every incident create), and the shutdown drain sequence all narrow
-those windows significantly, they don't eliminate them under every failure
-mode (e.g. clock skew between replicas). See the lease and notify packages'
-own doc comments for the specific tradeoffs.
+before every incident create), the shutdown drain sequence, and a `version`
+column that fences every mutating write on `incidents_processed` (`IF version
+= <value just read>`, so a replica whose lease already expired can't silently
+overwrite a newer leader's update) all narrow those windows significantly,
+they don't eliminate them under every failure mode (e.g. clock skew between
+replicas). See the lease and notify packages' own doc comments for the
+specific tradeoffs.
 
 ## Package layout
 
@@ -125,7 +128,7 @@ cp config.toml.example config.toml
 ```
 
 Internal API users (`integration_users`) are documented separately in
-[`cmd/user/PROVISION.md`](cmd/user/PROVISION.md).
+[`PROVISION.md`](PROVISION.md).
 
 ## Choreo Deployment
 

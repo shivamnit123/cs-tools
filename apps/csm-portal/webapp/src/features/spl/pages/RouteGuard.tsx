@@ -42,7 +42,7 @@ export default function RouteGuard(): JSX.Element {
   }
 
   if (!access.hasAccess) {
-    return <Error403Page message="Support Portal Lite is only available to Sales / Solutions Architecture staff." />;
+    return <Error403Page message="This section is only available to Sales / Solutions Architecture staff." />;
   }
 
   return (

@@ -576,7 +576,7 @@ func TestDispatcher_Handle_ProjectContactInvited_NamelessInviteeUsesEmailLocalPa
 // not FAILED, and the identity step still runs.
 func TestDispatcher_Handle_ProjectContactInvited_Killswitch(t *testing.T) {
 	identity, email, steps := &mockIdentityProvisioner{}, &mockEmailSender{}, &mockStepRecorder{}
-	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{}, false, false, nil, true, "").
+	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{}, false, false, nil, true, "", nil).
 		WithOnboarding(OnboardingConfig{Identity: identity, Email: email, Steps: steps, IdentityEnabled: true, EmailEnabled: true, PortalURL: "https://support.wso2.com"})
 
 	if err := d.Handle(context.Background(), invitedRecord(false)); err != nil {
@@ -592,7 +592,7 @@ func TestDispatcher_Handle_ProjectContactInvited_Killswitch(t *testing.T) {
 // mode sends the invitation to the test list, never to the real contact.
 func TestDispatcher_Handle_ProjectContactInvited_DebugModeRedirects(t *testing.T) {
 	email, steps := &mockEmailSender{}, &mockStepRecorder{}
-	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{}, true, true, []string{"debug@wso2.com"}, true, "").
+	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{}, true, true, []string{"debug@wso2.com"}, true, "", nil).
 		WithOnboarding(OnboardingConfig{Identity: &mockIdentityProvisioner{}, Email: email, Steps: steps, IdentityEnabled: true, EmailEnabled: true, PortalURL: "https://support.wso2.com"})
 
 	if err := d.Handle(context.Background(), invitedRecord(false)); err != nil {
@@ -1016,7 +1016,7 @@ func TestDispatcher_Handle_ProjectContactRegistered_SendsWelcome(t *testing.T) {
 	if len(sent.replyTo) != 1 || sent.replyTo[0] != "support@wso2.com" {
 		t.Errorf("replyTo = %v, want the onboarding Reply-To", sent.replyTo)
 	}
-	for _, want := range []string{"Hi Jane Doe,", "Acme Cloud", "GO TO SUPPORT PORTAL", `href="https://support.wso2.com"`} {
+	for _, want := range []string{"Hi Jane Doe,", "Acme Cloud", "Go to Support Portal", `href="https://support.wso2.com"`} {
 		if !strings.Contains(sent.htmlBody, want) {
 			t.Errorf("body does not contain %q", want)
 		}
@@ -1059,7 +1059,7 @@ func TestDispatcher_Handle_ProjectContactRegistered_Skips(t *testing.T) {
 		},
 		"killswitch": {
 			d: func(e *mockEmailSender, s *mockStepRecorder) *Dispatcher {
-				return NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{}, false, false, nil, true, "").
+				return NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{}, false, false, nil, true, "", nil).
 					WithOnboarding(OnboardingConfig{Email: e, Steps: s, EmailEnabled: true})
 			},
 			record: registeredRecord(false),
@@ -1099,7 +1099,7 @@ func TestDispatcher_Handle_ProjectContactRegistered_SkipKeepsSentWelcome(t *test
 
 func TestDispatcher_Handle_ProjectContactRegistered_DebugModeRedirects(t *testing.T) {
 	email, steps := &mockEmailSender{}, &mockStepRecorder{}
-	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{}, true, true, []string{"debug@wso2.com"}, true, "").
+	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{}, true, true, []string{"debug@wso2.com"}, true, "", nil).
 		WithOnboarding(OnboardingConfig{Email: email, Steps: steps, EmailEnabled: true})
 
 	if err := d.Handle(context.Background(), registeredRecord(false)); err != nil {

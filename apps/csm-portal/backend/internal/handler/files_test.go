@@ -26,23 +26,23 @@ import (
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
 )
 
-// mockSplDriveClient is a test double for splDriveClient.
-type mockSplDriveClient struct {
+// mockDriveClient is a test double for driveClient.
+type mockDriveClient struct {
 	listFilesFn    func(ctx context.Context, folderID string) ([]googledrive.DriveFile, error)
 	searchFolderFn func(ctx context.Context, folderName string) (*googledrive.DriveFolder, error)
 }
 
-func (m *mockSplDriveClient) ListFiles(ctx context.Context, folderID string) ([]googledrive.DriveFile, error) {
+func (m *mockDriveClient) ListFiles(ctx context.Context, folderID string) ([]googledrive.DriveFile, error) {
 	return m.listFilesFn(ctx, folderID)
 }
 
-func (m *mockSplDriveClient) SearchFolder(ctx context.Context, folderName string) (*googledrive.DriveFolder, error) {
+func (m *mockDriveClient) SearchFolder(ctx context.Context, folderName string) (*googledrive.DriveFolder, error) {
 	return m.searchFolderFn(ctx, folderName)
 }
 
 func TestSplFilesHandler_ListFiles(t *testing.T) {
 	t.Run("requires authentication", func(t *testing.T) {
-		h := NewSplFilesHandler(&mockSplDriveClient{}, splAccessGuard)
+		h := NewFilesHandler(&mockDriveClient{}, viewerAccessGuard)
 		r := httptest.NewRequest(http.MethodGet, "/spl/files?folderId=abc", nil)
 		w := httptest.NewRecorder()
 
@@ -51,10 +51,10 @@ func TestSplFilesHandler_ListFiles(t *testing.T) {
 		assertStatus(t, w, http.StatusUnauthorized)
 	})
 
-	t.Run("requires a role granting PermSPLAccess", func(t *testing.T) {
-		h := NewSplFilesHandler(&mockSplDriveClient{}, splAccessGuard)
+	t.Run("requires a role granting PermViewerAccess", func(t *testing.T) {
+		h := NewFilesHandler(&mockDriveClient{}, viewerAccessGuard)
 		r := httptest.NewRequest(http.MethodGet, "/spl/files?folderId=abc", nil)
-		// Authenticated but holds no role granting PermSPLAccess.
+		// Authenticated but holds no role granting PermViewerAccess.
 		r = r.WithContext(middleware.WithUserInfo(r.Context(), &middleware.UserInfo{Email: "nobody@example.com", UserID: "u-nobody"}))
 		w := httptest.NewRecorder()
 
@@ -64,7 +64,7 @@ func TestSplFilesHandler_ListFiles(t *testing.T) {
 	})
 
 	t.Run("rejects empty folderId with 400", func(t *testing.T) {
-		h := NewSplFilesHandler(&mockSplDriveClient{}, splAccessGuard)
+		h := NewFilesHandler(&mockDriveClient{}, viewerAccessGuard)
 		r := withUser(httptest.NewRequest(http.MethodGet, "/spl/files?folderId=", nil))
 		w := httptest.NewRecorder()
 
@@ -76,13 +76,13 @@ func TestSplFilesHandler_ListFiles(t *testing.T) {
 	t.Run("returns files from the drive client", func(t *testing.T) {
 		want := []googledrive.DriveFile{{ID: "f1", Name: "report.pdf", MimeType: "application/pdf"}}
 		var capturedFolderID string
-		mock := &mockSplDriveClient{
+		mock := &mockDriveClient{
 			listFilesFn: func(_ context.Context, folderID string) ([]googledrive.DriveFile, error) {
 				capturedFolderID = folderID
 				return want, nil
 			},
 		}
-		h := NewSplFilesHandler(mock, splAccessGuard)
+		h := NewFilesHandler(mock, viewerAccessGuard)
 		r := withUser(httptest.NewRequest(http.MethodGet, "/spl/files?folderId=folder-1", nil))
 		w := httptest.NewRecorder()
 
@@ -99,12 +99,12 @@ func TestSplFilesHandler_ListFiles(t *testing.T) {
 	})
 
 	t.Run("maps client errors to a generic failure response", func(t *testing.T) {
-		mock := &mockSplDriveClient{
+		mock := &mockDriveClient{
 			listFilesFn: func(_ context.Context, _ string) ([]googledrive.DriveFile, error) {
 				return nil, context.DeadlineExceeded
 			},
 		}
-		h := NewSplFilesHandler(mock, splAccessGuard)
+		h := NewFilesHandler(mock, viewerAccessGuard)
 		r := withUser(httptest.NewRequest(http.MethodGet, "/spl/files?folderId=folder-1", nil))
 		w := httptest.NewRecorder()
 
@@ -116,7 +116,7 @@ func TestSplFilesHandler_ListFiles(t *testing.T) {
 
 func TestSplFilesHandler_SearchFolder(t *testing.T) {
 	t.Run("requires authentication", func(t *testing.T) {
-		h := NewSplFilesHandler(&mockSplDriveClient{}, splAccessGuard)
+		h := NewFilesHandler(&mockDriveClient{}, viewerAccessGuard)
 		r := httptest.NewRequest(http.MethodGet, "/spl/files/search?folderName=Acme", nil)
 		w := httptest.NewRecorder()
 
@@ -126,7 +126,7 @@ func TestSplFilesHandler_SearchFolder(t *testing.T) {
 	})
 
 	t.Run("rejects empty folderName with 400", func(t *testing.T) {
-		h := NewSplFilesHandler(&mockSplDriveClient{}, splAccessGuard)
+		h := NewFilesHandler(&mockDriveClient{}, viewerAccessGuard)
 		r := withUser(httptest.NewRequest(http.MethodGet, "/spl/files/search?folderName=", nil))
 		w := httptest.NewRecorder()
 
@@ -137,7 +137,7 @@ func TestSplFilesHandler_SearchFolder(t *testing.T) {
 
 	t.Run("returns the matching folder", func(t *testing.T) {
 		want := &googledrive.DriveFolder{ID: "d1", Name: "Acme Corp"}
-		mock := &mockSplDriveClient{
+		mock := &mockDriveClient{
 			searchFolderFn: func(_ context.Context, folderName string) (*googledrive.DriveFolder, error) {
 				if folderName != "Acme Corp" {
 					t.Errorf("folderName = %q, want %q", folderName, "Acme Corp")
@@ -145,7 +145,7 @@ func TestSplFilesHandler_SearchFolder(t *testing.T) {
 				return want, nil
 			},
 		}
-		h := NewSplFilesHandler(mock, splAccessGuard)
+		h := NewFilesHandler(mock, viewerAccessGuard)
 		r := withUser(httptest.NewRequest(http.MethodGet, "/spl/files/search?folderName=Acme+Corp", nil))
 		w := httptest.NewRecorder()
 
@@ -159,12 +159,12 @@ func TestSplFilesHandler_SearchFolder(t *testing.T) {
 	})
 
 	t.Run("maps ErrFolderNotFound to 404", func(t *testing.T) {
-		mock := &mockSplDriveClient{
+		mock := &mockDriveClient{
 			searchFolderFn: func(_ context.Context, _ string) (*googledrive.DriveFolder, error) {
 				return nil, googledrive.ErrFolderNotFound
 			},
 		}
-		h := NewSplFilesHandler(mock, splAccessGuard)
+		h := NewFilesHandler(mock, viewerAccessGuard)
 		r := withUser(httptest.NewRequest(http.MethodGet, "/spl/files/search?folderName=Nope", nil))
 		w := httptest.NewRecorder()
 
@@ -174,5 +174,5 @@ func TestSplFilesHandler_SearchFolder(t *testing.T) {
 	})
 }
 
-// Compile-time check that *googledrive.Client satisfies splDriveClient.
-var _ splDriveClient = (*googledrive.Client)(nil)
+// Compile-time check that *googledrive.Client satisfies driveClient.
+var _ driveClient = (*googledrive.Client)(nil)

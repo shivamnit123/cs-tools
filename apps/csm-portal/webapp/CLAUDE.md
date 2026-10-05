@@ -41,9 +41,8 @@ gating on top of a real server-side gate, by explicit choice rather than by the 
 default. If a future admin-only action is added, default to the show-and-reject norm unless there's a
 specific reason (as here) to also hide it.
 
-`AddUserDialog.tsx` deliberately has no general role picker — there is still no Asgardeo-backed way
-to browse/assign a fuller role set at account-creation time. It does have one narrower, required
-control: **"User type" (Internal/External)**. entity-service's `user_type` has no plain settable
+`AddUserDialog.tsx` has two independent role-shaped controls that must not be confused with each
+other. One narrower, required control: **"User type" (Internal/External)**. entity-service's `user_type` has no plain settable
 column — it's derived by a DB trigger from role membership (`recompute_user_type`, migration 0011) —
 so this selector works by sending exactly one of `roles: ["internal"]`/`["external"]` on submit, not a
 `type` field on the wire; `external` (not `customer`/`partner`/...) is the role every
@@ -59,6 +58,28 @@ round-trip to find out. This is a display-consistency check only, the same relat
 redaction section below describes for its own frontend mitigation: entity-service's `userService.CreateUser`
 enforces the identical rule server-side (see that repo's own `CLAUDE.md`), and is what actually
 protects the database regardless of what this form does or doesn't check.
+
+**"External" is temporarily disabled** (`USER_TYPE_OPTIONS`'s own `disabled: true`, rendered via
+`MenuItem`'s `disabled` prop with "— currently unavailable" appended to the label) — both
+entity-service and `apps/csm-portal/backend` reject creating an external-type user regardless of what
+this form sends, so there is currently only one real, selectable choice in this dropdown. This is
+meant to come out once external-type creation is ready; see entity-service's own `CLAUDE.md` for the
+full reasoning.
+
+The second, independent control is **"Portal roles"** — a checkbox per role `GET /roles/grantable`
+reports, rendered only when that list is non-empty (`useGetGrantableRoles`, fetched only while the
+dialog is open). Selected keys go out as `grantRoles` on submit, a completely separate field from
+`roles` above: `roles` only ever shapes entity-service's `user_type`, `grantRoles` only ever grants
+Asgardeo-backed portal permissions (`cs_engineer`, `escalator`, ...) via SCIM, once the user already
+exists — see `apps/csm-portal/backend`'s own `CLAUDE.md`, "Granting portal roles on user creation", for
+the full backend mechanism. This frontend never learns the real identity-provider role name/id behind
+a key; `grantableRoleLabels.ts` maps each key to its own display label (falling back to a title-cased
+version of the raw key for one this map hasn't been updated for yet, rather than hiding it). Protected
+the same way the rest of this dialog already is: **admin-only on both ends** — `GET /roles/grantable`
+and `POST /users` share the identical `PermAdmin` gate on the backend, and on this frontend the section
+only ever renders inside `AddUserDialog`, which `CsmUsersPage.tsx`'s own `canCreateUser` check already
+keeps out of a non-admin's reach entirely (see the "Add User" exception at the top of this section) —
+no second, redundant permission check was added inside the dialog itself.
 
 ## Code organization
 

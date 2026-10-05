@@ -68,16 +68,34 @@ ensure_migrations_table() {
 apply_pending_migrations() {
   db="$1"; dir="$2"
   ensure_migrations_table "$db"
-  for f in $(ls "${dir}"/*.sql | sort -t_ -k1 -V); do
+  # Ordering: the 4-digit NNNN_*.sql files (the convention, see above) in
+  # numeric order, THEN any legacy 6-digit 000NNN_*.up.sql stragglers. Those
+  # predate the renumbering but depend on tables the 4-digit files create (e.g.
+  # 000087 triggers on `outage`, from 0083), yet `sort -V` would run them
+  # first: leading zeros make 000086 sort below 0001. *.down.sql files are
+  # rollbacks and must never be applied on the way up.
+  files="$( { ls "${dir}"/[0-9][0-9][0-9][0-9]_*.sql 2>/dev/null | sort -t_ -k1 -V;
+              ls "${dir}"/[0-9][0-9][0-9][0-9][0-9][0-9]_*.up.sql 2>/dev/null | sort -t_ -k1 -V; } )"
+  for f in $files; do
     version="$(basename "$f" .sql)"
     already="$($PSQL -d "$db" -tAc "SELECT 1 FROM schema_migrations WHERE version = '${version}'")"
     if [ "$already" != "1" ]; then
       echo "[migrate]   applying $f"
-      tmp="$(mktemp)"
-      cat "$f" > "$tmp"
-      printf "\nINSERT INTO schema_migrations (version) VALUES ('%s');\n" "$version" >> "$tmp"
-      $PSQL -d "$db" -1 -f "$tmp"
-      rm -f "$tmp"
+      if grep -qiE '(CREATE|DROP) INDEX CONCURRENTLY' "$f"; then
+        # CONCURRENTLY cannot run inside a transaction block, so a migration
+        # using it (e.g. 0152_work_item_type_updated_on_index.sql) is applied
+        # without -1, then recorded separately. Such files are written
+        # idempotent (IF NOT EXISTS), so a failure between the two steps just
+        # retries harmlessly.
+        $PSQL -d "$db" -f "$f"
+        $PSQL -d "$db" -c "INSERT INTO schema_migrations (version) VALUES ('${version}')"
+      else
+        tmp="$(mktemp)"
+        cat "$f" > "$tmp"
+        printf "\nINSERT INTO schema_migrations (version) VALUES ('%s');\n" "$version" >> "$tmp"
+        $PSQL -d "$db" -1 -f "$tmp"
+        rm -f "$tmp"
+      fi
     fi
 
     # A fixture named for this migration runs straight after it, in the same

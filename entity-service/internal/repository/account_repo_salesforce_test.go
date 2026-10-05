@@ -202,6 +202,21 @@ func (q *accountTxQuerier) Query(context.Context, string, ...any) (pgx.Rows, err
 }
 
 func (q *accountTxQuerier) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
+	if strings.Contains(sql, "UPDATE account") {
+		// The one-row UPDATE ... RETURNING id, copies: recorded with the Exec updates.
+		q.execs = append(q.execs, recordedExec{sql: sql, args: args})
+		if q.execErr != nil {
+			return scanRow{err: q.execErr}
+		}
+		var n int64
+		if len(q.updateResults) > 0 {
+			n, q.updateResults = q.updateResults[0], q.updateResults[1:]
+		}
+		if n == 0 {
+			return scanRow{err: pgx.ErrNoRows}
+		}
+		return scanRow{vals: []any{"acct-row", n}}
+	}
 	q.rowQueries = append(q.rowQueries, recordedExec{sql: sql, args: args})
 	return nopRow{}
 }
@@ -239,6 +254,7 @@ func TestUpsertAccountFromSalesforce_ResolutionAndLedger(t *testing.T) {
 		wantInsert    bool
 	}{
 		{name: "existing sf_id is updated", updateResults: []int64{1}, wantUpdates: 1},
+		{name: "duplicate sf_id: one row updated, every copy restored", updateResults: []int64{2, 2}, wantUpdates: 2},
 		{name: "ServiceNow row is linked by number", updateResults: []int64{0, 1}, wantUpdates: 2},
 		{name: "unknown account is inserted", updateResults: []int64{0, 0}, wantUpdates: 2, wantInsert: true},
 	}

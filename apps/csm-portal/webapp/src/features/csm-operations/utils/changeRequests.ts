@@ -208,7 +208,7 @@ export function changeRequestBlockingReason(
  * {@link changeRequestTransitionLabel}, so they still render and still work.
  */
 const TRANSITION_LABEL: Record<string, string> = {
-  assess: "Request approval",
+  assess: "Move to Assess",
   scheduled: "Schedule",
   implement: "Start implementation",
   review: "Mark implemented",

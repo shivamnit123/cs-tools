@@ -63,7 +63,7 @@ type ABTTeamScheduleMemberSchedule struct {
 // belief that getABTTeamScheduleDetails never populated it. It does —
 // modules/operations/operations.bal lines ~242-263 fill Teams/EventTypes
 // from snTeamScheduleData.result.metadata, and the SPL frontend's team/
-// event-type filter dropdowns (SplTeamSchedulePage.tsx) depend on this data
+// event-type filter dropdowns (TeamSchedulePage.tsx) depend on this data
 // being present. If those dropdowns are ever empty against a real backend
 // again, check that ServiceNow's actual response still nests
 // result.metadata[].teams/eventTypes the way snABTTeamScheduleData below

@@ -15,81 +15,100 @@
 // under the License.
 
 // Ported from apps/support-portal-lite/webapp's own
-// features/spl/cases/components/CaseStateCard.tsx. Error prop type swapped
-// from useSplApi's GetApiResponseError to this app's own React-Query Error.
-import { Card, CardActionArea, CardContent, CircularProgress, Typography } from "@wso2/oxygen-ui";
-import { alpha, useTheme, useColorScheme } from "@mui/material/styles";
-import { CircleAlertIcon } from "@wso2/oxygen-ui-icons-react";
+// features/spl/cases/components/CaseStateCard.tsx, then restyled to match
+// CSM Portal's own dashboard widget tile (DashboardWidgetTile.tsx's
+// shape==="count" body: an icon circle, a caption label and a large plain
+// count, on an outlined card with a primary-tinted hover) instead of a
+// solid-grey box with a per-state text color -- that's this card's own
+// previous style here, replaced during the SPL port; this restores it.
+// Deliberately NOT importing DashboardWidgetTile itself: that component
+// fetches its own data from a backend-configurable widget registry
+// (useWidgetData, resourceType/filters), which doesn't exist for SPL's six
+// fixed case states -- only its visual shape is reused, not its data layer
+// or its click-through-to-a-different-page behavior (this card still
+// toggles CasesPage's own inline state view, same as before).
+import { Box, Card, CardActionArea, CircularProgress, Typography } from "@wso2/oxygen-ui";
+import { Briefcase, CircleAlertIcon } from "@wso2/oxygen-ui-icons-react";
+import { alpha, useTheme } from "@mui/material/styles";
 import type { CaseDetailsWithCount } from "../api/caseTypes";
 
 export default function CaseStateCard({
   state,
-  color,
   data,
   loading,
   error,
   setCaseState,
 }: {
   state: string;
-  /** A {light, dark} pair, not one static color — see CasesPage's COLORS
-   *  for why a single hex can't have good contrast against the card's own
-   *  background in both modes. */
-  color: { light: string; dark: string };
   data: CaseDetailsWithCount | undefined;
   loading: boolean;
   error: Error | null | undefined;
   setCaseState: (state: string) => void;
 }) {
   const theme = useTheme();
-  // theme.palette.mode is not live under oxygen-ui's CSS-variables theme
-  // (extendTheme()) — confirmed empirically. useColorScheme() is the hook
-  // that actually tracks the live scheme.
-  const { mode: colorMode, systemMode } = useColorScheme();
-  const isDark = (colorMode === "system" ? systemMode : colorMode) === "dark";
-  const countColor = isDark ? color.dark : color.light;
 
   return (
     <Card
+      variant="outlined"
       sx={{
         width: 290,
-        height: 175,
-        cursor: "pointer",
-        // One uniform, slightly darker neutral for all six cards (regardless
-        // of state) instead of the default white/paper background — reads as
-        // a deliberate set of tiles against the "Overall Case Summary" panel
-        // rather than blending into it. Per-state identity stays in the
-        // count's own text color (the `color` prop below), not the card.
-        backgroundColor: isDark ? theme.palette.grey[800] : theme.palette.grey[200],
-        // Same warm-orange hover identity in both modes — a solid light
-        // peach reads fine on a light card but washes out a dark one, so an
-        // alpha overlay (which composites against whatever's underneath)
-        // stands in for the literal hex the source app used.
-        "&:hover": { backgroundColor: alpha("#ff7300", isDark ? 0.24 : 0.35) },
-        display: "flex",
-        alignContent: "center",
+        // Same hover identity as DashboardWidgetTile's own count-shape tile
+        // (widgetHoverSx there): a transparent border that tints on hover,
+        // plus a small lift -- no boxShadow.
+        border: "1px solid transparent",
+        transition: "border-color 0.2s ease, background-color 0.2s ease, transform 0.15s ease",
+        "&:hover": {
+          borderColor: theme.palette.primary.main,
+          bgcolor: alpha(theme.palette.primary.main, 0.06),
+          transform: "translateY(-1px)",
+        },
       }}
     >
-      <CardActionArea onClick={() => setCaseState(state)} disabled={loading || !!error}>
-        <CardContent
-          sx={{ display: "flex", justifyContent: "center", flexDirection: !error && !loading ? "column" : undefined }}
-        >
-          {loading ? (
+      <CardActionArea
+        onClick={() => setCaseState(state)}
+        disabled={loading || !!error}
+        sx={{ p: 1.75, height: "100%" }}
+      >
+        {loading ? (
+          <Box sx={{ display: "flex", justifyContent: "center", py: 2 }}>
             <CircularProgress color="primary" />
-          ) : error ? (
+          </Box>
+        ) : error ? (
+          <Box sx={{ display: "flex", justifyContent: "center", py: 2 }}>
             <CircleAlertIcon size={36} color={theme.palette.error.main} />
-          ) : (
-            data && (
-              <>
-                <Typography align="center" gutterBottom variant="h3" component="div" color={countColor}>
-                  {data.count}
-                </Typography>
-                <Typography align="center" gutterBottom variant="h5" component="div">
+          </Box>
+        ) : (
+          data && (
+            <Box sx={{ display: "flex", alignItems: "flex-start", gap: 1.25 }}>
+              <Box
+                sx={{
+                  p: 0.75,
+                  mt: 0.25,
+                  borderRadius: "50%",
+                  bgcolor: alpha(theme.palette.primary.light, 0.1),
+                  color: theme.palette.primary.light,
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  flexShrink: 0,
+                }}
+              >
+                <Briefcase size={16} />
+              </Box>
+              <Box sx={{ minWidth: 0, flex: 1 }}>
+                <Typography variant="caption" color="text.secondary" noWrap>
                   {state}
                 </Typography>
-              </>
-            )
-          )}
-        </CardContent>
+                <Typography
+                  noWrap
+                  sx={{ mt: 0.5, lineHeight: 1.1, fontWeight: 400, fontSize: "3.25rem" }}
+                >
+                  {data.count.toLocaleString()}
+                </Typography>
+              </Box>
+            </Box>
+          )
+        )}
       </CardActionArea>
     </Card>
   );

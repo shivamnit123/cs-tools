@@ -22,9 +22,11 @@ import (
 	"errors"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/events"
+	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/notifications"
 )
 
 // fakeStatusLister is a hand-written fake for statusLister, following this
@@ -48,23 +50,26 @@ type tierCall struct {
 // a test simulate a concurrent replica (or an earlier attempt) already
 // holding a given tier's claim, without needing a real Redis.
 type fakeTierStore struct {
-	tiers  map[string]int
-	claims map[string]bool
+	tiers       map[string]int
+	claims      map[string]bool
+	emailClaims map[string]bool
 
-	getErr     error
-	setErr     error
-	claimErr   error
-	releaseErr error
+	getErr        error
+	setErr        error
+	claimErr      error
+	releaseErr    error
+	claimEmailErr error
 
 	forceClaimLoss map[string]bool
 
-	sets         []tierCall
-	claimCalls   []tierCall
-	releaseCalls []tierCall
+	sets            []tierCall
+	claimCalls      []tierCall
+	releaseCalls    []tierCall
+	claimEmailCalls []tierCall
 }
 
 func newFakeTierStore() *fakeTierStore {
-	return &fakeTierStore{tiers: map[string]int{}, claims: map[string]bool{}, forceClaimLoss: map[string]bool{}}
+	return &fakeTierStore{tiers: map[string]int{}, claims: map[string]bool{}, emailClaims: map[string]bool{}, forceClaimLoss: map[string]bool{}}
 }
 
 func (f *fakeTierStore) key(caseID, clockType string) string { return caseID + "|" + clockType }
@@ -112,6 +117,19 @@ func (f *fakeTierStore) ReleaseTier(_ context.Context, caseID, clockType string,
 	return nil
 }
 
+func (f *fakeTierStore) ClaimEmail(_ context.Context, caseID, clockType string, tier int) (bool, error) {
+	if f.claimEmailErr != nil {
+		return false, f.claimEmailErr
+	}
+	f.claimEmailCalls = append(f.claimEmailCalls, tierCall{caseID, clockType, tier})
+	key := f.claimKey(caseID, clockType, tier)
+	if f.emailClaims[key] {
+		return false, nil
+	}
+	f.emailClaims[key] = true
+	return true, nil
+}
+
 type publishCall struct {
 	key, value []byte
 }
@@ -140,7 +158,7 @@ type fakeChatSender struct {
 	hasAudienceSpace func(string) bool
 }
 
-func (f *fakeChatSender) SendSLABreachAlert(_ context.Context, audience, clockType, tier, caseNumber, _, _, _, _, _, _, _, _, _ string) error {
+func (f *fakeChatSender) SendSLABreachAlert(_ context.Context, audience, clockType, tier, caseNumber, _, _, _, _, _, _, _, _, _, _ string) error {
 	f.calls = append(f.calls, chatCall{audience, clockType, tier, caseNumber})
 	return f.err
 }
@@ -150,6 +168,23 @@ func (f *fakeChatSender) HasAudienceSpace(audience string) bool {
 		return f.hasAudienceSpace(audience)
 	}
 	return false
+}
+
+type emailCall struct {
+	to, cc  []string
+	subject string
+	body    string
+}
+
+// fakeEmailSender is a hand-written fake for emailSender.
+type fakeEmailSender struct {
+	calls []emailCall
+	err   error
+}
+
+func (f *fakeEmailSender) SendEmail(_ context.Context, to, cc, _, _ []string, subject, htmlBody string, _ []notifications.EmailAttachment) error {
+	f.calls = append(f.calls, emailCall{to: to, cc: cc, subject: subject, body: htmlBody})
+	return f.err
 }
 
 // fakeLinkResolver is a hand-written fake for linkResolver.
@@ -385,6 +420,244 @@ func TestEngine_Tick_ChatFailurePropagatesAndKeepsCursor(t *testing.T) {
 	}
 	if store.tiers["CASE-1|response"] != 0 {
 		t.Errorf("cursor = %d, want left at 0 (chat send failed before it could advance)", store.tiers["CASE-1|response"])
+	}
+}
+
+// TestEngine_SendBreachEmails_StillSendsWhenChatFails verifies a Chat
+// outage doesn't also suppress the breach emails — a real gap this closed:
+// previously, alertTier returned before sendBreachEmails ever ran when
+// sendBreachAlert failed, so a case whose clock completed (and so dropped
+// out of the active /sla-status list) before Chat recovered never got
+// either email at all.
+func TestEngine_SendBreachEmails_StillSendsWhenChatFails(t *testing.T) {
+	entity := &fakeStatusLister{statuses: []SLAStatus{{
+		CaseID: "CASE-1", ClockType: "response", BusinessElapsedPercent: 50,
+		AssigneeEmail: "assignee@example.test", TeamEmail: "team@example.test",
+	}}}
+	store := newFakeTierStore()
+	store.tiers["CASE-1|response"] = 0
+	e := newTestEngine(entity, store, &fakePublisher{})
+	e.chat = &fakeChatSender{err: errors.New("chat webhook unreachable")}
+	email := &fakeEmailSender{}
+	e.email = email
+	e.emailSendingEnabled = true
+
+	if err := e.Tick(context.Background()); err == nil {
+		t.Fatal("Tick() error = nil, want the chat send failure propagated")
+	}
+	if len(email.calls) != 2 {
+		t.Fatalf("email calls = %d, want 2 (assignee + team) sent despite the chat failure, got %+v", len(email.calls), email.calls)
+	}
+}
+
+// TestEngine_SendBreachEmails_NotResentOnChatRetry verifies a tier retried
+// solely because the Chat alert failed does not re-send an already-
+// attempted breach email on the next Tick — the per-tier Redis claim
+// (TierStore.ClaimEmail) this closes a duplicate-send gap for.
+func TestEngine_SendBreachEmails_NotResentOnChatRetry(t *testing.T) {
+	entity := &fakeStatusLister{statuses: []SLAStatus{{
+		CaseID: "CASE-1", ClockType: "response", BusinessElapsedPercent: 50,
+		AssigneeEmail: "assignee@example.test", TeamEmail: "team@example.test",
+	}}}
+	store := newFakeTierStore()
+	store.tiers["CASE-1|response"] = 0
+	e := newTestEngine(entity, store, &fakePublisher{})
+	failingChat := &fakeChatSender{err: errors.New("chat webhook unreachable")}
+	e.chat = failingChat
+	email := &fakeEmailSender{}
+	e.email = email
+	e.emailSendingEnabled = true
+
+	if err := e.Tick(context.Background()); err == nil {
+		t.Fatal("first Tick() error = nil, want the chat send failure propagated")
+	}
+	if len(email.calls) != 2 {
+		t.Fatalf("after first Tick: email calls = %d, want 2", len(email.calls))
+	}
+
+	// Chat now recovers; the cursor was never advanced, so this tier is
+	// retried from scratch.
+	failingChat.err = nil
+	if err := e.Tick(context.Background()); err != nil {
+		t.Fatalf("second Tick() error = %v, want nil now that chat recovered", err)
+	}
+	if len(email.calls) != 2 {
+		t.Errorf("after second Tick: email calls = %d, want still 2 (not resent on the chat-triggered retry)", len(email.calls))
+	}
+}
+
+// TestEngine_SendBreachEmails_FallsBackToCaseIDWhenCaseNumberEmpty verifies
+// the email path uses the same caseNumber fallback sendBreachAlert's own
+// Chat card already has: a work item with no resolved CaseNumber still gets
+// a non-blank case reference in the email subject/body, via s.CaseID.
+func TestEngine_SendBreachEmails_FallsBackToCaseIDWhenCaseNumberEmpty(t *testing.T) {
+	entity := &fakeStatusLister{statuses: []SLAStatus{{
+		CaseID: "CASE-1", ClockType: "response", BusinessElapsedPercent: 50,
+		AssigneeEmail: "assignee@example.test",
+	}}}
+	store := newFakeTierStore()
+	store.tiers["CASE-1|response"] = 0
+	e := newTestEngine(entity, store, &fakePublisher{})
+	email := &fakeEmailSender{}
+	e.email = email
+	e.emailSendingEnabled = true
+
+	if err := e.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick() error = %v, want nil", err)
+	}
+	if len(email.calls) != 1 {
+		t.Fatalf("email calls = %d, want 1 (assignee only, no team email configured)", len(email.calls))
+	}
+	if !strings.Contains(email.calls[0].subject, "CASE-1") {
+		t.Errorf("subject = %q, want it to fall back to the raw case id when CaseNumber is empty", email.calls[0].subject)
+	}
+}
+
+// TestEngine_SendBreachEmails_DebugModeRedirectsToDebugRecipientsOnly
+// verifies neither breach email ever reaches the real assignee/team
+// addresses while EMAIL_DEBUG_MODE is on — only the configured debug
+// recipients do, matching dispatch.go's own EMAIL_DEBUG_MODE contract for
+// every other email in this service.
+func TestEngine_SendBreachEmails_DebugModeRedirectsToDebugRecipientsOnly(t *testing.T) {
+	entity := &fakeStatusLister{statuses: []SLAStatus{{
+		CaseID: "CASE-1", ClockType: "response", BusinessElapsedPercent: 50,
+		AssigneeEmail: "assignee@example.test", TeamEmail: "team@example.test",
+	}}}
+	store := newFakeTierStore()
+	store.tiers["CASE-1|response"] = 0
+	e := newTestEngine(entity, store, &fakePublisher{})
+	email := &fakeEmailSender{}
+	e.email = email
+	e.emailSendingEnabled = true
+	e.emailDebugMode = true
+	e.emailDebugRecipients = []string{"debug@example.test"}
+
+	if err := e.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick() error = %v, want nil", err)
+	}
+	if len(email.calls) != 2 {
+		t.Fatalf("email calls = %d, want 2 (assignee + team)", len(email.calls))
+	}
+	for _, c := range email.calls {
+		if len(c.to) != 1 || c.to[0] != "debug@example.test" {
+			t.Errorf("to = %v, want only the configured debug recipient", c.to)
+		}
+		for _, addr := range c.to {
+			if addr == "assignee@example.test" || addr == "team@example.test" {
+				t.Errorf("real address %q leaked into To while EMAIL_DEBUG_MODE is on", addr)
+			}
+		}
+	}
+}
+
+// TestEngine_SendBreachEmails_DebugModeSkipsWhenNoDebugRecipientsConfigured
+// verifies a misconfigured debug mode (no EMAIL_DEBUG_RECIPIENTS) skips the
+// send rather than falling back to the real address — the same posture
+// dispatch.go's sendPerGroup takes for the same misconfiguration.
+func TestEngine_SendBreachEmails_DebugModeSkipsWhenNoDebugRecipientsConfigured(t *testing.T) {
+	entity := &fakeStatusLister{statuses: []SLAStatus{{
+		CaseID: "CASE-1", ClockType: "response", BusinessElapsedPercent: 50,
+		AssigneeEmail: "assignee@example.test", TeamEmail: "team@example.test",
+	}}}
+	store := newFakeTierStore()
+	store.tiers["CASE-1|response"] = 0
+	e := newTestEngine(entity, store, &fakePublisher{})
+	email := &fakeEmailSender{}
+	e.email = email
+	e.emailSendingEnabled = true
+	e.emailDebugMode = true
+	e.emailDebugRecipients = nil
+
+	if err := e.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick() error = %v, want nil", err)
+	}
+	if len(email.calls) != 0 {
+		t.Fatalf("email calls = %d, want 0 (skipped, not sent to the real address)", len(email.calls))
+	}
+}
+
+// TestEngine_SendBreachEmails_UnresolvedTeamStillSendsInDebugMode verifies a
+// team that resolved by name (s.Team) but has no configured group_email
+// (s.TeamEmail empty) still gets a debug-mode email — to the configured
+// debug recipients, naming the team directly in the body — rather than
+// being silently skipped the same way a genuinely unknown team would be.
+// Lets a tester confirm team routing resolved correctly without needing
+// every team's group_email populated in every test environment.
+func TestEngine_SendBreachEmails_UnresolvedTeamStillSendsInDebugMode(t *testing.T) {
+	entity := &fakeStatusLister{statuses: []SLAStatus{{
+		CaseID: "CASE-1", ClockType: "response", BusinessElapsedPercent: 50,
+		Team: "Atlas",
+	}}}
+	store := newFakeTierStore()
+	store.tiers["CASE-1|response"] = 0
+	e := newTestEngine(entity, store, &fakePublisher{})
+	email := &fakeEmailSender{}
+	e.email = email
+	e.emailSendingEnabled = true
+	e.emailDebugMode = true
+	e.emailDebugRecipients = []string{"debug@example.test"}
+
+	if err := e.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick() error = %v, want nil", err)
+	}
+	if len(email.calls) != 1 {
+		t.Fatalf("email calls = %d, want 1 (team only — no assignee resolved)", len(email.calls))
+	}
+	sent := email.calls[0]
+	if len(sent.to) != 1 || sent.to[0] != "debug@example.test" {
+		t.Errorf("to = %v, want only the configured debug recipient", sent.to)
+	}
+	if !strings.Contains(sent.body, "Atlas") {
+		t.Errorf("body does not name the unresolved team (%q) anywhere", "Atlas")
+	}
+}
+
+// TestEngine_SendBreachEmails_UnresolvedTeamNeverSendsOutsideDebugMode
+// verifies the same unresolved-team case sends nothing at all when
+// EMAIL_DEBUG_MODE is off — production genuinely has no real address to
+// send a team email to, debug or not.
+func TestEngine_SendBreachEmails_UnresolvedTeamNeverSendsOutsideDebugMode(t *testing.T) {
+	entity := &fakeStatusLister{statuses: []SLAStatus{{
+		CaseID: "CASE-1", ClockType: "response", BusinessElapsedPercent: 50,
+		Team: "Atlas",
+	}}}
+	store := newFakeTierStore()
+	store.tiers["CASE-1|response"] = 0
+	e := newTestEngine(entity, store, &fakePublisher{})
+	email := &fakeEmailSender{}
+	e.email = email
+	e.emailSendingEnabled = true
+
+	if err := e.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick() error = %v, want nil", err)
+	}
+	if len(email.calls) != 0 {
+		t.Fatalf("email calls = %d, want 0 — production has no real team email to send to", len(email.calls))
+	}
+}
+
+// TestEngine_SendBreachEmails_UnresolvedAssigneeNeverSendsEvenInDebugMode
+// verifies the assignee recipient does NOT get this same unresolved-label
+// treatment — an unassigned case has no name worth surfacing, unlike a
+// team, so it stays skipped in debug mode exactly as in production.
+func TestEngine_SendBreachEmails_UnresolvedAssigneeNeverSendsEvenInDebugMode(t *testing.T) {
+	entity := &fakeStatusLister{statuses: []SLAStatus{{
+		CaseID: "CASE-1", ClockType: "response", BusinessElapsedPercent: 50,
+	}}}
+	store := newFakeTierStore()
+	store.tiers["CASE-1|response"] = 0
+	e := newTestEngine(entity, store, &fakePublisher{})
+	email := &fakeEmailSender{}
+	e.email = email
+	e.emailSendingEnabled = true
+	e.emailDebugMode = true
+	e.emailDebugRecipients = []string{"debug@example.test"}
+
+	if err := e.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick() error = %v, want nil", err)
+	}
+	if len(email.calls) != 0 {
+		t.Fatalf("email calls = %d, want 0 — no assignee and no team to send to", len(email.calls))
 	}
 }
 

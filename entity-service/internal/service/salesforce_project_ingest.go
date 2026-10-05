@@ -318,6 +318,7 @@ func (s *salesforceEventService) upsertProject(ctx context.Context, sfID, eventT
 	slog.InfoContext(ctx, "salesforce: project ingested",
 		"projectSfId", sfID, "key", row.Key, "projectId", res.ProjectID, "created", res.Created,
 		"linkedByKey", res.LinkedByKey, "reactivated", res.Reactivated)
+	s.requeueChildrenOf(ctx, repository.MissingParent{Kind: repository.MissingParentProject, SfID: sfID, Key: row.Key})
 	return nil
 }
 

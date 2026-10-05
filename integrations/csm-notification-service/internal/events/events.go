@@ -68,13 +68,6 @@ const (
 	// see cmd/server/main.go's kbDraftConsumerGroup comment).
 	TypeKBArticlePublished Type = "kb.article_published"
 
-	// TypeCRApprovalRequested is published by csm-flow-service's
-	// cr_approval_notice flow when a change request enters an approval state.
-	// Unlike the case.* types, its recipients and subject arrive already
-	// resolved: the flow owns the branch-specific wording and the audience
-	// lookup, so this service renders and sends rather than deciding who.
-	TypeCRApprovalRequested Type = "change_request.approval_requested"
-
 	// TypeCaseBillableStatusChanged is Postgres-data-source-only on the
 	// entity-service side, and — like TypeSLATierReached above — not an
 	// email/Chat trigger, so dispatch.Handle's switch has no
@@ -101,6 +94,13 @@ const (
 	// this type is otherwise dormant.
 	TypeCaseBillableStatusChanged Type = "case.billable_status_changed"
 
+	// TypeCRApprovalRequested is published by csm-flow-service's
+	// cr_approval_notice flow when a change request enters an approval state.
+	// Unlike the case.* types, its recipients and subject arrive already
+	// resolved: the flow owns the branch-specific wording and the audience
+	// lookup, so this service renders and sends rather than deciding who.
+	TypeCRApprovalRequested Type = "change_request.approval_requested"
+
 	// TypeProjectContactInvited is published by entity-service's Salesforce
 	// membership ingest once a Project_Contact__c in state INVITED /
 	// RE-INVITED has been written to Postgres (see that repo's own CLAUDE.md,
@@ -125,6 +125,7 @@ var KnownTypes = []Type{
 	TypeCaseCreated, TypeCommentAdded, TypeStatusChanged, TypeCaseAssigned, TypeCaseAcknowledged, TypeSeverityChanged, TypeIncidentCreated,
 	TypeSLATierReached, TypeCaseBillableStatusChanged, TypeKBArticlePublished,
 	TypeCRApprovalRequested, TypeCRPlanDateNotice,
+	TypeOutageNotificationDue, TypeOutageCommunicationDue,
 	TypeProjectContactInvited, TypeProjectContactRegistered,
 }
 
@@ -259,6 +260,16 @@ type KBArticlePublishedPayload struct {
 	KnowledgeArticleID string `json:"knowledgeArticleId"`
 }
 
+// CaseBillableStatusChangedPayload is the Payload shape for
+// TypeCaseBillableStatusChanged — mirrors entity-service's own
+// CaseBillableStatusChangedPayload exactly; see that type's own doc comment
+// for why LOW severity is the one thing this reacts to and why IsBillable
+// is precomputed there rather than left for a consumer to re-derive.
+type CaseBillableStatusChangedPayload struct {
+	CaseID     string `json:"caseId"`
+	IsBillable bool   `json:"isBillable"`
+}
+
 // StatusChangedPayload is TypeStatusChanged's payload. See
 // CaseCreatedPayload's doc comment for why Recipients is here, why
 // ProjectID is required, and for CaseNumber.
@@ -379,16 +390,6 @@ type SLATierReachedPayload struct {
 	CaseID    string `json:"caseId"`
 	ClockType string `json:"clockType"`
 	Tier      string `json:"tier"`
-}
-
-// CaseBillableStatusChangedPayload is the Payload shape for
-// TypeCaseBillableStatusChanged — mirrors entity-service's own
-// CaseBillableStatusChangedPayload exactly; see that type's own doc comment
-// for why LOW severity is the one thing this reacts to and why IsBillable
-// is precomputed there rather than left for a consumer to re-derive.
-type CaseBillableStatusChangedPayload struct {
-	CaseID     string `json:"caseId"`
-	IsBillable bool   `json:"isBillable"`
 }
 
 // TypeCRPlanDateNotice is published by csm-flow-service's cr_plan_date_notice

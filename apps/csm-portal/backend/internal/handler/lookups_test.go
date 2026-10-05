@@ -25,22 +25,22 @@ import (
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
 )
 
-type mockSplLookupsClient struct {
+type mockLookupsClient struct {
 	products []string
 	teams    []string
 	err      error
 }
 
-func (m *mockSplLookupsClient) GetProductList(ctx context.Context) ([]string, error) {
+func (m *mockLookupsClient) GetProductList(ctx context.Context) ([]string, error) {
 	return m.products, m.err
 }
-func (m *mockSplLookupsClient) GetABTTeamList(ctx context.Context) ([]string, error) {
+func (m *mockLookupsClient) GetABTTeamList(ctx context.Context) ([]string, error) {
 	return m.teams, m.err
 }
 
 func TestGetProducts_Success(t *testing.T) {
-	mock := &mockSplLookupsClient{products: []string{"A", "B"}}
-	h := NewSplLookupsHandler(mock, splAccessGuard)
+	mock := &mockLookupsClient{products: []string{"A", "B"}}
+	h := NewLookupsHandler(mock, viewerAccessGuard)
 	req := withUser(httptest.NewRequest(http.MethodGet, "/spl/products", nil))
 	w := httptest.NewRecorder()
 
@@ -54,9 +54,9 @@ func TestGetProducts_Success(t *testing.T) {
 }
 
 func TestGetABTTeams_RejectsMissingSPLAccess(t *testing.T) {
-	h := NewSplLookupsHandler(&mockSplLookupsClient{}, splAccessGuard)
+	h := NewLookupsHandler(&mockLookupsClient{}, viewerAccessGuard)
 	req := httptest.NewRequest(http.MethodGet, "/spl/abt-teams", nil)
-	// Authenticated but holds no role granting PermSPLAccess.
+	// Authenticated but holds no role granting PermViewerAccess.
 	req = req.WithContext(middleware.WithUserInfo(req.Context(), &middleware.UserInfo{Email: "nobody@example.com", UserID: "u-nobody"}))
 	w := httptest.NewRecorder()
 

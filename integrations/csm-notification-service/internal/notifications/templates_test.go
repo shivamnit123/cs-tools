@@ -348,7 +348,7 @@ func TestEscapeHTML_EncodesNonASCIIAsNumericEntity(t *testing.T) {
 // caught: the line used to substitute a raw UUID (project id) there
 // instead.
 func TestRenderCommentAddedEmail_UsesCaseNumberNotRawID(t *testing.T) {
-	out, _ := RenderCommentAddedEmail("Jane Doe", "CS0023001", "Something broke", "Working on it", "https://x/comment", "https://x/case")
+	out, _ := RenderCommentAddedEmail("Jane Doe", "CS0023001", "Something broke", "Working on it", "https://x/comment", "https://x/case", "")
 	if !strings.Contains(out, "CS0023001") {
 		t.Error("rendered email doesn't contain the case number")
 	}
@@ -361,7 +361,7 @@ func TestRenderCommentAddedEmail_UsesCaseNumberNotRawID(t *testing.T) {
 // "commented on case" — matching an existing internal WSO2-support email
 // format recipients (always wso2.com staff) are already used to.
 func TestRenderInternalNoteEmail_NoReplyStrapAndUsesWorkNoteWording(t *testing.T) {
-	out, _ := RenderInternalNoteEmail("Jane Doe", "WSO2-1000", "Something broke", "Internal only", "https://x/comment", "https://x/case")
+	out, _ := RenderInternalNoteEmail("Jane Doe", "WSO2-1000", "Something broke", "Internal only", "https://x/comment", "https://x/case", "")
 	if !strings.Contains(out, "added work note") {
 		t.Error("rendered email doesn't use the internal-note wording")
 	}
@@ -426,7 +426,7 @@ func TestRenderCaseCreatedEmail_OmitsPriorityAndProductRowsWhenEmpty(t *testing.
 // so this checks the same class of mistake can't happen here (e.g. the
 // old severity accidentally substituted into the new severity's slot).
 func TestRenderSeverityChangedEmail_ContainsOldAndNewSeverity(t *testing.T) {
-	out := RenderSeverityChangedEmail("CS0023001", "High (P2)", "Low (P4)", "https://x/case", "https://x/comment")
+	out := RenderSeverityChangedEmail("CS0023001", "High (P2)", "Low (P4)", "https://x/case", "https://x/comment", "")
 	if !strings.Contains(out, "CS0023001") {
 		t.Error("rendered email doesn't contain the case number")
 	}
@@ -638,7 +638,7 @@ func TestRenderProjectContactInvitedEmail_SignInButton(t *testing.T) {
 		"reminder": RenderProjectContactInvitedReminderEmail,
 	} {
 		got := render(ProjectContactInvitedEmailData{DisplayName: "jane", Email: "jane@acme.com", ProjectName: "Acme Cloud", ProjectKey: "ACMECLOUD", PortalURL: portal})
-		for _, want := range []string{`bgcolor="#ff7300"`, "background-color:#ff7300", "color:#000000", "SIGN IN TO SUPPORT PORTAL", "Is the button to sign in not working?", "mailto:support@wso2.com", "Cheers!<br>The WSO2 Team", "wso2-logo-white-new.png"} {
+		for _, want := range []string{`bgcolor="#FF6700"`, "background-color:#FF6700", "color:#000000", ">Sign in to Support Portal</a>", "Button not working? Use this link:", "Sign-in email", "mailto:support@wso2.com", "Cheers!<br>The WSO2 Team", "WSO2-Logo-White.png", "WSO2-Pulse-Orange.png"} {
 			if !strings.Contains(got, want) {
 				t.Errorf("%s: rendered email does not contain %q", name, want)
 			}
@@ -646,8 +646,13 @@ func TestRenderProjectContactInvitedEmail_SignInButton(t *testing.T) {
 		if n := strings.Count(got, portal); n != 3 {
 			t.Errorf("%s: portal URL appears %d times, want 3 (button, fallback href, fallback text)", name, n)
 		}
-		if strings.Contains(got, "text-decoration:underline") {
-			t.Errorf("%s: the old underlined sign-in link is still there", name)
+		// Only the grey fallback link is underlined; the button is not.
+		if n := strings.Count(got, "text-decoration:underline"); n != 1 {
+			t.Errorf("%s: %d underlined links, want 1 (the fallback)", name, n)
+		}
+		// The video belongs in the Welcome email only; invitations keep one action.
+		if strings.Contains(got, "getting-started video") {
+			t.Errorf("%s: invitation should not carry the getting-started video link", name)
 		}
 	}
 }
@@ -659,13 +664,16 @@ func TestRenderProjectContactRegisteredEmail(t *testing.T) {
 		DisplayName: "Jane <Doe>", ProjectName: "Acme Cloud", ProjectKey: "ACMECLOUD", PortalURL: "https://support.wso2.com",
 	})
 	for _, want := range []string{
-		"Hi Jane &lt;Doe&gt;,", "Welcome to the WSO2 Customer Support Portal", "<b>Acme Cloud</b> (ACMECLOUD)", "create and manage cases",
-		`href="https://youtu.be/1v5SqP6qRLc"`, "https://img.youtube.com/vi/1v5SqP6qRLc/hqdefault.jpg",
-		`href="https://support.wso2.com"`, "GO TO SUPPORT PORTAL", `bgcolor="#ff7300"`, "color:#000000", "mailto:support@wso2.com", "Cheers!",
+		"Hi Jane &lt;Doe&gt;,", "Welcome to the WSO2 Customer Support Portal", "<b>Acme Cloud</b>", ">ACMECLOUD</td>", "create and manage cases",
+		`href="https://www.youtube.com/watch?v=2WwZ5-qrp4Q"`, "Watch the getting-started video",
+		`href="https://support.wso2.com"`, ">Go to Support Portal</a>", `bgcolor="#FF6700"`, "color:#000000", "mailto:support@wso2.com", "Cheers!",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("welcome email does not contain %q", want)
 		}
+	}
+	if strings.Contains(got, "Button not working?") {
+		t.Error("welcome email should not carry the fallback link line")
 	}
 	if strings.Contains(got, "<!-- [") || strings.Count(got, "<!DOCTYPE") != 1 {
 		t.Error("welcome email has an unsubstituted placeholder or is not one document")

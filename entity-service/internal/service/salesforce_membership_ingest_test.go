@@ -127,11 +127,17 @@ type fakeStepRepo struct {
 	getErr        error
 	listErr       error
 	retryAttempts []string
+	requeued      []repository.MissingParent
 }
 
-func (f *fakeStepRepo) RecordRetryAttempt(_ context.Context, stepID string, seenUpdatedOn time.Time) (bool, error) {
-	f.retryAttempts = append(f.retryAttempts, stepID+"@"+seenUpdatedOn.Format(time.RFC3339))
+func (f *fakeStepRepo) RecordRetryAttempt(_ context.Context, stepID string) (bool, error) {
+	f.retryAttempts = append(f.retryAttempts, stepID)
 	return true, nil
+}
+
+func (f *fakeStepRepo) RequeueMissingParentFailures(_ context.Context, parent repository.MissingParent) (int64, error) {
+	f.requeued = append(f.requeued, parent)
+	return 0, nil
 }
 
 func (f *fakeStepRepo) Upsert(_ context.Context, req domain.UpsertOnboardingStepRequest) (domain.OnboardingStep, error) {
@@ -985,7 +991,7 @@ func (f *fakeStepRepo) ListMissingParentFailures(_ context.Context, _ time.Durat
 	out := []domain.OnboardingStep{}
 	for _, s := range f.existing {
 		if s.Step == domain.OnboardingStepDatabase && s.Status == domain.OnboardingStepFailed &&
-			repository.IsMissingParentError(derefString(s.LastError)) && s.AttemptCount < maxAttempts && len(out) < limit {
+			repository.IsMissingParentError(derefString(s.LastError)) && s.RetryCount < maxAttempts && len(out) < limit {
 			out = append(out, s)
 		}
 	}
@@ -1014,13 +1020,14 @@ func TestMembershipIngest_RegisteredTransitionPublishesWelcome(t *testing.T) {
 			if err := h.svc.HandleEvent(context.Background(), membershipEvent("UPDATED", "Project_Contact__c")); err != nil {
 				t.Fatalf("HandleEvent: %v", err)
 			}
-			if len(h.pub.published) != tc.want {
-				t.Fatalf("published = %d, want %d", len(h.pub.published), tc.want)
+			welcomes := publishedOfType(h.pub, events.TypeProjectContactRegistered)
+			if len(welcomes) != tc.want {
+				t.Fatalf("welcomes = %d, want %d", len(welcomes), tc.want)
 			}
 			if tc.want == 0 {
 				return
 			}
-			env := h.pub.published[0]
+			env := welcomes[0]
 			if env.Type != events.TypeProjectContactRegistered || env.EntityID != testMembershipID {
 				t.Errorf("envelope = %s %s", env.Type, env.EntityID)
 			}
@@ -1056,5 +1063,55 @@ func TestMembershipIngest_ReplayOfRegisteredVersionDoesNotPublish(t *testing.T) 
 	}
 	if len(h.pub.published) != 1 {
 		t.Errorf("published = %d after a replay, want still 1", len(h.pub.published))
+	}
+}
+
+func publishedOfType(p *fakeInvitePublisher, typ events.Type) []events.Envelope {
+	var out []events.Envelope
+	for _, e := range p.published {
+		if e.Type == typ {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// TestMembershipIngest_NewMembershipOfASignedInContactPublishesInvited: an
+// unlocked contact's new membership is saved REGISTERED; only a new one is told.
+func TestMembershipIngest_NewMembershipOfASignedInContactPublishesInvited(t *testing.T) {
+	fresh := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	old := time.Now().UTC().Add(-48 * time.Hour).Format(time.RFC3339)
+	cases := map[string]struct {
+		eventType   string
+		existed     bool
+		previous    string
+		createdDate *string
+		want        int
+	}{
+		"created now":                   {eventType: "CREATED", createdDate: &fresh, want: 1},
+		"created by an UPDATED first":   {eventType: "UPDATED", createdDate: &fresh, want: 1},
+		"backfill of an old record":     {eventType: "UPDATED", createdDate: &old, want: 0},
+		"no createdDate":                {eventType: "CREATED", want: 0},
+		"reactivated from deactivated":  {eventType: "UPDATED", existed: true, previous: "DEACTIVATED", want: 1},
+		"undelete of a deactivated row": {eventType: "RESTORED", existed: true, previous: "DEACTIVATED", want: 0},
+		"echo of a portal write":        {eventType: "UPDATED", existed: true, previous: "REGISTERED", createdDate: &fresh, want: 0},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			pc := sampleProjectContact("REGISTERED", "Portal user")
+			pc.CreatedDate = tc.createdDate
+			h := newIngestHarness(pc, sampleContact(), true)
+			h.repo.rowAlreadyExisted = tc.existed
+			h.repo.previousState = tc.previous
+			if err := h.svc.HandleEvent(context.Background(), membershipEvent(tc.eventType, "Project_Contact__c")); err != nil {
+				t.Fatalf("HandleEvent: %v", err)
+			}
+			if got := len(publishedOfType(h.pub, events.TypeProjectContactInvited)); got != tc.want {
+				t.Errorf("invited = %d, want %d", got, tc.want)
+			}
+			if got := len(publishedOfType(h.pub, events.TypeProjectContactRegistered)); got != 0 {
+				t.Errorf("welcomes = %d, want 0", got)
+			}
+		})
 	}
 }

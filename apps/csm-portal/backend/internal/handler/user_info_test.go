@@ -27,7 +27,7 @@ import (
 
 func TestSplGetUserInfo(t *testing.T) {
 	t.Run("requires authenticated user", func(t *testing.T) {
-		h := NewSplUserInfoHandler(&mockEntityUserClient{}, splAccessGuard)
+		h := NewUserInfoHandler(&mockEntityUserClient{}, viewerAccessGuard)
 		r := httptest.NewRequest(http.MethodGet, "/spl/user-info", nil)
 		w := httptest.NewRecorder()
 		h.GetUserInfo(w, r)
@@ -35,10 +35,10 @@ func TestSplGetUserInfo(t *testing.T) {
 		assertErrorMessage(t, w, ErrMsgUnauthorized)
 	})
 
-	t.Run("rejects a role that doesn't grant PermSPLAccess", func(t *testing.T) {
-		h := NewSplUserInfoHandler(&mockEntityUserClient{}, splAccessGuard)
+	t.Run("rejects a role that doesn't grant PermViewerAccess", func(t *testing.T) {
+		h := NewUserInfoHandler(&mockEntityUserClient{}, viewerAccessGuard)
 		r := httptest.NewRequest(http.MethodGet, "/spl/user-info", nil)
-		// Authenticated but holds no role granting PermSPLAccess.
+		// Authenticated but holds no role granting PermViewerAccess.
 		r = r.WithContext(middleware.WithUserInfo(r.Context(), &middleware.UserInfo{Email: "nobody@example.com", UserID: "u-nobody"}))
 		w := httptest.NewRecorder()
 		h.GetUserInfo(w, r)
@@ -48,12 +48,12 @@ func TestSplGetUserInfo(t *testing.T) {
 
 	t.Run("resolves the caller's own name from entity-service", func(t *testing.T) {
 		var called bool
-		h := NewSplUserInfoHandler(&mockEntityUserClient{
+		h := NewUserInfoHandler(&mockEntityUserClient{
 			getUserMeFn: func(ctx context.Context) ([]byte, error) {
 				called = true
 				return []byte(`{"id":"u-1","email":"agent@example.com","firstName":"Agent","lastName":"Example"}`), nil
 			},
-		}, splAccessGuard)
+		}, viewerAccessGuard)
 		r := withUser(httptest.NewRequest(http.MethodGet, "/spl/user-info", nil))
 		w := httptest.NewRecorder()
 		h.GetUserInfo(w, r)
@@ -61,18 +61,18 @@ func TestSplGetUserInfo(t *testing.T) {
 		if !called {
 			t.Error("entity GetUserMe was not called")
 		}
-		view := decodeJSON[SplUserInfoView](t, w)
+		view := decodeJSON[UserInfoView](t, w)
 		if view.FirstName != "Agent" || view.LastName != "Example" {
 			t.Errorf("view = %+v, want FirstName=Agent LastName=Example", view)
 		}
 	})
 
 	t.Run("maps upstream failure to a generic 500", func(t *testing.T) {
-		h := NewSplUserInfoHandler(&mockEntityUserClient{
+		h := NewUserInfoHandler(&mockEntityUserClient{
 			getUserMeFn: func(ctx context.Context) ([]byte, error) {
 				return nil, context.DeadlineExceeded
 			},
-		}, splAccessGuard)
+		}, viewerAccessGuard)
 		r := withUser(httptest.NewRequest(http.MethodGet, "/spl/user-info", nil))
 		w := httptest.NewRecorder()
 		h.GetUserInfo(w, r)

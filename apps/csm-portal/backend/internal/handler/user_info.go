@@ -29,32 +29,32 @@ type entityUserMeClient interface {
 	GetUserMe(ctx context.Context) ([]byte, error)
 }
 
-// SplUserInfoView is the portal response for GET /user-info.
-type SplUserInfoView struct {
+// UserInfoView is the portal response for GET /user-info.
+type UserInfoView struct {
 	FirstName string `json:"firstName"`
 	LastName  string `json:"lastName"`
 }
 
-// SplUserInfoHandler handles HTTP requests for the caller's own name,
+// UserInfoHandler handles HTTP requests for the caller's own name,
 // delegating to entity-service — the same GET /users/me call UsersHandler.GetMe
 // already makes, since first/last name already live on entity-service's own
 // user table (no separate employee-info lookup needed for them).
-type SplUserInfoHandler struct {
+type UserInfoHandler struct {
 	entity      entityUserMeClient
 	accessGuard *AccessGuard
 }
 
-// NewSplUserInfoHandler creates a SplUserInfoHandler backed by the given
-// entity client. accessGuard enforces PermSPLAccess, SupportPortalLite's
+// NewUserInfoHandler creates a UserInfoHandler backed by the given
+// entity client. accessGuard enforces PermViewerAccess, SupportPortalLite's
 // blanket audience gate.
-func NewSplUserInfoHandler(entity entityUserMeClient, accessGuard *AccessGuard) *SplUserInfoHandler {
-	return &SplUserInfoHandler{entity: entity, accessGuard: accessGuard}
+func NewUserInfoHandler(entity entityUserMeClient, accessGuard *AccessGuard) *UserInfoHandler {
+	return &UserInfoHandler{entity: entity, accessGuard: accessGuard}
 }
 
 // GetUserInfo handles GET /user-info: returns the caller's own first/last
 // name, resolved from entity-service.
-func (h *SplUserInfoHandler) GetUserInfo(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+func (h *UserInfoHandler) GetUserInfo(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
@@ -73,7 +73,7 @@ func (h *SplUserInfoHandler) GetUserInfo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	writeJSONValue(w, http.StatusOK, SplUserInfoView{
+	writeJSONValue(w, http.StatusOK, UserInfoView{
 		FirstName: derefStr(resp.FirstName),
 		LastName:  resp.LastName,
 	})

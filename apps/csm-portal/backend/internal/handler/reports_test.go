@@ -26,7 +26,7 @@ import (
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/servicenow"
 )
 
-type mockSplReportsClient struct {
+type mockReportsClient struct {
 	slaReport        servicenow.SLAReportDetails
 	slaErr           error
 	projectReport    servicenow.CSReportDetails
@@ -35,20 +35,20 @@ type mockSplReportsClient struct {
 	timelogsErr      error
 }
 
-func (m *mockSplReportsClient) GetSLAReport(ctx context.Context, projectSysID, from, to string) (servicenow.SLAReportDetails, error) {
+func (m *mockReportsClient) GetSLAReport(ctx context.Context, projectSysID, from, to string) (servicenow.SLAReportDetails, error) {
 	return m.slaReport, m.slaErr
 }
 
-func (m *mockSplReportsClient) GetProjectReportDetails(ctx context.Context, projectSysID, from, to string) (servicenow.CSReportDetails, error) {
+func (m *mockReportsClient) GetProjectReportDetails(ctx context.Context, projectSysID, from, to string) (servicenow.CSReportDetails, error) {
 	return m.projectReport, m.projectReportErr
 }
 
-func (m *mockSplReportsClient) GetTimeLogBreakdown(ctx context.Context, projectID string) (servicenow.TimeLogBreakdownDetails, error) {
+func (m *mockReportsClient) GetTimeLogBreakdown(ctx context.Context, projectID string) (servicenow.TimeLogBreakdownDetails, error) {
 	return m.timelogs, m.timelogsErr
 }
 
 func TestGenerateSLAReport_RequiresQueryParams(t *testing.T) {
-	h := NewSplReportsHandler(&mockSplReportsClient{}, splAccessGuard)
+	h := NewReportsHandler(&mockReportsClient{}, viewerAccessGuard)
 	req := withUser(httptest.NewRequest(http.MethodGet, "/spl/generate-sla-report", nil))
 	w := httptest.NewRecorder()
 
@@ -58,9 +58,9 @@ func TestGenerateSLAReport_RequiresQueryParams(t *testing.T) {
 }
 
 func TestGenerateSLAReport_RejectsMissingSPLAccess(t *testing.T) {
-	h := NewSplReportsHandler(&mockSplReportsClient{}, splAccessGuard)
+	h := NewReportsHandler(&mockReportsClient{}, viewerAccessGuard)
 	req := httptest.NewRequest(http.MethodGet, "/spl/generate-sla-report?projectSysId=p1&from=2024-01-01&to=2024-01-31", nil)
-	// Authenticated but holds no role granting PermSPLAccess.
+	// Authenticated but holds no role granting PermViewerAccess.
 	req = req.WithContext(middleware.WithUserInfo(req.Context(), &middleware.UserInfo{Email: "nobody@example.com", UserID: "u-nobody"}))
 	w := httptest.NewRecorder()
 
@@ -70,8 +70,8 @@ func TestGenerateSLAReport_RejectsMissingSPLAccess(t *testing.T) {
 }
 
 func TestGenerateSLAReport_Success(t *testing.T) {
-	mock := &mockSplReportsClient{slaReport: servicenow.SLAReportDetails{ProjectName: "Acme"}}
-	h := NewSplReportsHandler(mock, splAccessGuard)
+	mock := &mockReportsClient{slaReport: servicenow.SLAReportDetails{ProjectName: "Acme"}}
+	h := NewReportsHandler(mock, viewerAccessGuard)
 	req := withUser(httptest.NewRequest(http.MethodGet, "/spl/generate-sla-report?projectSysId=p1&from=2024-01-01&to=2024-01-31", nil))
 	w := httptest.NewRecorder()
 
@@ -85,7 +85,7 @@ func TestGenerateSLAReport_Success(t *testing.T) {
 }
 
 func TestGenerateSLAReport_RejectsUnsafeProjectSysID(t *testing.T) {
-	h := NewSplReportsHandler(&mockSplReportsClient{}, splAccessGuard)
+	h := NewReportsHandler(&mockReportsClient{}, viewerAccessGuard)
 	req := withUser(httptest.NewRequest(http.MethodGet, "/spl/generate-sla-report?projectSysId=p1%5EORactive%3Dtrue&from=2024-01-01&to=2024-01-31", nil))
 	w := httptest.NewRecorder()
 
@@ -95,8 +95,8 @@ func TestGenerateSLAReport_RejectsUnsafeProjectSysID(t *testing.T) {
 }
 
 func TestGenerateTimelogsBreakdownReport_NotFound(t *testing.T) {
-	mock := &mockSplReportsClient{timelogsErr: servicenow.ErrProjectNotFound}
-	h := NewSplReportsHandler(mock, splAccessGuard)
+	mock := &mockReportsClient{timelogsErr: servicenow.ErrProjectNotFound}
+	h := NewReportsHandler(mock, viewerAccessGuard)
 	req := withUser(httptest.NewRequest(http.MethodGet, "/spl/generate-timelogs-breakdown-report?projectId=p1", nil))
 	w := httptest.NewRecorder()
 
@@ -106,8 +106,8 @@ func TestGenerateTimelogsBreakdownReport_NotFound(t *testing.T) {
 }
 
 func TestGetReportDetails_Success(t *testing.T) {
-	mock := &mockSplReportsClient{projectReport: servicenow.CSReportDetails{SubscriptionDetails: servicenow.SubscriptionDetail{ProjectName: "Acme"}}}
-	h := NewSplReportsHandler(mock, splAccessGuard)
+	mock := &mockReportsClient{projectReport: servicenow.CSReportDetails{SubscriptionDetails: servicenow.SubscriptionDetail{ProjectName: "Acme"}}}
+	h := NewReportsHandler(mock, viewerAccessGuard)
 	req := withUser(httptest.NewRequest(http.MethodGet, "/spl/report-details?projectSysId=p1&from=2024-01-01&to=2024-01-31", nil))
 	w := httptest.NewRecorder()
 

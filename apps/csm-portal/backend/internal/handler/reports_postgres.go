@@ -62,7 +62,7 @@ type entitySearchTimeCardsResponse struct {
 	Total     int                  `json:"total"`
 }
 
-// postgresSplReportsClient implements splReportsClient for
+// postgresReportsClient implements reportsClient for
 // GetTimeLogBreakdown only, by calling entity-service (Postgres). GetSLAReport
 // and GetProjectReportDetails are NOT migrated: both are backed by bespoke
 // ServiceNow scoped-app endpoints (/api/wso2/case_sla/report,
@@ -73,28 +73,28 @@ type entitySearchTimeCardsResponse struct {
 // "response" vs "workaround" vs "resolution" time) from the ServiceNow
 // response shape alone, not wiring up already-defined data. Both stay on the
 // wrapped ServiceNow client.
-type postgresSplReportsClient struct {
+type postgresReportsClient struct {
 	entity entityReportsClient
-	sn     splReportsClient
+	sn     reportsClient
 }
 
-// NewPostgresSplReportsClient builds a postgresSplReportsClient. entity is
+// NewPostgresReportsClient builds a postgresReportsClient. entity is
 // typically the same *entity.CustomerEntityClient every other CS Portal
 // handler already uses; sn is the existing ServiceNow client, kept for the
 // two reports above.
-func NewPostgresSplReportsClient(entity entityReportsClient, sn splReportsClient) *postgresSplReportsClient {
-	return &postgresSplReportsClient{entity: entity, sn: sn}
+func NewPostgresReportsClient(entity entityReportsClient, sn reportsClient) *postgresReportsClient {
+	return &postgresReportsClient{entity: entity, sn: sn}
 }
 
-// GetSLAReport implements splReportsClient by delegating to the wrapped
+// GetSLAReport implements reportsClient by delegating to the wrapped
 // ServiceNow client — see this type's own doc comment for why.
-func (c *postgresSplReportsClient) GetSLAReport(ctx context.Context, projectSysID, from, to string) (servicenow.SLAReportDetails, error) {
+func (c *postgresReportsClient) GetSLAReport(ctx context.Context, projectSysID, from, to string) (servicenow.SLAReportDetails, error) {
 	return c.sn.GetSLAReport(ctx, projectSysID, from, to)
 }
 
-// GetProjectReportDetails implements splReportsClient by delegating to the
+// GetProjectReportDetails implements reportsClient by delegating to the
 // wrapped ServiceNow client — see this type's own doc comment for why.
-func (c *postgresSplReportsClient) GetProjectReportDetails(ctx context.Context, projectSysID, from, to string) (servicenow.CSReportDetails, error) {
+func (c *postgresReportsClient) GetProjectReportDetails(ctx context.Context, projectSysID, from, to string) (servicenow.CSReportDetails, error) {
 	return c.sn.GetProjectReportDetails(ctx, projectSysID, from, to)
 }
 
@@ -118,7 +118,7 @@ func formatHoursMinutes(hours float64) string {
 // postgresSplProjectClient's own doc comment on why Number==Key here) to
 // entity-service's internal project detail. Search-then-exact-match, the
 // same pattern used throughout this migration for every number-keyed lookup.
-func (c *postgresSplReportsClient) resolveProjectByNumber(ctx context.Context, projectNumber string) (entityProjectDetailsView, error) {
+func (c *postgresReportsClient) resolveProjectByNumber(ctx context.Context, projectNumber string) (entityProjectDetailsView, error) {
 	// Limit is entity-service's own maxLimit (see its SearchProjects
 	// validation) -- SearchQuery is a substring match against name/key/
 	// subscription type, and the exact-Key match below only looks inside
@@ -171,7 +171,7 @@ const entitySearchPageLimit = 50
 // searchAllCases pages through entity-service's SearchCases using body as
 // the template request (its Pagination field is overwritten each page),
 // returning every case rather than just the first entitySearchPageLimit.
-func (c *postgresSplReportsClient) searchAllCases(ctx context.Context, filters entitySearchCasesFilters, sortBy entityCaseSort) ([]entitySearchCaseView, error) {
+func (c *postgresReportsClient) searchAllCases(ctx context.Context, filters entitySearchCasesFilters, sortBy entityCaseSort) ([]entitySearchCaseView, error) {
 	var all []entitySearchCaseView
 	for offset := 0; ; offset += entitySearchPageLimit {
 		body, err := json.Marshal(entitySearchCasesRequest{
@@ -200,7 +200,7 @@ func (c *postgresSplReportsClient) searchAllCases(ctx context.Context, filters e
 // searchAllTimeCards pages through entity-service's SearchTimeCards for a
 // single case, returning every time card rather than just the first
 // entitySearchPageLimit.
-func (c *postgresSplReportsClient) searchAllTimeCards(ctx context.Context, caseID string) ([]entityTimeCardView, error) {
+func (c *postgresReportsClient) searchAllTimeCards(ctx context.Context, caseID string) ([]entityTimeCardView, error) {
 	var all []entityTimeCardView
 	for offset := 0; ; offset += entitySearchPageLimit {
 		body, err := json.Marshal(entitySearchTimeCardsRequest{
@@ -225,12 +225,12 @@ func (c *postgresSplReportsClient) searchAllTimeCards(ctx context.Context, caseI
 	}
 }
 
-// GetTimeLogBreakdown implements splReportsClient, paging through every
+// GetTimeLogBreakdown implements reportsClient, paging through every
 // case in the project and every time card per case (see
 // searchAllCases/searchAllTimeCards) rather than reading a single
 // entitySearchPageLimit-sized page and truncating the rest, which ServiceNow's
 // own version of this report never did either.
-func (c *postgresSplReportsClient) GetTimeLogBreakdown(ctx context.Context, projectID string) (servicenow.TimeLogBreakdownDetails, error) {
+func (c *postgresReportsClient) GetTimeLogBreakdown(ctx context.Context, projectID string) (servicenow.TimeLogBreakdownDetails, error) {
 	project, err := c.resolveProjectByNumber(ctx, projectID)
 	if err != nil {
 		return servicenow.TimeLogBreakdownDetails{}, err

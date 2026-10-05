@@ -85,7 +85,7 @@ func (m *mockUsageMetricsClient) GetDeployedProductUsageCounts(ctx context.Conte
 }
 
 func TestUsageMetricsHandler_GetProjects_RequiresAuth(t *testing.T) {
-	h := NewUsageMetricsHandler(&mockUsageMetricsClient{}, splAccessGuard)
+	h := NewUsageMetricsHandler(&mockUsageMetricsClient{}, viewerAccessGuard)
 
 	req := httptest.NewRequest(http.MethodGet, "/spl/usage-metrics/projects", nil)
 	w := httptest.NewRecorder()
@@ -95,10 +95,10 @@ func TestUsageMetricsHandler_GetProjects_RequiresAuth(t *testing.T) {
 }
 
 func TestUsageMetricsHandler_GetProjects_RequiresUsageMetricsPermission(t *testing.T) {
-	h := NewUsageMetricsHandler(&mockUsageMetricsClient{}, splAccessGuard)
+	h := NewUsageMetricsHandler(&mockUsageMetricsClient{}, viewerAccessGuard)
 
 	// SPL access (sales_solutions) but no usage_metrics_viewer/cs_engineer/
-	// admin — passes PermSPLAccess, fails the additional
+	// admin — passes PermViewerAccess, fails the additional
 	// PermUsageMetricsViewer check.
 	req := httptest.NewRequest(http.MethodGet, "/spl/usage-metrics/projects", nil)
 	req = req.WithContext(middleware.WithUserInfo(req.Context(), &middleware.UserInfo{
@@ -112,7 +112,7 @@ func TestUsageMetricsHandler_GetProjects_RequiresUsageMetricsPermission(t *testi
 
 func TestUsageMetricsHandler_GetProjects_Success(t *testing.T) {
 	client := &mockUsageMetricsClient{response: []byte(`[{"sys_id":"1"}]`)}
-	h := NewUsageMetricsHandler(client, splAccessGuard)
+	h := NewUsageMetricsHandler(client, viewerAccessGuard)
 
 	req := withUser(httptest.NewRequest(http.MethodGet, "/spl/usage-metrics/projects?search=Acme", nil))
 	w := httptest.NewRecorder()
@@ -129,7 +129,7 @@ func TestUsageMetricsHandler_GetProjects_Success(t *testing.T) {
 
 func TestUsageMetricsHandler_GetProjects_MapsUpstreamError(t *testing.T) {
 	client := &mockUsageMetricsClient{err: &apierror.Error{StatusCode: http.StatusServiceUnavailable, Body: "down"}}
-	h := NewUsageMetricsHandler(client, splAccessGuard)
+	h := NewUsageMetricsHandler(client, viewerAccessGuard)
 
 	req := withUser(httptest.NewRequest(http.MethodGet, "/spl/usage-metrics/projects", nil))
 	w := httptest.NewRecorder()
@@ -140,7 +140,7 @@ func TestUsageMetricsHandler_GetProjects_MapsUpstreamError(t *testing.T) {
 
 func TestUsageMetricsHandler_SearchInstanceMetrics_ForwardsBody(t *testing.T) {
 	client := &mockUsageMetricsClient{response: []byte(`{"ok":true}`)}
-	h := NewUsageMetricsHandler(client, splAccessGuard)
+	h := NewUsageMetricsHandler(client, viewerAccessGuard)
 
 	body := `{"projectIds":["p1"]}`
 	req := withUser(httptest.NewRequest(http.MethodPost, "/spl/usage-metrics/instances/metrics/search", strings.NewReader(body)))
@@ -155,7 +155,7 @@ func TestUsageMetricsHandler_SearchInstanceMetrics_ForwardsBody(t *testing.T) {
 
 func TestUsageMetricsHandler_SearchInstanceMetrics_RejectsInvalidJSON(t *testing.T) {
 	client := &mockUsageMetricsClient{}
-	h := NewUsageMetricsHandler(client, splAccessGuard)
+	h := NewUsageMetricsHandler(client, viewerAccessGuard)
 
 	req := withUser(httptest.NewRequest(http.MethodPost, "/spl/usage-metrics/instances/metrics/search", strings.NewReader("not json")))
 	w := httptest.NewRecorder()
@@ -169,7 +169,7 @@ func TestUsageMetricsHandler_SearchInstanceMetrics_RejectsInvalidJSON(t *testing
 
 func TestUsageMetricsHandler_GetDeployedProductMetrics_RejectsInvalidDateRange(t *testing.T) {
 	client := &mockUsageMetricsClient{response: []byte(`{}`)}
-	h := NewUsageMetricsHandler(client, splAccessGuard)
+	h := NewUsageMetricsHandler(client, viewerAccessGuard)
 
 	body := `{"deploymentId":"d1","startDate":"2026-06-01","endDate":"2026-01-01"}`
 	req := withUser(httptest.NewRequest(http.MethodPost, "/spl/usage-metrics/deployed-products/dp-1/metrics/search", strings.NewReader(body)))
@@ -185,7 +185,7 @@ func TestUsageMetricsHandler_GetDeployedProductMetrics_RejectsInvalidDateRange(t
 
 func TestUsageMetricsHandler_GetDeployedProductMetrics_Success(t *testing.T) {
 	client := &mockUsageMetricsClient{response: []byte(`{"summary":{}}`)}
-	h := NewUsageMetricsHandler(client, splAccessGuard)
+	h := NewUsageMetricsHandler(client, viewerAccessGuard)
 
 	body := `{"deploymentId":"d1","startDate":"2026-01-01","endDate":"2026-01-31"}`
 	req := withUser(httptest.NewRequest(http.MethodPost, "/spl/usage-metrics/deployed-products/dp-1/metrics/search", strings.NewReader(body)))
@@ -204,7 +204,7 @@ func TestUsageMetricsHandler_GetDeployedProductMetrics_Success(t *testing.T) {
 
 func TestUsageMetricsHandler_GetDeployedProductMetrics_RequiresID(t *testing.T) {
 	client := &mockUsageMetricsClient{}
-	h := NewUsageMetricsHandler(client, splAccessGuard)
+	h := NewUsageMetricsHandler(client, viewerAccessGuard)
 
 	body := `{"deploymentId":"d1","startDate":"2026-01-01","endDate":"2026-01-31"}`
 	req := withUser(httptest.NewRequest(http.MethodPost, "/spl/usage-metrics/deployed-products//metrics/search", strings.NewReader(body)))

@@ -26,9 +26,9 @@ import (
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/servicenow"
 )
 
-// splAttachmentsClient abstracts the ServiceNow attachment-download
-// operation used by SplAttachmentsHandler.
-type splAttachmentsClient interface {
+// attachmentsClient abstracts the ServiceNow attachment-download
+// operation used by AttachmentsHandler.
+type attachmentsClient interface {
 	// RequireCaseAttachment confirms attachmentSysID is attached to a case
 	// before DownloadAttachment is called with it -- see its own doc
 	// comment on servicenow.Client for why: DownloadAttachment's only
@@ -37,19 +37,19 @@ type splAttachmentsClient interface {
 	DownloadAttachment(ctx context.Context, attachmentSysID string) (body []byte, contentType string, contentDisposition string, err error)
 }
 
-// SplAttachmentsHandler handles HTTP requests for downloading a case
+// AttachmentsHandler handles HTTP requests for downloading a case
 // attachment, delegating to the ServiceNow service.
-type SplAttachmentsHandler struct {
-	servicenow  splAttachmentsClient
+type AttachmentsHandler struct {
+	servicenow  attachmentsClient
 	accessGuard *AccessGuard
 }
 
-// NewSplAttachmentsHandler creates a SplAttachmentsHandler backed by the
-// given ServiceNow client. accessGuard enforces PermSPLAccess,
+// NewAttachmentsHandler creates a AttachmentsHandler backed by the
+// given ServiceNow client. accessGuard enforces PermViewerAccess,
 // SupportPortalLite's blanket audience gate, plus PermDownloadAttachment for
 // DownloadAttachment specifically.
-func NewSplAttachmentsHandler(sn splAttachmentsClient, accessGuard *AccessGuard) *SplAttachmentsHandler {
-	return &SplAttachmentsHandler{servicenow: sn, accessGuard: accessGuard}
+func NewAttachmentsHandler(sn attachmentsClient, accessGuard *AccessGuard) *AttachmentsHandler {
+	return &AttachmentsHandler{servicenow: sn, accessGuard: accessGuard}
 }
 
 // DownloadAttachment handles GET /attachments/{attachmentId}/download. Only
@@ -59,12 +59,12 @@ func NewSplAttachmentsHandler(sn splAttachmentsClient, accessGuard *AccessGuard)
 // mirroring this backend's existing GetCaseAttachmentContent convention,
 // which never trusts an upstream Content-Type/Content-Disposition for
 // inline rendering.
-func (h *SplAttachmentsHandler) DownloadAttachment(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+func (h *AttachmentsHandler) DownloadAttachment(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
-	if !requireSPLPermission(w, user, h.accessGuard, PermDownloadAttachment) {
+	if !requireViewerPermission(w, user, h.accessGuard, PermDownloadAttachment) {
 		return
 	}
 

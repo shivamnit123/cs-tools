@@ -908,7 +908,7 @@ export default function CsmIncidentDetailPage(): JSX.Element {
               <MetaCell label="Subcategory">
                 <Typography variant="body2">{incident.subcategory || "—"}</Typography>
               </MetaCell>
-              <MetaCell label="Contact type">
+              <MetaCell label="Channel">
                 <Typography variant="body2">{incident.contactType || "—"}</Typography>
               </MetaCell>
               <MetaCell label="Impact">

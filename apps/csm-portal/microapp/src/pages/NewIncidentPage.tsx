@@ -47,7 +47,7 @@ import { Logger } from "@utils/logger";
 import { incidentPriorityColor, incidentPriorityLabel } from "@components/operations/incidentConfig";
 import {
   CATEGORY_OPTIONS,
-  CONTACT_TYPE_OPTIONS,
+  CHANNEL_OPTIONS,
   computeIncidentPriority,
   IMPACT_OPTIONS,
   SUBCATEGORY_OPTIONS_BY_CATEGORY,
@@ -63,8 +63,9 @@ const SELECT_PLACEHOLDER = "-- Select --";
 // structural conventions (plain useState per field, a renderSelect helper, a collapsed "More
 // options" Accordion for the less-common ServiceNow reference lookups). Unlike change requests,
 // most of incidents' core fields are actually required — the backend hard-requires
-// callerId/category/serviceId/impact/urgency/subject, and this form also requires
-// subcategory/contactType client-side, same as the webapp's own validation. There is deliberately
+// callerId/category/serviceId/impact/urgency/subject, and this form also requires Channel (the
+// wire field `contactType`) client-side, same as the webapp's own validation. Subcategory is optional (the backend and the
+// webapp both accept an incident without one) and only sent when picked. There is deliberately
 // no priority or state field to fill in: priority is only ever a computed live preview
 // (impact × urgency → ITIL matrix), and every new incident starts at ServiceNow's default state.
 export default function NewIncidentPage() {
@@ -74,7 +75,7 @@ export default function NewIncidentPage() {
   const [description, setDescription] = useState("");
   const [category, setCategory] = useState<IncidentCategory | typeof UNSET>(UNSET);
   const [subcategory, setSubcategory] = useState<IncidentSubcategory | typeof UNSET>(UNSET);
-  const [contactType, setContactType] = useState<IncidentContactType | typeof UNSET>(UNSET);
+  const [channel, setChannel] = useState<IncidentContactType | typeof UNSET>(UNSET);
   const [impact, setImpact] = useState<IncidentImpact | typeof UNSET>(UNSET);
   const [urgency, setUrgency] = useState<IncidentUrgency | typeof UNSET>(UNSET);
   const [caller, setCaller] = useState<EntityOption | null>(null);
@@ -117,8 +118,7 @@ export default function NewIncidentPage() {
   const canSubmit =
     shortDescription.trim().length > 0 &&
     !!category &&
-    !!subcategory &&
-    !!contactType &&
+    !!channel &&
     !!impact &&
     !!urgency &&
     !!caller &&
@@ -126,19 +126,19 @@ export default function NewIncidentPage() {
     !createIncident.isPending;
 
   const handleSubmit = (): void => {
-    if (!canSubmit || !category || !subcategory || !contactType || !impact || !urgency || !caller || !service) return;
+    if (!canSubmit || !category || !channel || !impact || !urgency || !caller || !service) return;
     setSubmitError(null);
 
     const payload: IncidentCreatePayloadDto = {
       subject: shortDescription.trim(),
       category,
-      subcategory,
-      contactType,
+      contactType: channel,
       impact,
       urgency,
       callerId: caller.id,
       serviceId: service.id,
     };
+    if (subcategory) payload.subcategory = subcategory;
     if (description.trim()) payload.additionalComments = description.trim();
     if (serviceOffering) payload.serviceOfferingId = serviceOffering.id;
     if (configurationItem) payload.configurationItemId = configurationItem.id;
@@ -232,10 +232,10 @@ export default function NewIncidentPage() {
           subcategory,
           setSubcategory,
           subcategoryOptions,
-          true,
+          false,
           !category,
         )}
-        {renderSelect("incident-contact-type", "Contact type", contactType, setContactType, CONTACT_TYPE_OPTIONS, true)}
+        {renderSelect("incident-channel", "Channel", channel, setChannel, CHANNEL_OPTIONS, true)}
         {renderSelect("incident-impact", "Impact", impact, setImpact, IMPACT_OPTIONS, true)}
         {renderSelect("incident-urgency", "Urgency", urgency, setUrgency, URGENCY_OPTIONS, true)}
 

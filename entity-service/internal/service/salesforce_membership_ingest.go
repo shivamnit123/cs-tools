@@ -237,11 +237,11 @@ func (s *salesforceEventService) ingestMembership(ctx context.Context, membershi
 	// the person would never be told — the previous state is what tells
 	// that apart from our own write returning. A genuinely
 	// Salesforce-originated first invitation (or the historical backfill)
-	// still creates the row and still publishes. The state check stays: an
-	// event that lands on REGISTERED or DEACTIVATED is not an invitation.
+	// still creates the row and still publishes. A membership that lands
+	// REGISTERED publishes only when it is new (see addedAsRegistered).
 	invited := in.State == domain.MembershipStateInvited || in.State == domain.MembershipStateReInvited
 	movedIntoInvited := res.CreatedProjectContact || !strings.EqualFold(res.PreviousState, in.State)
-	if invited && movedIntoInvited {
+	if (invited && movedIntoInvited) || addedAsRegistered(in.State, eventType, res, pc.CreatedDate) {
 		s.publishProjectContactInvited(ctx, in, pc, eventModifiedOn, hasModified)
 	} else if invited {
 		slog.InfoContext(ctx, "salesforce: membership already in this state, not re-publishing project_contact.invited",
@@ -253,6 +253,23 @@ func (s *salesforceEventService) ingestMembership(ctx context.Context, membershi
 		s.publishProjectContactRegistered(ctx, in, pc, eventModifiedOn, hasModified)
 	}
 	return nil
+}
+
+// newMembershipWindow bounds how old a Salesforce record created REGISTERED
+// may be and still count as a new membership rather than a backfill.
+const newMembershipWindow = 24 * time.Hour
+
+// addedAsRegistered reports a NEW membership that Salesforce saved REGISTERED
+// because the contact is already unlocked (has signed in before).
+func addedAsRegistered(state, eventType string, res domain.SalesforceMembershipUpsertResult, createdDate *string) bool {
+	if !strings.EqualFold(state, domain.MembershipStateRegistered) || eventType == domain.SalesforceEventRestored {
+		return false
+	}
+	if !res.CreatedProjectContact {
+		return strings.EqualFold(res.PreviousState, domain.MembershipStateDeactivated)
+	}
+	created, ok := parseSalesforceLastModified(createdDate)
+	return ok && time.Since(created) < newMembershipWindow
 }
 
 func wasInvitedState(state string) bool {

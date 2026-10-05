@@ -24,7 +24,6 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 )
@@ -142,22 +141,34 @@ type MembershipWriteContext struct {
 // still the last thing that happens.
 type MembershipWritePlan func(ctx context.Context, wc MembershipWriteContext) (domain.SalesforceMembershipUpsert, domain.UpsertOnboardingStepRequest, error)
 
+// projectMembershipRepo's writes (Upsert, UpsertWithin, DeactivateBySfID) run
+// as the system, whoever triggered them: the Salesforce webhook and retry
+// worker carry no identity, and a customer's own membership registration
+// reaches Upsert on that customer's identity, which must not change the
+// result. Their only read of an RLS-protected table is projectReferencedOrder/
+// accountReferencedOrder's EXISTS over work_item, which ranks duplicate sf_id
+// rows and so must see every work_item. Authorization of a portal write stays
+// in the service layer (requireInternalCaller), as it was before RLS.
+// GetMembershipByEmail and ResolveWriteContext read no protected table and
+// use the caller's own identity.
 type projectMembershipRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
-// NewProjectMembershipRepository constructs a ProjectMembershipRepository backed by the pool.
-func NewProjectMembershipRepository(db *pgxpool.Pool) ProjectMembershipRepository {
+// NewProjectMembershipRepository constructs a ProjectMembershipRepository backed by the scoped pool.
+func NewProjectMembershipRepository(db *Scoped) ProjectMembershipRepository {
 	return &projectMembershipRepo{db: db}
 }
 
 func (r *projectMembershipRepo) DeactivateBySfID(ctx context.Context, membershipSfID string, basis AdminRoleBasisFunc) (bool, error) {
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return false, fmt.Errorf("deactivate project contact: begin tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	ctx = WithSystemIdentity(ctx)
+	return InTxReturning(ctx, r.db, func(tx pgx.Tx) (bool, error) {
+		return deactivateBySfIDTx(ctx, tx, membershipSfID, basis)
+	})
+}
 
+// deactivateBySfIDTx is DeactivateBySfID's body, run inside tx.
+func deactivateBySfIDTx(ctx context.Context, tx pgx.Tx, membershipSfID string, basis AdminRoleBasisFunc) (bool, error) {
 	tag, err := tx.Exec(ctx, `
 		UPDATE project_contact
 		SET state = $2::project_contact_state_enum, updated_on = NOW(), updated_by = $3
@@ -185,10 +196,6 @@ func (r *projectMembershipRepo) DeactivateBySfID(ctx context.Context, membership
 		if err := rederiveAdminAfterDeactivate(ctx, tx, membershipSfID, basis); err != nil {
 			return false, err
 		}
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("deactivate project contact: commit: %w", err)
 	}
 	return true, nil
 }
@@ -227,12 +234,14 @@ func rederiveAdminAfterDeactivate(ctx context.Context, tx querier, membershipSfI
 }
 
 func (r *projectMembershipRepo) Upsert(ctx context.Context, in domain.SalesforceMembershipUpsert, step domain.UpsertOnboardingStepRequest) (domain.SalesforceMembershipUpsertResult, error) {
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return domain.SalesforceMembershipUpsertResult{}, fmt.Errorf("upsert membership: begin tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	ctx = WithSystemIdentity(ctx)
+	return InTxReturning(ctx, r.db, func(tx pgx.Tx) (domain.SalesforceMembershipUpsertResult, error) {
+		return upsertTx(ctx, tx, in, step)
+	})
+}
 
+// upsertTx is Upsert's body, run inside tx.
+func upsertTx(ctx context.Context, tx pgx.Tx, in domain.SalesforceMembershipUpsert, step domain.UpsertOnboardingStepRequest) (domain.SalesforceMembershipUpsertResult, error) {
 	res, err := upsertMembershipTx(ctx, tx, in)
 	if err != nil {
 		return domain.SalesforceMembershipUpsertResult{}, err
@@ -243,21 +252,36 @@ func (r *projectMembershipRepo) Upsert(ctx context.Context, in domain.Salesforce
 	if _, err := upsertOnboardingStep(ctx, tx, step); err != nil {
 		return domain.SalesforceMembershipUpsertResult{}, err
 	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return domain.SalesforceMembershipUpsertResult{}, fmt.Errorf("upsert membership: commit: %w", err)
-	}
 	return res, nil
 }
 
 // UpsertWithin implements ProjectMembershipRepository.
 func (r *projectMembershipRepo) UpsertWithin(ctx context.Context, projectID, email string, plan MembershipWritePlan) (domain.SalesforceMembershipUpsertResult, error) {
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return domain.SalesforceMembershipUpsertResult{}, fmt.Errorf("membership write: begin tx: %w", err)
+	var res domain.SalesforceMembershipUpsertResult
+	// planned records that the write ran to the end -- the plan, and with it the
+	// Salesforce half, completed -- so any error InTx still returns can only be
+	// the commit. That is the one failure ErrMembershipCommitFailed reports, and
+	// InTx alone would fold it into an ordinary error.
+	planned := false
+	// The identity is stamped on the transaction only; plan keeps the caller's ctx.
+	err := r.db.InTx(WithSystemIdentity(ctx), func(tx pgx.Tx) error {
+		var err error
+		res, err = upsertWithinTx(ctx, tx, projectID, email, plan)
+		planned = err == nil
+		return err
+	})
+	switch {
+	case err == nil:
+		return res, nil
+	case planned:
+		return res, fmt.Errorf("%w: %v", ErrMembershipCommitFailed, err)
+	default:
+		return domain.SalesforceMembershipUpsertResult{}, err
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+}
 
+// upsertWithinTx is UpsertWithin's body, run inside tx.
+func upsertWithinTx(ctx context.Context, tx pgx.Tx, projectID, email string, plan MembershipWritePlan) (domain.SalesforceMembershipUpsertResult, error) {
 	if err := lockMembershipWriteKey(ctx, tx, projectID, email); err != nil {
 		return domain.SalesforceMembershipUpsertResult{}, err
 	}
@@ -272,8 +296,8 @@ func (r *projectMembershipRepo) UpsertWithin(ctx context.Context, projectID, ema
 	}
 
 	// The Salesforce half. An error here leaves both systems untouched: the
-	// deferred Rollback discards whatever this transaction has read, and
-	// nothing has been written to either side yet.
+	// rollback discards whatever this transaction has read, and nothing has
+	// been written to either side yet.
 	in, step, err := plan(ctx, MembershipWriteContext{Target: target, Existing: existing})
 	if err != nil {
 		return domain.SalesforceMembershipUpsertResult{}, err
@@ -288,10 +312,6 @@ func (r *projectMembershipRepo) UpsertWithin(ctx context.Context, projectID, ema
 	step.ProjectContactID = &res.ProjectContactID
 	if _, err := upsertOnboardingStep(ctx, tx, step); err != nil {
 		return domain.SalesforceMembershipUpsertResult{}, err
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return res, fmt.Errorf("%w: %v", ErrMembershipCommitFailed, err)
 	}
 	return res, nil
 }
@@ -476,11 +496,13 @@ func upsertMembershipTx(ctx context.Context, tx pgx.Tx, in domain.SalesforceMemb
 			return res, &apierror.NotFoundError{Msg: "project not found"}
 		}
 	} else {
+		var copies int64
 		err = tx.QueryRow(ctx, `
-		SELECT id, account_id FROM project
-		WHERE (key = $1 AND $1 <> '') OR (sf_id = $2 AND $2 <> '')
-		ORDER BY CASE WHEN key = $1 THEN 0 ELSE 1 END
-		LIMIT 1`, in.ProjectKey, in.ProjectSfID).Scan(&res.ProjectID, &projectAccountID)
+		SELECT p.id, p.account_id, count(*) FILTER (WHERE p.sf_id = $2) OVER () FROM project p
+		WHERE (p.key = $1 AND $1 <> '') OR (p.sf_id = $2 AND $2 <> '')
+		ORDER BY CASE WHEN p.key = $1 THEN 0 ELSE 1 END, `+projectReferencedOrder+`
+		LIMIT 1`, in.ProjectKey, in.ProjectSfID).Scan(&res.ProjectID, &projectAccountID, &copies)
+		warnDuplicateSfID(ctx, "project", in.ProjectSfID, res.ProjectID, copies)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return res, &apierror.NotFoundError{Msg: fmt.Sprintf("project not found for key %q / sfId %q", in.ProjectKey, in.ProjectSfID)}
 		}
@@ -492,9 +514,12 @@ func upsertMembershipTx(ctx context.Context, tx pgx.Tx, in domain.SalesforceMemb
 	// 2. account — the contact's own account by sf_id; an own contact falls
 	// back to the project's account.
 	if in.ContactAccountSfID != "" {
-		err = tx.QueryRow(ctx, `SELECT id FROM account WHERE sf_id = $1`, in.ContactAccountSfID).Scan(&res.AccountID)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		accountID, err := resolveIDBySfID(ctx, tx, resolveAccountBySfIDQuery, "account", in.ContactAccountSfID)
+		if err != nil {
 			return res, fmt.Errorf("upsert membership: resolve account: %w", err)
+		}
+		if accountID != nil {
+			res.AccountID = *accountID
 		}
 	}
 	if res.AccountID == "" {
@@ -551,10 +576,15 @@ func upsertMembershipUser(ctx context.Context, tx querier, in domain.SalesforceM
 		return "", "", false, &apierror.ValidationError{Msg: "contact email is required to resolve the user"}
 	}
 
-	err = tx.QueryRow(ctx, `SELECT id, user_name FROM "user" WHERE sf_id = $1`, in.ContactSfID).Scan(&id, &userName)
+	// One copy per sf_id: active first, then oldest (an account_contact EXISTS has no index here).
+	var copies int64
+	err = tx.QueryRow(ctx, `
+		SELECT id, user_name, count(*) OVER () FROM "user" WHERE sf_id = $1
+		ORDER BY is_active IS TRUE DESC, created_on, id LIMIT 1`, in.ContactSfID).Scan(&id, &userName, &copies)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return "", "", false, fmt.Errorf("upsert membership: resolve user by sf_id: %w", err)
 	}
+	warnDuplicateSfID(ctx, "user", in.ContactSfID, id, copies)
 	if id == "" {
 		rows, qerr := tx.Query(ctx, `SELECT id, user_name FROM "user" WHERE LOWER(email) = $1 LIMIT 2`, email)
 		if qerr != nil {
@@ -777,10 +807,15 @@ func syncDerivedAdminRole(ctx context.Context, tx querier, userID, adminRole str
 // insert and on update when known, FALSE on insert and untouched on update
 // when nil.
 func upsertAccountContact(ctx context.Context, tx querier, contactSfID, accountID, userName string, isPrimary *bool, actor string) (id string, created bool, err error) {
-	err = tx.QueryRow(ctx, `SELECT id FROM account_contact WHERE sf_id = $1 AND account_id = $2`, contactSfID, accountID).Scan(&id)
+	var copies int64
+	err = tx.QueryRow(ctx, `
+		SELECT ac.id, count(*) OVER () FROM account_contact ac WHERE ac.sf_id = $1 AND ac.account_id = $2
+		ORDER BY EXISTS (SELECT 1 FROM project_contact pc WHERE pc.account_contact_id = ac.id) DESC, ac.created_on, ac.id
+		LIMIT 1`, contactSfID, accountID).Scan(&id, &copies)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return "", false, fmt.Errorf("upsert membership: resolve account_contact by sf_id: %w", err)
 	}
+	warnDuplicateSfID(ctx, "account_contact", contactSfID, id, copies)
 	if id == "" {
 		err = tx.QueryRow(ctx, `
 			SELECT id FROM account_contact WHERE account_id = $1 AND LOWER(user_name) = LOWER($2)
@@ -817,10 +852,15 @@ func upsertAccountContact(ctx context.Context, tx querier, contactSfID, accountI
 // apart from "this is our own portal write coming back".
 func upsertProjectContact(ctx context.Context, tx pgx.Tx, in domain.SalesforceMembershipUpsert, projectID, accountContactID, actor string) (id string, created bool, previousState string, err error) {
 	var prior *string
-	err = tx.QueryRow(ctx, `SELECT id, state::text FROM project_contact WHERE sf_id = $1`, in.MembershipSfID).Scan(&id, &prior)
+	var copies int64
+	err = tx.QueryRow(ctx, `
+		SELECT pc.id, pc.state::text, count(*) OVER () FROM project_contact pc WHERE pc.sf_id = $1
+		ORDER BY EXISTS (SELECT 1 FROM project_contact_group g WHERE g.project_contact_id = pc.id) DESC, pc.created_on, pc.id
+		LIMIT 1`, in.MembershipSfID).Scan(&id, &prior, &copies)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return "", false, "", fmt.Errorf("upsert membership: resolve project_contact by sf_id: %w", err)
 	}
+	warnDuplicateSfID(ctx, "project_contact", in.MembershipSfID, id, copies)
 	if id == "" {
 		err = tx.QueryRow(ctx, `
 			SELECT id, state::text FROM project_contact WHERE project_id = $1 AND account_contact_id = $2

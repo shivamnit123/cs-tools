@@ -104,6 +104,10 @@ type fakeChangeRequestDetailRow struct {
 	startOn, endOn                                                     *time.Time
 	impact, state, changeModel                                         *string
 	createdOn, updatedOn                                               time.Time
+	agID, agName                                                       *string
+	isOnHold                                                           *bool
+	onHoldReason                                                       *string
+	onHoldStartedOn                                                    *time.Time
 	createdBy                                                          string
 	justification, impactDescription, serviceOutage                    *string
 	communicationPlan, rollbackPlan, testPlan                          *string
@@ -132,6 +136,8 @@ func (f fakeChangeRequestDetailRow) Scan(dest ...any) error {
 		f.aeID, f.aeName,
 		f.startOn, f.endOn, f.impact, f.state, f.changeModel,
 		f.createdOn, f.updatedOn,
+		f.agID, f.agName,
+		f.isOnHold, f.onHoldReason, f.onHoldStartedOn,
 		f.createdBy, f.justification, f.impactDescription, f.serviceOutage, f.communicationPlan, f.rollbackPlan, f.testPlan,
 		f.isCustomerApproved, f.isCustomerReviewed,
 		f.implementationPlan, f.priority, f.category,
@@ -181,6 +187,7 @@ func TestScanChangeRequestViewAndDetail_FieldParityAdditions(t *testing.T) {
 		row := fakeChangeRequestDetailRow{
 			id: "CR-1", number: "CHG0001", subject: strPtrCR("s"), description: strPtrCR("d"),
 			createdOn: now, updatedOn: now, createdBy: "actor@wso2.com",
+			agID: strPtrCR("team-1"), agName: strPtrCR("Devops"),
 			implementationPlan: strPtrCR("do the thing"), priority: strPtrCR("HIGH"), category: strPtrCR("SOFTWARE"),
 			rbID: strPtrCR("user-1"), rbName: strPtrCR("Jane Doe"),
 			affectedServicesText: strPtrCR("svc-a"), affectedComponentsText: strPtrCR("comp-a"), rollbackDurationText: strPtrCR("2h"),
@@ -206,6 +213,15 @@ func TestScanChangeRequestViewAndDetail_FieldParityAdditions(t *testing.T) {
 		}
 		if cr.RequestedBy == nil || cr.RequestedBy.ID != "user-1" || cr.RequestedBy.Name != "Jane Doe" {
 			t.Errorf("RequestedBy = %+v, want {user-1 Jane Doe}", cr.RequestedBy)
+		}
+		// Real, reported bug: the CSM Portal's own action bar requires
+		// AssignedTeam to be set before Assess can be requested at all, but
+		// this repository never selected work_item.assignment_group_id back,
+		// so no change request could ever be promoted past New through the
+		// portal on this data source, regardless of what ServiceNow itself
+		// (or csm-sync-service, mirroring it into Postgres) actually had set.
+		if cr.AssignedTeam == nil || cr.AssignedTeam.ID != "team-1" || cr.AssignedTeam.Name != "Devops" {
+			t.Errorf("AssignedTeam = %+v, want {team-1 Devops}", cr.AssignedTeam)
 		}
 		if cr.CustomerGroup == nil || cr.CustomerGroup.ID != "group-1" || cr.CustomerGroup.Name != "SRE Team" {
 			t.Errorf("CustomerGroup = %+v, want {group-1 SRE Team}", cr.CustomerGroup)
@@ -248,6 +264,9 @@ func TestScanChangeRequestViewAndDetail_FieldParityAdditions(t *testing.T) {
 		}
 		if cr.RequestedBy != nil || cr.CustomerGroup != nil {
 			t.Errorf("RequestedBy/CustomerGroup = %+v/%+v, want both nil", cr.RequestedBy, cr.CustomerGroup)
+		}
+		if cr.AssignedTeam != nil {
+			t.Errorf("AssignedTeam = %+v, want nil (no assignment group set)", cr.AssignedTeam)
 		}
 		if cr.ImplementationPlan != nil || cr.Priority != nil || cr.GitReference != nil {
 			t.Errorf("expected NULL field-parity columns to stay nil, got ImplementationPlan=%v Priority=%v GitReference=%v",

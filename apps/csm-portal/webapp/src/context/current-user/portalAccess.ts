@@ -32,6 +32,11 @@ export const PORTAL_ROLE = {
   timecardApprover: "timecard_approver",
   dashboardDesigner: "dashboard_designer",
   admin: "admin",
+  // Grants PermCreateWorkNote on the backend (internal/handler/access.go) --
+  // posting a work_note-type comment on a case, nothing else. See
+  // PermissionProvider.tsx's canAddWorkNotes for the one capability this
+  // backs.
+  worknoteCreator: "worknote_creator",
 } as const;
 
 const ALL_PORTAL_ROLES: readonly string[] = Object.values(PORTAL_ROLE);

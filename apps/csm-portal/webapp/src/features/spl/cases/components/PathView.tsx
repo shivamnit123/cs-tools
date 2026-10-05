@@ -17,7 +17,7 @@
 // Ported from apps/support-portal-lite/webapp's own features/spl/cases/components/PathView.tsx
 // (breadcrumb: Home > Account > Project > Case). Routes updated from that
 // app's bare "/cases"/"/accounts"/"/projects" to this app's "/spl/*" prefix
-// (see csmNavItems.ts's "spl" section).
+// (see csmNavItems.ts's "viewer" section).
 import type { ReactNode } from "react";
 import { Stack, Tooltip, Button } from "@wso2/oxygen-ui";
 import { HomeIcon, ChevronRightIcon } from "@wso2/oxygen-ui-icons-react";

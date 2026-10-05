@@ -121,7 +121,7 @@ func TestGetTimeLogBreakdown_PagesThroughAllCasesAndTimeCards(t *testing.T) {
 		}
 	}
 
-	c := NewPostgresSplReportsClient(entity, nil)
+	c := NewPostgresReportsClient(entity, nil)
 	got, err := c.GetTimeLogBreakdown(context.Background(), "PRJ001")
 	if err != nil {
 		t.Fatalf("GetTimeLogBreakdown: %v", err)

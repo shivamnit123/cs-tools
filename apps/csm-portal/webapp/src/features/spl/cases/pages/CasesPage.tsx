@@ -27,8 +27,7 @@
 // PermissionProvider above this page. No PageHeader either (this app has
 // no equivalent helper) — a plain Typography stands in.
 import { useState } from "react";
-import { Box, Grid, Paper, Typography } from "@wso2/oxygen-ui";
-import { useTheme, useColorScheme } from "@mui/material/styles";
+import { Box, Grid, Typography } from "@wso2/oxygen-ui";
 import { useGetCases } from "../api/useCases";
 import Search from "../components/Search";
 import CaseStateCard from "../components/CaseStateCard";
@@ -36,22 +35,6 @@ import CaseStateView from "../components/CaseStateView";
 import type { CaseDetailsWithCount } from "../api/caseTypes";
 
 const STATES = ["Open", "Work In Progress", "Awaiting Info", "Solution Proposed", "Waiting on WSO2", "Reopened"];
-// Per state, a {light, dark} pair rather than one static hex — the count's
-// own uniform grey card background (see CaseStateCard) sits at a different
-// brightness in each mode, and a single color can't have good contrast
-// against both: a pale pink or a slate grey close to the card's own tone
-// (the previous flat COLORS values) read as nearly invisible against a
-// light-grey card, a dark-grey one, or both. Each pair here is a light-mode
-// "800"-ish shade and a dark-mode "200"/"400"-ish shade of the same hue,
-// the standard MUI convention for text-on-tinted-surface contrast.
-const COLORS: { light: string; dark: string }[] = [
-  { light: "#0052CC", dark: "#4C9AFF" }, // Open — blue
-  { light: "#2E7D32", dark: "#66BB6A" }, // Work In Progress — green
-  { light: "#AD1457", dark: "#F48FB1" }, // Awaiting Info — pink/magenta
-  { light: "#5D4037", dark: "#BCAAA4" }, // Solution Proposed — brown
-  { light: "#D84315", dark: "#FF8A65" }, // Waiting on WSO2 — deep orange
-  { light: "#37474F", dark: "#B0BEC5" }, // Reopened — blue-grey
-];
 
 function useCaseStateQuery(state: string) {
   const [page, setPage] = useState(0);
@@ -63,15 +46,6 @@ function useCaseStateQuery(state: string) {
 export default function CasesPage() {
   const [caseState, setCaseState] = useState("");
   const [showTable, setShowTable] = useState(true);
-  const theme = useTheme();
-  // theme.palette.mode is NOT live here: oxygen-ui's theme is built with
-  // extendTheme() (MUI's CSS-variables system), where a plain useTheme()
-  // call returns the theme's static reference mode, not the mode actually
-  // showing on screen — confirmed empirically (it kept resolving "light"
-  // with data-color-scheme="dark" set). useColorScheme() is the hook that
-  // actually tracks the live scheme.
-  const { mode: colorMode, systemMode } = useColorScheme();
-  const isDark = (colorMode === "system" ? systemMode : colorMode) === "dark";
 
   // Called unconditionally, one per fixed state — see file header comment.
   const q0 = useCaseStateQuery(STATES[0]);
@@ -91,36 +65,24 @@ export default function CasesPage() {
         <Search searchOption="case" setShowTable={setShowTable} />
       </Box>
       {caseState === "" && showTable && (
-        <Grid container spacing={3} sx={{ p: 2, mt: 4 }}>
-          <Grid size={{ xs: 12 }} sx={{ display: "flex", justifyContent: "center" }}>
-            <Paper
-              sx={{
-                backgroundColor: isDark ? theme.palette.grey[900] : "#ECECEC",
-                maxWidth: 1050,
-              }}
-            >
-              <Grid container p={3}>
-                <Grid size={{ xs: 12 }}>
-                  <Typography align="left" gutterBottom variant="h4">
-                    Overall Case Summary
-                  </Typography>
-                </Grid>
-                {STATES.map((state, i) => (
-                  <Grid key={state} size={{ xs: 4 }} p={2} sx={{ display: "flex", justifyContent: "center" }}>
-                    <CaseStateCard
-                      data={queries[i].data}
-                      loading={queries[i].loading}
-                      error={queries[i].error}
-                      state={state}
-                      setCaseState={setCaseState}
-                      color={COLORS[i]}
-                    />
-                  </Grid>
-                ))}
+        <Box sx={{ mt: 5, width: "100%", maxWidth: 1050, mx: "auto" }}>
+          <Typography align="left" gutterBottom variant="h6">
+            Overall Case Summary
+          </Typography>
+          <Grid container spacing={3} justifyContent="center" sx={{ mt: 4 }}>
+            {STATES.map((state, i) => (
+              <Grid key={state} size={{ xs: 12, sm: 6, md: 4 }} sx={{ display: "flex", justifyContent: "center" }}>
+                <CaseStateCard
+                  data={queries[i].data}
+                  loading={queries[i].loading}
+                  error={queries[i].error}
+                  state={state}
+                  setCaseState={setCaseState}
+                />
               </Grid>
-            </Paper>
+            ))}
           </Grid>
-        </Grid>
+        </Box>
       )}
       {STATES.map((state, i) =>
         caseState === state && showTable && queries[i].data ? (

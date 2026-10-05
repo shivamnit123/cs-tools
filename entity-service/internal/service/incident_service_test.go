@@ -26,6 +26,7 @@ import (
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/events"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/repository"
 )
 
 // TestIncidentStateToEnum locks in the one deliberate mismatch between
@@ -79,9 +80,11 @@ func TestIncidentPriorityToEnum(t *testing.T) {
 // unconfigured methods panic if called -- same convention as stubCaseRepo
 // (case_service_test.go).
 type stubIncidentRepo struct {
+	createIncident               func(ctx context.Context, req domain.CreateIncidentRequest, priority string, subcategoryValue *string, createdBy string) (domain.CreateIncidentResponse, error)
 	createIncidentFromServiceNow func(ctx context.Context, req domain.CreateIncidentRequest, id, number, createdBy string) (domain.CreateIncidentResponse, error)
 	createIncidentComment        func(ctx context.Context, incidentID string, commentType domain.CommentType, content, createdBy string) (domain.CaseComment, error)
 	getIncidentByID              func(ctx context.Context, id string) (domain.IncidentView, error)
+	updateIncidentLifecycle      func(ctx context.Context, id string, u repository.IncidentLifecycleUpdate, actorEmail string) error
 }
 
 func (s *stubIncidentRepo) SearchIncidents(context.Context, domain.SearchIncidentsRequest, []string, []string, []string, []string, *bool, *bool, *time.Time, *time.Time) ([]domain.SearchIncidentView, int, error) {
@@ -110,6 +113,18 @@ func (s *stubIncidentRepo) CreateIncidentFromServiceNow(ctx context.Context, req
 		return s.createIncidentFromServiceNow(ctx, req, id, number, createdBy)
 	}
 	panic("CreateIncidentFromServiceNow called unexpectedly: Postgres must stay untouched when ServiceNow never accepts the incident")
+}
+func (s *stubIncidentRepo) CreateIncident(ctx context.Context, req domain.CreateIncidentRequest, priority string, subcategoryValue *string, createdBy string) (domain.CreateIncidentResponse, error) {
+	if s.createIncident != nil {
+		return s.createIncident(ctx, req, priority, subcategoryValue, createdBy)
+	}
+	panic("CreateIncident called unexpectedly")
+}
+func (s *stubIncidentRepo) UpdateIncidentLifecycle(ctx context.Context, id string, u repository.IncidentLifecycleUpdate, actorEmail string) error {
+	if s.updateIncidentLifecycle != nil {
+		return s.updateIncidentLifecycle(ctx, id, u, actorEmail)
+	}
+	panic("UpdateIncidentLifecycle called unexpectedly")
 }
 
 // stubMirrorIncidentService embeds IncidentService (nil) and overrides only
@@ -400,10 +415,11 @@ func TestIncidentService_CreateIncident_DoesNotPublishWhenPostgresFails(t *testi
 type stubUpdateIncidentUserRepo struct {
 	stubUserRepo
 	email string
+	id    string
 }
 
 func (s stubUpdateIncidentUserRepo) GetUserByEmail(_ context.Context, _ string) (domain.User, error) {
-	return domain.User{Email: s.email}, nil
+	return domain.User{ID: s.id, Email: s.email}, nil
 }
 
 // newTestIncidentView is a minimal, valid domain.IncidentView returned by
@@ -420,7 +436,7 @@ func newTestIncidentView(id string) domain.IncidentView {
 // constructs), UpdateIncident must still 503, exactly as the original stub
 // always did.
 func TestIncidentService_UpdateIncident_UnsupportedOnPlainDataSource(t *testing.T) {
-	svc := NewIncidentService(&stubIncidentRepo{})
+	svc := NewIncidentService(&stubIncidentRepo{}, nil)
 	workNotes := "investigating"
 	_, err := svc.UpdateIncident(context.Background(), domain.UpdateIncidentRequest{ID: testDeploymentUUID, WorkNotes: &workNotes})
 	var se *apierror.ServiceUnavailableError
@@ -684,7 +700,7 @@ func TestIncidentService_UpdateIncident_RejectsUnsupportedFields(t *testing.T) {
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	subject := "new subject"
-	state := domain.IncidentStateInProgress
+	category := domain.IncidentCategorySecurity
 	priority := domain.IncidentPriorityHigh
 	assignmentGroupID := "77777777-7777-7777-7777-777777777777"
 	watchList := []string{testDeploymentUUID}
@@ -694,7 +710,7 @@ func TestIncidentService_UpdateIncident_RejectsUnsupportedFields(t *testing.T) {
 		req  domain.UpdateIncidentRequest
 	}{
 		{name: "subject", req: domain.UpdateIncidentRequest{ID: testDeploymentUUID, Subject: &subject}},
-		{name: "state", req: domain.UpdateIncidentRequest{ID: testDeploymentUUID, State: &state}},
+		{name: "category", req: domain.UpdateIncidentRequest{ID: testDeploymentUUID, Category: &category}},
 		{name: "priority", req: domain.UpdateIncidentRequest{ID: testDeploymentUUID, Priority: &priority}},
 		{name: "assignmentGroupId", req: domain.UpdateIncidentRequest{ID: testDeploymentUUID, AssignmentGroupID: &assignmentGroupID}},
 		{name: "watchList", req: domain.UpdateIncidentRequest{ID: testDeploymentUUID, WatchList: &watchList}},
@@ -728,5 +744,144 @@ func TestIncidentService_UpdateIncident_RequiresAtLeastOneField(t *testing.T) {
 	var ve *apierror.ValidationError
 	if !asValidationError(err, &ve) {
 		t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
+	}
+}
+
+// TestIncidentResolutionCodeToEnum locks in incident_resolution_code_enum's
+// two spellings that differ from domain.IncidentResolutionCode's.
+func TestIncidentResolutionCodeToEnum(t *testing.T) {
+	cases := map[domain.IncidentResolutionCode]string{
+		domain.IncidentResolutionCodeSolvedWorkaround:         "SOLVED_WORK_AROUND",
+		domain.IncidentResolutionCodeSolvedPermanently:        "SOLVED_PERMANENTLY",
+		domain.IncidentResolutionCodeNotSolvedNotReproducible: "NOT_SOLVED_NOT_REPRODUCIBLE",
+		domain.IncidentResolutionCodeFalseAlarm:               "FALSE_ALARM",
+		domain.IncidentResolutionCodeDuplicate:                "DUPLICATE",
+		domain.IncidentResolutionCodeNotActionable:            "NOT_ACTIONABLE_ALERT",
+	}
+	for in, want := range cases {
+		got, ok := incidentResolutionCodeToEnum(in)
+		if !ok || got != want {
+			t.Errorf("incidentResolutionCodeToEnum(%q) = %q, %v; want %q, true", in, got, ok, want)
+		}
+	}
+	if _, ok := incidentResolutionCodeToEnum("NOT_A_CODE"); ok {
+		t.Error("incidentResolutionCodeToEnum(NOT_A_CODE) ok = true, want false")
+	}
+}
+
+// TestIncidentService_UpdateIncident_StartProgressClaimsAndMirrors is the
+// exact PATCH the portal's "In Progress" action sends for an unassigned
+// incident: {state: IN_PROGRESS, assignedEngineerId: <me>}. It used to be
+// rejected with a ValidationError (the "Invalid request payload." users saw);
+// it must reach the repository mapped to Postgres labels, need nothing else
+// (no assignment group), and be mirrored to ServiceNow with both fields.
+func TestIncidentService_UpdateIncident_StartProgressClaimsAndMirrors(t *testing.T) {
+	engineer := "88888888-8888-8888-8888-888888888888"
+	var gotID, gotActor string
+	var got repository.IncidentLifecycleUpdate
+	repo := &stubIncidentRepo{
+		updateIncidentLifecycle: func(_ context.Context, id string, u repository.IncidentLifecycleUpdate, actorEmail string) error {
+			gotID, got, gotActor = id, u, actorEmail
+			return nil
+		},
+		getIncidentByID: func(_ context.Context, id string) (domain.IncidentView, error) {
+			return newTestIncidentView(id), nil
+		},
+	}
+	mirrorCalled := make(chan domain.UpdateIncidentRequest, 1)
+	mirror := &stubMirrorIncidentService{
+		updateIncident: func(_ context.Context, req domain.UpdateIncidentRequest) (domain.UpdateIncidentResponse, error) {
+			mirrorCalled <- req
+			return domain.UpdateIncidentResponse{}, nil
+		},
+	}
+	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
+	svc := NewIncidentServiceWithSNMirror(repo, stubUpdateIncidentUserRepo{email: "jane.doe@example.com"}, mirror, nil, dispatcher)
+
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	state := domain.IncidentStateInProgress
+	if _, err := svc.UpdateIncident(ctx, domain.UpdateIncidentRequest{ID: testDeploymentUUID, State: &state, AssignedEngineerID: &engineer}); err != nil {
+		t.Fatalf("UpdateIncident(IN_PROGRESS + claim): %v", err)
+	}
+	if gotID != testDeploymentUUID || gotActor != "jane.doe@example.com" {
+		t.Errorf("repo got id=%q actor=%q", gotID, gotActor)
+	}
+	if got.State == nil || *got.State != "IN_PROGRESS" {
+		t.Errorf("repo got state %v, want IN_PROGRESS", got.State)
+	}
+	if got.AssignedEngineerID == nil || *got.AssignedEngineerID != engineer {
+		t.Errorf("repo got assignedEngineerId %v, want %q", got.AssignedEngineerID, engineer)
+	}
+	select {
+	case m := <-mirrorCalled:
+		if m.State == nil || *m.State != domain.IncidentStateInProgress || m.AssignedEngineerID == nil || *m.AssignedEngineerID != engineer {
+			t.Errorf("mirror got state=%v assignedEngineerId=%v", m.State, m.AssignedEngineerID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mirror.UpdateIncident was never called")
+	}
+}
+
+// TestIncidentService_UpdateIncident_LifecycleFieldMapping covers the
+// domain -> Postgres label mapping on the way to the repository, and the
+// up-front rejection of values with no Postgres equivalent.
+func TestIncidentService_UpdateIncident_LifecycleFieldMapping(t *testing.T) {
+	var got repository.IncidentLifecycleUpdate
+	repo := &stubIncidentRepo{
+		updateIncidentLifecycle: func(_ context.Context, _ string, u repository.IncidentLifecycleUpdate, _ string) error {
+			got = u
+			return nil
+		},
+		getIncidentByID: func(_ context.Context, id string) (domain.IncidentView, error) {
+			return newTestIncidentView(id), nil
+		},
+	}
+	mirror := &stubMirrorIncidentService{
+		updateIncident: func(context.Context, domain.UpdateIncidentRequest) (domain.UpdateIncidentResponse, error) {
+			return domain.UpdateIncidentResponse{}, nil
+		},
+	}
+	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
+	svc := NewIncidentServiceWithSNMirror(repo, stubUpdateIncidentUserRepo{email: "jane.doe@example.com", id: "99999999-9999-9999-9999-999999999999"}, mirror, nil, dispatcher)
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+
+	cancelled := domain.IncidentStateCancelled
+	if _, err := svc.UpdateIncident(ctx, domain.UpdateIncidentRequest{ID: testDeploymentUUID, State: &cancelled}); err != nil {
+		t.Fatalf("UpdateIncident(CANCELLED): %v", err)
+	}
+	if got.State == nil || *got.State != "CANCELED" {
+		t.Errorf("CANCELLED mapped to %v, want CANCELED", got.State)
+	}
+
+	resolved := domain.IncidentStateResolved
+	code := domain.IncidentResolutionCodeSolvedWorkaround
+	notes := "restarted the gateway"
+	if _, err := svc.UpdateIncident(ctx, domain.UpdateIncidentRequest{ID: testDeploymentUUID, State: &resolved, ResolutionCode: &code, ResolutionNotes: &notes}); err != nil {
+		t.Fatalf("UpdateIncident(RESOLVED): %v", err)
+	}
+	if got.ResolutionCode == nil || *got.ResolutionCode != "SOLVED_WORK_AROUND" || got.ResolutionNotes == nil || *got.ResolutionNotes != notes {
+		t.Errorf("resolution mapped to code=%v notes=%v", got.ResolutionCode, got.ResolutionNotes)
+	}
+	if got.DefaultResolvedByID == nil || *got.DefaultResolvedByID != "99999999-9999-9999-9999-999999999999" {
+		t.Errorf("DefaultResolvedByID = %v, want the acting user's id", got.DefaultResolvedByID)
+	}
+
+	badState := domain.IncidentState("STARTED")
+	badCode := domain.IncidentResolutionCode("FIXED")
+	badUUID := "not-a-uuid"
+	for name, req := range map[string]domain.UpdateIncidentRequest{
+		"unknown state":            {ID: testDeploymentUUID, State: &badState},
+		"unknown resolution code":  {ID: testDeploymentUUID, ResolutionCode: &badCode},
+		"malformed assignee id":    {ID: testDeploymentUUID, AssignedEngineerID: &badUUID},
+		"malformed resolved-by id": {ID: testDeploymentUUID, ResolvedByID: &badUUID},
+	} {
+		repo.updateIncidentLifecycle = func(context.Context, string, repository.IncidentLifecycleUpdate, string) error {
+			panic("UpdateIncidentLifecycle must not be called for " + name)
+		}
+		_, err := svc.UpdateIncident(ctx, req)
+		var ve *apierror.ValidationError
+		if !asValidationError(err, &ve) {
+			t.Errorf("%s: expected *apierror.ValidationError, got %T: %v", name, err, err)
+		}
 	}
 }

@@ -378,6 +378,7 @@ func (s *salesforceEventService) upsertAccount(ctx context.Context, sfID, eventT
 		s.recordAccountIngestFailed(ctx, state, err)
 		return err
 	}
+	s.requeueChildrenOf(ctx, repository.MissingParent{Kind: repository.MissingParentAccount, SfID: strings.TrimSpace(cust.ID)})
 	return nil
 }
 

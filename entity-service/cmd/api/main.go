@@ -69,7 +69,10 @@ func main() {
 	// change-request activity to the linked issue. Same gate as the webhook --
 	// one switch turns the whole integration on or off, so it can never run
 	// half-connected.
-	githubCtx, stopGithub := context.WithCancel(context.Background())
+	// WithSystemIdentity: same reasoning as slaEngineCtx/crNoticeCtx below -- the
+	// outbound repo is a plain pool today, but stamping it now means migrating it
+	// to Scoped later cannot silently fail every tick with ErrNoCallerIdentity.
+	githubCtx, stopGithub := context.WithCancel(repository.WithSystemIdentity(context.Background()))
 	defer stopGithub()
 	if cfg.HasGithubIntegration() {
 		if pool == nil {
@@ -92,10 +95,15 @@ func main() {
 	// 000088) — see service.SLAEngineRecomputeWorker's own doc comment.
 	// Gated on pool the same way the GitHub outbound worker above is:
 	// nowhere to read/write a clock at all with no database configured.
-	slaEngineCtx, stopSLAEngine := context.WithCancel(context.Background())
+	// WithSystemIdentity: this worker runs on its own process-startup
+	// context, never an HTTP request, so there is no caller identity to
+	// inherit. sla no longer has RLS (migration 0153), but this worker still
+	// writes through the Scoped repository, which requires an identity on ctx;
+	// it is genuinely internal.
+	slaEngineCtx, stopSLAEngine := context.WithCancel(repository.WithSystemIdentity(context.Background()))
 	defer stopSLAEngine()
 	if pool != nil {
-		slaEngineWorker := service.NewSLAEngineRecomputeWorker(repository.NewSLAEngineRepository(pool), cfg.SLARecomputeInterval)
+		slaEngineWorker := service.NewSLAEngineRecomputeWorker(repository.NewSLAEngineRepository(repository.NewScoped(pool)), cfg.SLARecomputeInterval)
 		go slaEngineWorker.Run(slaEngineCtx)
 		log.Printf("sla engine recompute worker enabled (every %s)", cfg.SLARecomputeInterval)
 	}
@@ -110,7 +118,10 @@ func main() {
 	// consumer read and discard every change-request record and vice versa —
 	// a separate topic is what isolates the two volumes, where a separate
 	// consumer group would only isolate the processing.
-	crNoticeCtx, stopCRNotices := context.WithCancel(context.Background())
+	// WithSystemIdentity: same reasoning as slaEngineCtx above -- this
+	// drainer runs on its own process-startup context, never an HTTP
+	// request, and CRNoticeRepository's writes are Scoped-wrapped now too.
+	crNoticeCtx, stopCRNotices := context.WithCancel(repository.WithSystemIdentity(context.Background()))
 	defer stopCRNotices()
 	var crPublisher service.EventPublisherService
 	if cfg.CRNoticesEnabled {
@@ -130,7 +141,7 @@ func main() {
 				}),
 				service.NewEventPublishFailureService(repository.NewEventPublishFailureRepository(pool)),
 			)
-			crRepo := repository.NewCRNoticeRepository(pool)
+			crRepo := repository.NewCRNoticeRepository(repository.NewScoped(pool))
 			drainer := service.NewCRNoticeDrainer(
 				crRepo,
 				service.NewCRNoticeService(crRepo, crPublisher),
@@ -138,6 +149,54 @@ func main() {
 			)
 			go drainer.Run(crNoticeCtx)
 			log.Printf("change-request notices enabled: publishing to topic %q every %s", cfg.CREventHubTopic, cfg.CRNoticePollInterval)
+		}
+	}
+
+	// Outage emails: the internal-stakeholder notification and the SRE
+	// outage communication, decided every OUTAGE_NOTICE_POLL_INTERVAL and
+	// published on their own topic for csm-notification-service to send --
+	// seconds after the change, as ServiceNow's record-triggered flows are,
+	// instead of on csm-scheduled-tasks' tick.
+	//
+	// No switch of its own: an email whose recipient list is empty is never
+	// swept (see OutageNoticeDrainer), so OUTAGE_NOTIFICATION_RECIPIENTS and
+	// OUTAGE_COMMUNICATION_RECIPIENTS are what turn each one on.
+	if pool != nil && cfg.DataSource != config.DataSourceServiceNow {
+		switch {
+		case len(cfg.OutageNotificationRecipients) == 0 && len(cfg.OutageCommunicationRecipients) == 0:
+			log.Printf("outage emails off: OUTAGE_NOTIFICATION_RECIPIENTS and OUTAGE_COMMUNICATION_RECIPIENTS are both empty")
+		case cfg.EventHubBroker == "" || !cfg.EventPublishingEnabled:
+			log.Printf("outage emails off: event publishing is not configured (EVENT_HUB_BROKER/EVENT_PUBLISHING_ENABLED)")
+		default:
+			outageNoticeCtx, stopOutageNotices := context.WithCancel(repository.WithSystemIdentity(context.Background()))
+			defer stopOutageNotices()
+			// The context below carries the system identity, which ResolveScope
+			// returns before ever consulting client ids, so none are configured.
+			outageAccess := service.NewAccessService(repository.NewAccessRepository(pool), service.AccessClientConfig{})
+			drainer := &service.OutageNoticeDrainer{
+				Notifications: service.NewOutageNotificationService(
+					repository.NewOutageNotificationRepository(pool), outageAccess),
+				Communications: service.NewOutageCommunicationService(
+					repository.NewOutageCommunicationRepository(pool), outageAccess),
+				Publisher: service.NewEventPublisherService(
+					eventbus.NewProducer(eventbus.Config{
+						Broker:           cfg.EventHubBroker,
+						ConnectionString: cfg.EventHubConnectionString,
+						Topic:            cfg.OutageEventHubTopic,
+					}),
+					service.NewEventPublishFailureService(repository.NewEventPublishFailureRepository(pool)),
+				),
+				NotificationRecipients:  cfg.OutageNotificationRecipients,
+				CommunicationRecipients: cfg.OutageCommunicationRecipients,
+				// Woken by migration 0186's NOTIFY on every outage change;
+				// the interval is only the fallback poll.
+				Listener: repository.NewOutageChangeListener(pool),
+				Interval: cfg.OutageNoticePollInterval,
+			}
+			go drainer.Run(outageNoticeCtx)
+			log.Printf("outage emails enabled: publishing to topic %q on each outage change (fallback poll %s; internal notification: %d recipients, outage communication: %d recipients)",
+				cfg.OutageEventHubTopic, cfg.OutageNoticePollInterval,
+				len(cfg.OutageNotificationRecipients), len(cfg.OutageCommunicationRecipients))
 		}
 	}
 
@@ -168,6 +227,29 @@ func main() {
 		go cloudStatusDrainer.Run(cloudStatusCtx)
 		log.Printf("cloud status notices enabled: draining every %s across %d services",
 			cfg.CloudStatusPollInterval, len(cfg.CloudStatusServiceIDs))
+	}
+
+	// Incident report flows: the record-triggered port of ServiceNow's
+	// "Create Incident Report Task" and "Incident Report Generator". Always
+	// on wherever there is a database -- like the ServiceNow flows, there is
+	// no switch. Running even with DATA_SOURCE=servicenow is deliberate: the
+	// 0181 trigger records incident changes whenever the table is written,
+	// and a drainer that is off lets them pile up, to be replayed as stale
+	// tasks the day it comes on. Writes Postgres only, never ServiceNow, so it
+	// needs no caller token and no publisher.
+	// WithSystemIdentity: a background process with no viewer, and
+	// work_item's RLS insert policy (0147) admits it only as internal.
+	incidentReportCtx, stopIncidentReport := context.WithCancel(repository.WithSystemIdentity(context.Background()))
+	defer stopIncidentReport()
+	if pool != nil {
+		incidentReportDrainer := service.NewIncidentReportDrainer(
+			repository.NewIncidentReportRepository(repository.NewScoped(pool)),
+			service.NewIncidentReportService(),
+			cfg.IncidentReportPollInterval,
+			service.IncidentReportMaxAttempts,
+		)
+		go incidentReportDrainer.Run(incidentReportCtx)
+		log.Printf("incident report flows running: draining every %s", cfg.IncidentReportPollInterval)
 	}
 
 	// The health probe listens separately, on its own port, so that only its

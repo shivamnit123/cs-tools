@@ -29,7 +29,7 @@ import (
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
 )
 
-func splScanRequest(t *testing.T, payload SplUserScanRequest) *http.Request {
+func scanTestRequest(t *testing.T, payload UserScanRequest) *http.Request {
 	t.Helper()
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -50,7 +50,7 @@ func scanProjectsResponse(id, key, closureState string) []byte {
 }
 
 func TestSplScanUser_AuthGates(t *testing.T) {
-	h := NewSplUserScanHandler(&mockSalesEntityClient{}, &mockEntityScanClient{}, splAccessGuard)
+	h := NewSplUserScanHandler(&mockSalesEntityClient{}, &mockEntityScanClient{}, viewerAccessGuard)
 
 	t.Run("requires authenticated user", func(t *testing.T) {
 		r := httptest.NewRequest(http.MethodPost, "/spl/scan-user", bytes.NewReader([]byte(`{}`)))
@@ -59,14 +59,14 @@ func TestSplScanUser_AuthGates(t *testing.T) {
 		assertStatus(t, w, http.StatusUnauthorized)
 	})
 
-	t.Run("rejects a role that doesn't grant PermSPLAccess", func(t *testing.T) {
-		h2 := NewSplUserScanHandler(&mockSalesEntityClient{}, &mockEntityScanClient{}, splAccessGuard)
-		body, err := json.Marshal(SplUserScanRequest{Email: "a@b.com"})
+	t.Run("rejects a role that doesn't grant PermViewerAccess", func(t *testing.T) {
+		h2 := NewSplUserScanHandler(&mockSalesEntityClient{}, &mockEntityScanClient{}, viewerAccessGuard)
+		body, err := json.Marshal(UserScanRequest{Email: "a@b.com"})
 		if err != nil {
 			t.Fatalf("marshal payload: %v", err)
 		}
 		r := httptest.NewRequest(http.MethodPost, "/spl/scan-user", bytes.NewReader(body))
-		// Authenticated but holds no role granting PermSPLAccess.
+		// Authenticated but holds no role granting PermViewerAccess.
 		r = r.WithContext(middleware.WithUserInfo(r.Context(), &middleware.UserInfo{Email: "nobody@example.com", UserID: "u-nobody"}))
 		w := httptest.NewRecorder()
 		h2.ScanUser(w, r)
@@ -88,8 +88,8 @@ func TestSplScanUser_AuthGates(t *testing.T) {
 					return nil, nil
 				},
 			},
-			&mockEntityScanClient{}, splAccessGuard)
-		tests := []SplUserScanRequest{
+			&mockEntityScanClient{}, viewerAccessGuard)
+		tests := []UserScanRequest{
 			{Email: "", SubscriptionKey: "sub-1"},
 			{Email: "a@b.com", SubscriptionKey: ""},
 			{Email: "   ", SubscriptionKey: "sub-1"},
@@ -97,7 +97,7 @@ func TestSplScanUser_AuthGates(t *testing.T) {
 		}
 		for _, payload := range tests {
 			w := httptest.NewRecorder()
-			h2.ScanUser(w, splScanRequest(t, payload))
+			h2.ScanUser(w, scanTestRequest(t, payload))
 			assertStatus(t, w, http.StatusBadRequest)
 		}
 	})
@@ -118,12 +118,12 @@ func TestSplScanUser_SalesforceSide(t *testing.T) {
 
 	t.Run("contact not found, subscription not found", func(t *testing.T) {
 		sales := &mockSalesEntityClient{}
-		h := NewSplUserScanHandler(sales, neutralEntity, splAccessGuard)
-		r := splScanRequest(t, SplUserScanRequest{Email: "nobody@example.com", SubscriptionKey: "key-1"})
+		h := NewSplUserScanHandler(sales, neutralEntity, viewerAccessGuard)
+		r := scanTestRequest(t, UserScanRequest{Email: "nobody@example.com", SubscriptionKey: "key-1"})
 		w := httptest.NewRecorder()
 		h.ScanUser(w, r)
 		assertStatus(t, w, http.StatusOK)
-		resp := decodeJSON[[]SplScanResponse](t, w)
+		resp := decodeJSON[[]ScanResponse](t, w)
 		sf := resp[0]
 		if sf.System != "Salesforce" {
 			t.Fatalf("system = %q, want Salesforce", sf.System)
@@ -131,13 +131,13 @@ func TestSplScanUser_SalesforceSide(t *testing.T) {
 		if sf.SystemResult[0].State {
 			t.Error("contact result should not be success")
 		}
-		if sf.SystemResult[0].Information != splInfoContactNotFound {
+		if sf.SystemResult[0].Information != infoContactNotFound {
 			t.Errorf("contact information = %+v, want ContactNotFound", sf.SystemResult[0].Information)
 		}
-		if sf.SystemResult[1].Information != splInfoSubscriptionNotFound {
+		if sf.SystemResult[1].Information != infoSubscriptionNotFound {
 			t.Errorf("subscription information = %+v, want SubscriptionNotFound", sf.SystemResult[1].Information)
 		}
-		if sf.SystemResult[2].Information != splInfoMembershipNotFound {
+		if sf.SystemResult[2].Information != infoMembershipNotFound {
 			t.Errorf("membership information = %+v, want MembershipNotFound", sf.SystemResult[2].Information)
 		}
 	})
@@ -155,16 +155,16 @@ func TestSplScanUser_SalesforceSide(t *testing.T) {
 				return &entity.Subscription{ID: "sub-1", CustomerID: "acct-1"}, nil
 			},
 		}
-		h := NewSplUserScanHandler(sales, neutralEntity, splAccessGuard)
-		r := splScanRequest(t, SplUserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1"})
+		h := NewSplUserScanHandler(sales, neutralEntity, viewerAccessGuard)
+		r := scanTestRequest(t, UserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1"})
 		w := httptest.NewRecorder()
 		h.ScanUser(w, r)
-		resp := decodeJSON[[]SplScanResponse](t, w)
+		resp := decodeJSON[[]ScanResponse](t, w)
 		sf := resp[0]
 		if !sf.SystemResult[0].State {
 			t.Error("contact result should be success")
 		}
-		if sf.SystemResult[2].Information != splInfoMembershipNotFoundInSubscription {
+		if sf.SystemResult[2].Information != infoMembershipNotFoundInSubscription {
 			t.Errorf("membership information = %+v, want MembershipNotFoundInSubscription", sf.SystemResult[2].Information)
 		}
 	})
@@ -179,18 +179,18 @@ func TestSplScanUser_SalesforceSide(t *testing.T) {
 						Name           string `json:"name"`
 						Classification string `json:"classification"`
 					}{ID: "acct-1", Classification: "Enterprise"},
-					Memberships: []entity.ContactMembership{{SubscriptionID: "sub-1", Type: splMembershipTypeCustomer}},
+					Memberships: []entity.ContactMembership{{SubscriptionID: "sub-1", Type: membershipTypeCustomer}},
 				}, nil
 			},
 			getSubscriptionByKeyFn: func(ctx context.Context, subscriptionKey string) (*entity.Subscription, error) {
 				return &entity.Subscription{ID: "sub-1", CustomerID: "acct-1"}, nil
 			},
 		}
-		h := NewSplUserScanHandler(sales, neutralEntity, splAccessGuard)
-		r := splScanRequest(t, SplUserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1", IsPartner: false})
+		h := NewSplUserScanHandler(sales, neutralEntity, viewerAccessGuard)
+		r := scanTestRequest(t, UserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1", IsPartner: false})
 		w := httptest.NewRecorder()
 		h.ScanUser(w, r)
-		resp := decodeJSON[[]SplScanResponse](t, w)
+		resp := decodeJSON[[]ScanResponse](t, w)
 		sf := resp[0]
 		if !sf.SystemResult[2].State {
 			t.Errorf("membership result should be success, got %+v", sf.SystemResult[2])
@@ -206,25 +206,25 @@ func TestSplScanUser_SalesforceSide(t *testing.T) {
 						ID             string `json:"id"`
 						Name           string `json:"name"`
 						Classification string `json:"classification"`
-					}{ID: "acct-1", Classification: splAccountClassificationPartner},
-					Memberships: []entity.ContactMembership{{SubscriptionID: "sub-1", Type: splMembershipTypeCustomer}},
+					}{ID: "acct-1", Classification: accountClassificationPartner},
+					Memberships: []entity.ContactMembership{{SubscriptionID: "sub-1", Type: membershipTypeCustomer}},
 				}, nil
 			},
 			getSubscriptionByKeyFn: func(ctx context.Context, subscriptionKey string) (*entity.Subscription, error) {
 				return &entity.Subscription{ID: "sub-1", CustomerID: "acct-1"}, nil
 			},
 		}
-		h := NewSplUserScanHandler(sales, neutralEntity, splAccessGuard)
+		h := NewSplUserScanHandler(sales, neutralEntity, viewerAccessGuard)
 		// isPartner=true but membership type is CUSTOMER -> invalid on a partner account.
-		r := splScanRequest(t, SplUserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1", IsPartner: true})
+		r := scanTestRequest(t, UserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1", IsPartner: true})
 		w := httptest.NewRecorder()
 		h.ScanUser(w, r)
-		resp := decodeJSON[[]SplScanResponse](t, w)
+		resp := decodeJSON[[]ScanResponse](t, w)
 		sf := resp[0]
 		if sf.SystemResult[2].State {
 			t.Error("membership result should not be success")
 		}
-		if sf.SystemResult[2].Information != splInfoInvalidMembership {
+		if sf.SystemResult[2].Information != infoInvalidMembership {
 			t.Errorf("membership information = %+v, want InvalidMembership", sf.SystemResult[2].Information)
 		}
 	})
@@ -239,20 +239,20 @@ func TestSplScanUser_SalesforceSide(t *testing.T) {
 						Name           string `json:"name"`
 						Classification string `json:"classification"`
 					}{ID: "acct-1", Classification: "Enterprise"},
-					Memberships: []entity.ContactMembership{{SubscriptionID: "sub-1", Type: splMembershipTypePartner}},
+					Memberships: []entity.ContactMembership{{SubscriptionID: "sub-1", Type: membershipTypePartner}},
 				}, nil
 			},
 			getSubscriptionByKeyFn: func(ctx context.Context, subscriptionKey string) (*entity.Subscription, error) {
 				return &entity.Subscription{ID: "sub-1", CustomerID: "acct-1"}, nil
 			},
 		}
-		h := NewSplUserScanHandler(sales, neutralEntity, splAccessGuard)
-		r := splScanRequest(t, SplUserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1", IsPartner: false})
+		h := NewSplUserScanHandler(sales, neutralEntity, viewerAccessGuard)
+		r := scanTestRequest(t, UserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1", IsPartner: false})
 		w := httptest.NewRecorder()
 		h.ScanUser(w, r)
-		resp := decodeJSON[[]SplScanResponse](t, w)
+		resp := decodeJSON[[]ScanResponse](t, w)
 		sf := resp[0]
-		if sf.SystemResult[2].Information != splInfoInvalidCustomerMembership {
+		if sf.SystemResult[2].Information != infoInvalidCustomerMembership {
 			t.Errorf("membership information = %+v, want InvalidCustomerMembership", sf.SystemResult[2].Information)
 		}
 	})
@@ -267,20 +267,20 @@ func TestSplScanUser_SalesforceSide(t *testing.T) {
 						Name           string `json:"name"`
 						Classification string `json:"classification"`
 					}{ID: "acct-1"},
-					Memberships: []entity.ContactMembership{{SubscriptionID: "sub-1", Type: splMembershipTypeCustomer}},
+					Memberships: []entity.ContactMembership{{SubscriptionID: "sub-1", Type: membershipTypeCustomer}},
 				}, nil
 			},
 			getSubscriptionByKeyFn: func(ctx context.Context, subscriptionKey string) (*entity.Subscription, error) {
 				return &entity.Subscription{ID: "sub-1", CustomerID: "acct-DIFFERENT"}, nil
 			},
 		}
-		h := NewSplUserScanHandler(sales, neutralEntity, splAccessGuard)
-		r := splScanRequest(t, SplUserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1", IsPartner: false})
+		h := NewSplUserScanHandler(sales, neutralEntity, viewerAccessGuard)
+		r := scanTestRequest(t, UserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1", IsPartner: false})
 		w := httptest.NewRecorder()
 		h.ScanUser(w, r)
-		resp := decodeJSON[[]SplScanResponse](t, w)
+		resp := decodeJSON[[]ScanResponse](t, w)
 		sf := resp[0]
-		if sf.SystemResult[1].Information != splInfoSubscriptionNotFoundInAccount {
+		if sf.SystemResult[1].Information != infoSubscriptionNotFoundInAccount {
 			t.Errorf("subscription information = %+v, want SubscriptionNotFoundInAccount", sf.SystemResult[1].Information)
 		}
 	})
@@ -295,19 +295,19 @@ func TestSplScanUser_EntityServiceSide(t *testing.T) {
 				return []byte(`{"projects":[]}`), nil
 			},
 		}
-		h := NewSplUserScanHandler(neutralSales, ent, splAccessGuard)
-		r := splScanRequest(t, SplUserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1"})
+		h := NewSplUserScanHandler(neutralSales, ent, viewerAccessGuard)
+		r := scanTestRequest(t, UserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1"})
 		w := httptest.NewRecorder()
 		h.ScanUser(w, r)
-		resp := decodeJSON[[]SplScanResponse](t, w)
+		resp := decodeJSON[[]ScanResponse](t, w)
 		sn := resp[1]
 		if sn.System != "Servicenow" {
 			t.Fatalf("system = %q, want Servicenow", sn.System)
 		}
-		if sn.SystemResult[1].Information != splInfoProjectNotFound {
+		if sn.SystemResult[1].Information != infoProjectNotFound {
 			t.Errorf("project information = %+v, want ProjectNotFound", sn.SystemResult[1].Information)
 		}
-		if sn.SystemResult[0].Information != splInfoUserNotFoundInProject {
+		if sn.SystemResult[0].Information != infoUserNotFoundInProject {
 			t.Errorf("user information = %+v, want UserNotFoundInProject", sn.SystemResult[0].Information)
 		}
 	})
@@ -321,12 +321,12 @@ func TestSplScanUser_EntityServiceSide(t *testing.T) {
 				return scanProjectsResponse("proj-1", "other-key-1-suffix", "Open"), nil
 			},
 		}
-		h := NewSplUserScanHandler(neutralSales, ent, splAccessGuard)
-		r := splScanRequest(t, SplUserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1"})
+		h := NewSplUserScanHandler(neutralSales, ent, viewerAccessGuard)
+		r := scanTestRequest(t, UserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1"})
 		w := httptest.NewRecorder()
 		h.ScanUser(w, r)
-		resp := decodeJSON[[]SplScanResponse](t, w)
-		if resp[1].SystemResult[1].Information != splInfoProjectNotFound {
+		resp := decodeJSON[[]ScanResponse](t, w)
+		if resp[1].SystemResult[1].Information != infoProjectNotFound {
 			t.Errorf("project information = %+v, want ProjectNotFound", resp[1].SystemResult[1].Information)
 		}
 	})
@@ -340,11 +340,11 @@ func TestSplScanUser_EntityServiceSide(t *testing.T) {
 				return scanUsersResponse("a@b.com", false), nil
 			},
 		}
-		h := NewSplUserScanHandler(neutralSales, ent, splAccessGuard)
-		r := splScanRequest(t, SplUserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1"})
+		h := NewSplUserScanHandler(neutralSales, ent, viewerAccessGuard)
+		r := scanTestRequest(t, UserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1"})
 		w := httptest.NewRecorder()
 		h.ScanUser(w, r)
-		resp := decodeJSON[[]SplScanResponse](t, w)
+		resp := decodeJSON[[]ScanResponse](t, w)
 		sn := resp[1]
 		if sn.SystemResult[1].State {
 			t.Error("project result should not be success when closure state isn't Open")
@@ -364,16 +364,16 @@ func TestSplScanUser_EntityServiceSide(t *testing.T) {
 				return []byte(`{"users":[]}`), nil
 			},
 		}
-		h := NewSplUserScanHandler(neutralSales, ent, splAccessGuard)
-		r := splScanRequest(t, SplUserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1"})
+		h := NewSplUserScanHandler(neutralSales, ent, viewerAccessGuard)
+		r := scanTestRequest(t, UserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1"})
 		w := httptest.NewRecorder()
 		h.ScanUser(w, r)
-		resp := decodeJSON[[]SplScanResponse](t, w)
+		resp := decodeJSON[[]ScanResponse](t, w)
 		sn := resp[1]
 		if sn.SystemResult[1].State != true {
 			t.Error("project result should be success (Open)")
 		}
-		if sn.SystemResult[0].Information != splInfoUserNotFound {
+		if sn.SystemResult[0].Information != infoUserNotFound {
 			t.Errorf("user information = %+v, want UserNotFound", sn.SystemResult[0].Information)
 		}
 	})
@@ -387,11 +387,11 @@ func TestSplScanUser_EntityServiceSide(t *testing.T) {
 				return scanUsersResponse("a@b.com", false), nil
 			},
 		}
-		h := NewSplUserScanHandler(neutralSales, ent, splAccessGuard)
-		r := splScanRequest(t, SplUserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1"})
+		h := NewSplUserScanHandler(neutralSales, ent, viewerAccessGuard)
+		r := scanTestRequest(t, UserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1"})
 		w := httptest.NewRecorder()
 		h.ScanUser(w, r)
-		resp := decodeJSON[[]SplScanResponse](t, w)
+		resp := decodeJSON[[]ScanResponse](t, w)
 		if !resp[1].SystemResult[0].State {
 			t.Error("user result should be success")
 		}
@@ -411,11 +411,11 @@ func TestSplScanUser_EntityServiceSide(t *testing.T) {
 				return nil, nil
 			},
 		}
-		h := NewSplUserScanHandler(neutralSales, ent, splAccessGuard)
-		r := splScanRequest(t, SplUserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1"})
+		h := NewSplUserScanHandler(neutralSales, ent, viewerAccessGuard)
+		r := scanTestRequest(t, UserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1"})
 		w := httptest.NewRecorder()
 		h.ScanUser(w, r)
-		resp := decodeJSON[[]SplScanResponse](t, w)
+		resp := decodeJSON[[]ScanResponse](t, w)
 		userResult := resp[1].SystemResult[0]
 		if userResult.State {
 			t.Error("locked-out user result should not be success")
@@ -440,12 +440,12 @@ func TestSplScanUser_EntityServiceSide(t *testing.T) {
 				return nil, context.DeadlineExceeded
 			},
 		}
-		h := NewSplUserScanHandler(neutralSales, ent, splAccessGuard)
-		r := splScanRequest(t, SplUserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1"})
+		h := NewSplUserScanHandler(neutralSales, ent, viewerAccessGuard)
+		r := scanTestRequest(t, UserScanRequest{Email: "a@b.com", SubscriptionKey: "key-1"})
 		w := httptest.NewRecorder()
 		h.ScanUser(w, r)
 		assertStatus(t, w, http.StatusOK)
-		resp := decodeJSON[[]SplScanResponse](t, w)
+		resp := decodeJSON[[]ScanResponse](t, w)
 		userResult := resp[1].SystemResult[0]
 		if userResult.Information.Solution != "Could not resend the invitation automatically. Resend it manually from the project's Contacts tab." {
 			t.Errorf("solution = %q, unexpected", userResult.Information.Solution)
@@ -460,8 +460,8 @@ func TestSplScanUser_UpstreamFailuresReturn500WithBespokeMessage(t *testing.T) {
 				return nil, context.DeadlineExceeded
 			},
 		}
-		h := NewSplUserScanHandler(sales, &mockEntityScanClient{}, splAccessGuard)
-		r := splScanRequest(t, SplUserScanRequest{Email: "a@b.com", SubscriptionKey: "sub-1"})
+		h := NewSplUserScanHandler(sales, &mockEntityScanClient{}, viewerAccessGuard)
+		r := scanTestRequest(t, UserScanRequest{Email: "a@b.com", SubscriptionKey: "sub-1"})
 		w := httptest.NewRecorder()
 		h.ScanUser(w, r)
 		assertStatus(t, w, http.StatusInternalServerError)
@@ -474,8 +474,8 @@ func TestSplScanUser_UpstreamFailuresReturn500WithBespokeMessage(t *testing.T) {
 				return nil, context.DeadlineExceeded
 			},
 		}
-		h := NewSplUserScanHandler(&mockSalesEntityClient{}, ent, splAccessGuard)
-		r := splScanRequest(t, SplUserScanRequest{Email: "a@b.com", SubscriptionKey: "sub-1"})
+		h := NewSplUserScanHandler(&mockSalesEntityClient{}, ent, viewerAccessGuard)
+		r := scanTestRequest(t, UserScanRequest{Email: "a@b.com", SubscriptionKey: "sub-1"})
 		w := httptest.NewRecorder()
 		h.ScanUser(w, r)
 		assertStatus(t, w, http.StatusInternalServerError)
@@ -488,8 +488,8 @@ func TestSplScanUser_UpstreamFailuresReturn500WithBespokeMessage(t *testing.T) {
 				return nil, context.DeadlineExceeded
 			},
 		}
-		h := NewSplUserScanHandler(&mockSalesEntityClient{}, ent, splAccessGuard)
-		r := splScanRequest(t, SplUserScanRequest{Email: "a@b.com", SubscriptionKey: "sub-1"})
+		h := NewSplUserScanHandler(&mockSalesEntityClient{}, ent, viewerAccessGuard)
+		r := scanTestRequest(t, UserScanRequest{Email: "a@b.com", SubscriptionKey: "sub-1"})
 		w := httptest.NewRecorder()
 		h.ScanUser(w, r)
 		assertStatus(t, w, http.StatusInternalServerError)

@@ -38,8 +38,8 @@ import (
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/entity"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/eventbus"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/kbclient"
-"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/kbembeddingengine"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/kbdraftengine"
+	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/kbembeddingengine"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/middleware"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/notifications"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/recipientlinks"
@@ -190,6 +190,23 @@ func main() {
 	crDLQProducer := eventbus.NewProducer(crDLQCfg)
 	defer crDLQProducer.Close()
 
+	// The two outage emails ride their own topic as well, for the same
+	// reason: entity-service's outage notice drainer publishes them there
+	// (OUTAGE_EVENT_HUB_TOPIC there), and its own DLQ keeps a stuck outage
+	// email out of the case and change-request dead-letter topics.
+	outageCfg := eventbus.Config{
+		Broker:           eventBusCfg.Broker,
+		ConnectionString: eventBusCfg.ConnectionString,
+		Topic:            envOrDefault("OUTAGE_EVENT_HUB_TOPIC", "outage-events"),
+	}
+	outageDLQCfg := eventbus.Config{
+		Broker:           eventBusCfg.Broker,
+		ConnectionString: eventBusCfg.ConnectionString,
+		Topic:            envOrDefault("OUTAGE_EVENT_HUB_DLQ_TOPIC", "outage-events-dlq"),
+	}
+	outageDLQProducer := eventbus.NewProducer(outageDLQCfg)
+	defer outageDLQProducer.Close()
+
 	// The onboarding events ride their own topic too, for the same reason
 	// the change-request notices do: a separate consumer group isolates
 	// processing, only a separate topic isolates volume. An invitation
@@ -220,6 +237,10 @@ func main() {
 	crDLQConsumerGroup := envOrDefault("CR_DLQ_CONSUMER_GROUP", "csm-notification-service-cr-dlq")
 	crConsumerCount := envInt("CR_CONSUMER_COUNT", 1)
 	crDLQConsumerCount := envInt("CR_DLQ_CONSUMER_COUNT", 1)
+	outageConsumerGroup := envOrDefault("OUTAGE_CONSUMER_GROUP", "csm-notification-service-outage")
+	outageDLQConsumerGroup := envOrDefault("OUTAGE_DLQ_CONSUMER_GROUP", "csm-notification-service-outage-dlq")
+	outageConsumerCount := envInt("OUTAGE_CONSUMER_COUNT", 1)
+	outageDLQConsumerCount := envInt("OUTAGE_DLQ_CONSUMER_COUNT", 1)
 	projectConsumerGroup := envOrDefault("PROJECT_CONSUMER_GROUP", "csm-notification-service-project")
 	projectDLQConsumerGroup := envOrDefault("PROJECT_DLQ_CONSUMER_GROUP", "csm-notification-service-project-dlq")
 	projectConsumerCount := envInt("PROJECT_CONSUMER_COUNT", 1)
@@ -274,7 +295,13 @@ func main() {
 	// dispatch.Dispatcher.defaultOnCallNumber.
 	defaultOnCallNumber := os.Getenv("INCIDENT_DEFAULT_CALL_TO")
 
-	dispatcher := dispatch.NewDispatcher(emailClient, googleChatClient, twilioClient, linkResolver, emailSendingEnabled, emailDebugMode, emailDebugRecipients, callSendingEnabled, defaultOnCallNumber).
+	// DEFAULT_CSM_EMAIL_CC is CC'd on every case.* email's CSM-portal-link
+	// group only (never the customer-portal group, never during
+	// EMAIL_DEBUG_MODE) — see dispatch.Dispatcher.defaultCSMEmailCC's own
+	// doc comment.
+	defaultCSMEmailCC := splitComma(os.Getenv("DEFAULT_CSM_EMAIL_CC"))
+
+	dispatcher := dispatch.NewDispatcher(emailClient, googleChatClient, twilioClient, linkResolver, emailSendingEnabled, emailDebugMode, emailDebugRecipients, callSendingEnabled, defaultOnCallNumber, defaultCSMEmailCC).
 		WithOnboarding(loadOnboardingConfig(customerEntityClient, emailClient))
 
 	// The main consumer's OnExhausted: publish the exhausted record to the
@@ -298,6 +325,15 @@ func main() {
 		slog.WarnContext(ctx, "eventbus: handler exhausted retries, publishing to dead-letter topic",
 			append(attrs, deadLetterErrAttrs(handleErr)...)...)
 		return crDLQProducer.Publish(ctx, record.Key, record.Value)
+	}
+
+	// And for the outage consumer.
+	outageToDeadLetter := func(ctx context.Context, record eventbus.Record, handleErr error) error {
+		attrs := []any{"topic", record.Topic, "partition", record.Partition,
+			"offset", record.Offset, "dlqTopic", outageDLQCfg.Topic}
+		slog.WarnContext(ctx, "eventbus: handler exhausted retries, publishing to dead-letter topic",
+			append(attrs, deadLetterErrAttrs(handleErr)...)...)
+		return outageDLQProducer.Publish(ctx, record.Key, record.Value)
 	}
 
 	// Same again for the onboarding consumer: a stuck invitation cannot
@@ -357,6 +393,8 @@ func main() {
 	// that is all their topic carries.
 	crConsumers := startConsumers(ctx, "cr", crCfg, crConsumerGroup, crConsumerCount, dispatcher.Handle, crToDeadLetter)
 	crDLQConsumers := startConsumers(ctx, "cr-dlq", crDLQCfg, crDLQConsumerGroup, crDLQConsumerCount, dispatcher.Handle, nil)
+	outageConsumers := startConsumers(ctx, "outage", outageCfg, outageConsumerGroup, outageConsumerCount, dispatcher.Handle, outageToDeadLetter)
+	outageDLQConsumers := startConsumers(ctx, "outage-dlq", outageDLQCfg, outageDLQConsumerGroup, outageDLQConsumerCount, dispatcher.Handle, nil)
 	// And the same for project_contact.invited: the one dispatcher routes
 	// on the envelope's Type already, and these two only ever receive the
 	// onboarding events since that is all their topic carries.
@@ -446,7 +484,7 @@ func main() {
 		// exists.
 		slaProducer = eventbus.NewProducer(eventBusCfg)
 
-		slaEngine := slaengine.NewEngine(slaEntityClient, slaengine.NewTierStore(redisClient), slaProducer, googleChatClient, linkResolver)
+		slaEngine := slaengine.NewEngine(slaEntityClient, slaengine.NewTierStore(redisClient), slaProducer, googleChatClient, linkResolver, emailClient, emailSendingEnabled, emailDebugMode, emailDebugRecipients)
 
 		// SLA_TICK_INTERVAL defaults far above the old wake-index engine's
 		// 15s: that interval made sense for firing a precomputed due date
@@ -563,6 +601,12 @@ func main() {
 		c.Close()
 	}
 	for _, c := range crDLQConsumers {
+		c.Close()
+	}
+	for _, c := range outageConsumers {
+		c.Close()
+	}
+	for _, c := range outageDLQConsumers {
 		c.Close()
 	}
 	for _, c := range projectConsumers {

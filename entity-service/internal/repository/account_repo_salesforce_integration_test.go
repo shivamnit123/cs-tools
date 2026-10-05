@@ -97,7 +97,7 @@ func newAccountSalesforceIntegrationRepo(t *testing.T) (*accountRepo, *pgxpool.P
 			t.Fatalf("seed: %v", err)
 		}
 	}
-	return &accountRepo{db: pool}, pool
+	return &accountRepo{db: NewScoped(pool)}, pool
 }
 
 type sfiAccount struct {
@@ -139,7 +139,9 @@ func readSfiLedger(t *testing.T, pool *pgxpool.Pool, sfID string) (eventType, st
 
 func sfiSearch(t *testing.T, r *accountRepo) int {
 	t.Helper()
-	_, total, err := r.SearchAccounts(context.Background(), domain.SearchAccountsRequest{
+	// The search serves internal callers only (internalOnly on the route), so it
+	// runs on that caller's identity, which the HTTP middleware supplies.
+	_, total, err := r.SearchAccounts(WithSystemIdentity(context.Background()), domain.SearchAccountsRequest{
 		Pagination: domain.Pagination{Limit: 10},
 		Filters:    domain.SearchAccountsFilters{SearchQuery: sfiSfID},
 	})
@@ -214,7 +216,7 @@ func TestAccountSalesforceIntegration(t *testing.T) {
 	if n := sfiSearch(t, r); n != 0 {
 		t.Errorf("search total after DELETED = %d, want 0", n)
 	}
-	if _, err := r.GetAccountByID(ctx, sfiAccountID); err != nil {
+	if _, err := r.GetAccountByID(WithSystemIdentity(ctx), sfiAccountID); err != nil {
 		t.Errorf("GetAccountByID after DELETED: %v, want the row", err)
 	}
 

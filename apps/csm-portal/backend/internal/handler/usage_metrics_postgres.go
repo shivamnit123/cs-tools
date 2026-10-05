@@ -37,7 +37,7 @@ type entityUsageMetricsClient interface {
 	SearchDeployedProductUsageCounts(ctx context.Context, deployedProductID string, body []byte) ([]byte, error)
 }
 
-// postgresSplUsageMetricsClient implements usageMetricsServiceNowClient by
+// postgresUsageMetricsClient implements usageMetricsServiceNowClient by
 // calling entity-service (Postgres) instead of ServiceNow's custom
 // x_wso2_customer_0 scoped-app API directly.
 //
@@ -57,15 +57,15 @@ type entityUsageMetricsClient interface {
 // omitted, so existing frontend code that reads it unconditionally keeps
 // working -- same convention as postgresSplAccountClient/
 // postgresSplProjectClient elsewhere in this package.
-type postgresSplUsageMetricsClient struct {
+type postgresUsageMetricsClient struct {
 	entity entityUsageMetricsClient
 }
 
-// NewPostgresSplUsageMetricsClient builds a postgresSplUsageMetricsClient.
+// NewPostgresUsageMetricsClient builds a postgresUsageMetricsClient.
 // entity is typically the same *entity.CustomerEntityClient every other CS
 // Portal handler already uses.
-func NewPostgresSplUsageMetricsClient(entity entityUsageMetricsClient) *postgresSplUsageMetricsClient {
-	return &postgresSplUsageMetricsClient{entity: entity}
+func NewPostgresUsageMetricsClient(entity entityUsageMetricsClient) *postgresUsageMetricsClient {
+	return &postgresUsageMetricsClient{entity: entity}
 }
 
 // --- shared wire types ---
@@ -116,7 +116,7 @@ type usageMetricsProjectTypeahead struct {
 }
 
 // GetAllProjects implements usageMetricsServiceNowClient.
-func (c *postgresSplUsageMetricsClient) GetAllProjects(ctx context.Context, search string) ([]byte, error) {
+func (c *postgresUsageMetricsClient) GetAllProjects(ctx context.Context, search string) ([]byte, error) {
 	req := entitySearchProjectsRequest{
 		Pagination:  entityPagination{Limit: 30, Offset: 0},
 		SearchQuery: search,
@@ -182,7 +182,7 @@ type snProjectsSearchResponse struct {
 }
 
 // SearchUsageMetricsProjects implements usageMetricsServiceNowClient.
-func (c *postgresSplUsageMetricsClient) SearchUsageMetricsProjects(ctx context.Context, payload []byte) ([]byte, error) {
+func (c *postgresUsageMetricsClient) SearchUsageMetricsProjects(ctx context.Context, payload []byte) ([]byte, error) {
 	var in snProjectSearchRequest
 	if err := json.Unmarshal(payload, &in); err != nil {
 		return nil, fmt.Errorf("decode usage-metrics projects/search request: %w", err)
@@ -306,7 +306,7 @@ type snDeploymentsSearchResponse struct {
 }
 
 // SearchUsageMetricsDeployments implements usageMetricsServiceNowClient.
-func (c *postgresSplUsageMetricsClient) SearchUsageMetricsDeployments(ctx context.Context, payload []byte) ([]byte, error) {
+func (c *postgresUsageMetricsClient) SearchUsageMetricsDeployments(ctx context.Context, payload []byte) ([]byte, error) {
 	var in snDeploymentsSearchRequest
 	if err := json.Unmarshal(payload, &in); err != nil {
 		return nil, fmt.Errorf("decode usage-metrics deployments/search request: %w", err)
@@ -433,7 +433,7 @@ type snDeployedProductsSearchResponse struct {
 }
 
 // SearchUsageMetricsDeployedProducts implements usageMetricsServiceNowClient.
-func (c *postgresSplUsageMetricsClient) SearchUsageMetricsDeployedProducts(ctx context.Context, payload []byte) ([]byte, error) {
+func (c *postgresUsageMetricsClient) SearchUsageMetricsDeployedProducts(ctx context.Context, payload []byte) ([]byte, error) {
 	var in snDeployedProductsSearchRequest
 	if err := json.Unmarshal(payload, &in); err != nil {
 		return nil, fmt.Errorf("decode usage-metrics deployed-products/search request: %w", err)
@@ -529,7 +529,7 @@ type snInstancesSearchResponse struct {
 // already matches entity-service's domain.SearchInstancesRequest exactly, so
 // it is round-tripped through a typed struct only to validate shape, not
 // reshaped.
-func (c *postgresSplUsageMetricsClient) SearchUsageMetricsInstances(ctx context.Context, payload []byte) ([]byte, error) {
+func (c *postgresUsageMetricsClient) SearchUsageMetricsInstances(ctx context.Context, payload []byte) ([]byte, error) {
 	var req struct {
 		Filters    *entityUsageMetricsFilters `json:"filters,omitempty"`
 		Pagination entityPagination           `json:"pagination"`
@@ -611,7 +611,7 @@ type entityInstanceMetricsResponse struct {
 }
 
 // SearchInstanceMetrics implements usageMetricsServiceNowClient.
-func (c *postgresSplUsageMetricsClient) SearchInstanceMetrics(ctx context.Context, payload []byte) ([]byte, error) {
+func (c *postgresUsageMetricsClient) SearchInstanceMetrics(ctx context.Context, payload []byte) ([]byte, error) {
 	var req struct {
 		Filters entityUsageMetricsFilters `json:"filters"`
 	}
@@ -665,7 +665,7 @@ type entityInstanceUsageResponse struct {
 }
 
 // SearchInstanceUsages implements usageMetricsServiceNowClient.
-func (c *postgresSplUsageMetricsClient) SearchInstanceUsages(ctx context.Context, payload []byte) ([]byte, error) {
+func (c *postgresUsageMetricsClient) SearchInstanceUsages(ctx context.Context, payload []byte) ([]byte, error) {
 	var req struct {
 		Filters entityUsageMetricsFilters `json:"filters"`
 	}
@@ -736,7 +736,7 @@ type snMetricsStatsResponse struct {
 }
 
 // GetInstanceMetricsStats implements usageMetricsServiceNowClient.
-func (c *postgresSplUsageMetricsClient) GetInstanceMetricsStats(ctx context.Context, payload []byte) ([]byte, error) {
+func (c *postgresUsageMetricsClient) GetInstanceMetricsStats(ctx context.Context, payload []byte) ([]byte, error) {
 	var req struct {
 		Filters entityInstanceStatsFilters `json:"filters"`
 	}
@@ -791,7 +791,7 @@ type snUsagesStatsResponse struct {
 }
 
 // GetInstanceUsagesStats implements usageMetricsServiceNowClient.
-func (c *postgresSplUsageMetricsClient) GetInstanceUsagesStats(ctx context.Context, payload []byte) ([]byte, error) {
+func (c *postgresUsageMetricsClient) GetInstanceUsagesStats(ctx context.Context, payload []byte) ([]byte, error) {
 	var req struct {
 		Filters entityInstanceStatsFilters `json:"filters"`
 	}
@@ -875,7 +875,7 @@ type entityDeployedProductChartEntry struct {
 }
 
 // GetDeployedProductMetrics implements usageMetricsServiceNowClient.
-func (c *postgresSplUsageMetricsClient) GetDeployedProductMetrics(ctx context.Context, deployedProductID string, payload []byte) ([]byte, error) {
+func (c *postgresUsageMetricsClient) GetDeployedProductMetrics(ctx context.Context, deployedProductID string, payload []byte) ([]byte, error) {
 	var req entityDeployedProductMetricsRequest
 	if err := json.Unmarshal(payload, &req); err != nil {
 		return nil, fmt.Errorf("decode deployed-product metrics request: %w", err)
@@ -938,7 +938,7 @@ type entityDeployedProductUsageCountsResponse struct {
 }
 
 // GetDeployedProductUsageCounts implements usageMetricsServiceNowClient.
-func (c *postgresSplUsageMetricsClient) GetDeployedProductUsageCounts(ctx context.Context, deployedProductID string, payload []byte) ([]byte, error) {
+func (c *postgresUsageMetricsClient) GetDeployedProductUsageCounts(ctx context.Context, deployedProductID string, payload []byte) ([]byte, error) {
 	var req entityDeployedProductMetricsRequest
 	if err := json.Unmarshal(payload, &req); err != nil {
 		return nil, fmt.Errorf("decode deployed-product usage-counts request: %w", err)

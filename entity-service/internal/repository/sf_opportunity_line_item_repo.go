@@ -93,12 +93,12 @@ func writeSfOpportunityLineItem(ctx context.Context, q querier, opportunitySfID,
 		li.Classification, li.Environment, li.TotalPrice,
 		li.LineItemSfID,
 	}
-	tag, err := q.Exec(ctx, updateSfOpportunityProductQuery, args...)
+	_, n, err := updateOneBySfID(ctx, q, updateSfOpportunityProductQuery, "sf_opportunity_product", li.LineItemSfID, args...)
 	if err != nil {
 		return false, fmt.Errorf("upsert line item %s: update: %w", li.LineItemSfID, err)
 	}
 	created := false
-	if tag.RowsAffected() == 0 {
+	if n == 0 {
 		if _, err := q.Exec(ctx, insertSfOpportunityProductQuery, args...); err != nil {
 			return false, fmt.Errorf("upsert line item %s: insert: %w", li.LineItemSfID, err)
 		}

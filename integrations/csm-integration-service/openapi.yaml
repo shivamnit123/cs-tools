@@ -226,7 +226,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/ProjectUpdateResponse'
         "400":
-          description: BadRequest
+          description: >-
+            BadRequest. Entity-service's validation message is passed through when
+            it is safe to show, e.g. `sortBy: "name" is not a valid sort field; use
+            endDate`; otherwise "Invalid request payload."
           content:
             application/json:
               schema:
@@ -281,7 +284,10 @@ paths:
               schema:
                 $ref: '#/components/schemas/ProjectSearchResponse'
         "400":
-          description: BadRequest
+          description: >-
+            BadRequest. Entity-service's validation message is passed through when
+            it is safe to show, e.g. `sortBy: "name" is not a valid sort field; use
+            endDate`; otherwise "Invalid request payload."
           content:
             application/json:
               schema:
@@ -640,7 +646,7 @@ paths:
     post:
       summary: Search opportunities.
       description: >
-        ServiceNow data source only; there is no Postgres equivalent. Read-only:
+        Served from ServiceNow, or from the CSM database on Postgres. Read-only:
         this operation does not require a forwarded end-user identity token, so a
         pure M2M call through this service succeeds (unlike the ServiceNow-backed
         write operations elsewhere in this API).
@@ -693,7 +699,7 @@ paths:
     get:
       summary: Get an opportunity by ID.
       description: >
-        ServiceNow data source only; there is no Postgres equivalent. Read-only:
+        Served from ServiceNow, or from the CSM database on Postgres. Read-only:
         this operation does not require a forwarded end-user identity token, so a
         pure M2M call through this service succeeds.
       operationId: getOpportunity
@@ -746,7 +752,7 @@ paths:
     post:
       summary: Search invoices.
       description: >
-        ServiceNow data source only; there is no Postgres equivalent. Read-only:
+        Served from ServiceNow, or from the CSM database on Postgres. Read-only:
         this operation does not require a forwarded end-user identity token, so a
         pure M2M call through this service succeeds.
       operationId: searchInvoices
@@ -798,7 +804,7 @@ paths:
     get:
       summary: Get an invoice by ID.
       description: >
-        ServiceNow data source only; there is no Postgres equivalent. Read-only:
+        Served from ServiceNow, or from the CSM database on Postgres. Read-only:
         this operation does not require a forwarded end-user identity token, so a
         pure M2M call through this service succeeds.
       operationId: getInvoice
@@ -851,7 +857,7 @@ paths:
     post:
       summary: Search project-opportunity links.
       description: >
-        ServiceNow data source only; there is no Postgres equivalent. A project can
+        Served from ServiceNow, or from the CSM database on Postgres. A project can
         have more than one linked opportunity — one row per link — so this always
         returns a list. No by-id fetch: the underlying data has no single-record
         endpoint. Read-only: this operation does not require a forwarded end-user
@@ -1858,6 +1864,25 @@ components:
         searchQuery:
           type: string
           description: Case-insensitive match against name, key, and subscription type.
+        endDateFrom:
+          type: string
+          format: date
+          description: Only projects ending on or after this date (yyyy-MM-dd).
+        endDateTo:
+          type: string
+          format: date
+          description: Only projects ending on or before this date (yyyy-MM-dd).
+        onboardingStatus:
+          type: array
+          items:
+            type: string
+          description: Only projects whose onboarding status is any of these, e.g. "In-Progress".
+        subRegion:
+          type: string
+          description: Only projects whose account has this sub-region (case-insensitive).
+        arrTodayGte:
+          type: string
+          description: Minimum account ARR. Rejected with 400 on the Postgres data source.
 
     ProjectSearchResponse:
       type: object
@@ -1905,6 +1930,7 @@ components:
                 type: boolean
               roles:
                 type: array
+                description: Project roles, e.g. PORTAL_USER, SECURITY_CONTACT, BUSINESS_CONTACT.
                 items:
                   type: string
         offset:
@@ -2178,8 +2204,7 @@ components:
     Opportunity:
       type: object
       description: >
-        Sourced from ServiceNow's Salesforce-sync data (ServiceNow data source only;
-        no Postgres equivalent). Every field but id is nullable — ServiceNow can
+        Salesforce data, read from ServiceNow or from the CSM database on Postgres. Every field but id is nullable — ServiceNow can
         omit any of them entirely for a sparsely-populated row.
       properties:
         id:
@@ -2198,6 +2223,10 @@ components:
         eulaVersionDecimal:
           type: string
           nullable: true
+        stage:
+          type: string
+          nullable: true
+          description: Sales stage, e.g. "50 - Closed Won".
 
     SearchOpportunitiesResponse:
       type: object
@@ -2228,8 +2257,7 @@ components:
     Invoice:
       type: object
       description: >
-        Sourced from ServiceNow's Salesforce-sync data (ServiceNow data source only;
-        no Postgres equivalent). Every field but id is nullable — ServiceNow can
+        Salesforce data, read from ServiceNow or from the CSM database on Postgres. Every field but id is nullable — ServiceNow can
         omit any of them entirely for a sparsely-populated row.
       properties:
         id:
@@ -2305,8 +2333,7 @@ components:
     ProjectOpportunityLink:
       type: object
       description: >
-        Sourced from ServiceNow's Salesforce-sync data (ServiceNow data source only;
-        no Postgres equivalent). Every field but id is nullable — ServiceNow can
+        Salesforce data, read from ServiceNow or from the CSM database on Postgres. Every field but id is nullable — ServiceNow can
         omit either reference entirely for a sparsely-populated row.
       properties:
         id:

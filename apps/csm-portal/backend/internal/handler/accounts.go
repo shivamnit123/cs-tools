@@ -195,8 +195,8 @@ func (h *AccountHandler) UpdateAccountTeams(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, result)
 }
 
-// splAccountClient abstracts the ServiceNow operations used by
-// SplAccountHandler. GetAccounts/GetAccountByID/GetProjectsByAccount used to
+// viewerAccountClient abstracts the ServiceNow operations used by
+// ViewerAccountHandler. GetAccounts/GetAccountByID/GetProjectsByAccount used to
 // live here too, backed first by ServiceNow and later by a Postgres
 // translation layer -- both removed in favor of calling CS Portal's own
 // GET /accounts/{id}, POST /accounts/search, and POST /projects/search
@@ -207,24 +207,24 @@ func (h *AccountHandler) UpdateAccountTeams(w http.ResponseWriter, r *http.Reque
 // create/read have no entity-service equivalent (CreateEscalation is an
 // explicit stub -- see entity-service's escalation_service.go), so those
 // two stay here, ServiceNow-backed, unmerged.
-type splAccountClient interface {
+type viewerAccountClient interface {
 	GetEscalationsByAccount(ctx context.Context, accountNumber string, offset, limit int) ([]servicenow.EscalationDetail, error)
 	EscalateCase(ctx context.Context, accountNumber, caseNumber string, request servicenow.EscalationRequest, submittedByEmail string) (servicenow.EscalationResponse, error)
 }
 
-// SplAccountHandler handles HTTP requests for SupportPortalLite's
+// ViewerAccountHandler handles HTTP requests for SupportPortalLite's
 // account-escalation endpoints -- the one piece of the account domain with
-// no Postgres/entity-service equivalent to merge onto (see splAccountClient's
+// no Postgres/entity-service equivalent to merge onto (see viewerAccountClient's
 // own doc comment). Reading and listing accounts/projects now goes through
 // CS Portal's own /accounts and /projects routes directly.
-type SplAccountHandler struct {
-	sn          splAccountClient
+type ViewerAccountHandler struct {
+	sn          viewerAccountClient
 	accessGuard *AccessGuard
 }
 
-// NewSplAccountHandler creates a SplAccountHandler.
-func NewSplAccountHandler(sn splAccountClient, accessGuard *AccessGuard) *SplAccountHandler {
-	return &SplAccountHandler{sn: sn, accessGuard: accessGuard}
+// NewViewerAccountHandler creates a ViewerAccountHandler.
+func NewViewerAccountHandler(sn viewerAccountClient, accessGuard *AccessGuard) *ViewerAccountHandler {
+	return &ViewerAccountHandler{sn: sn, accessGuard: accessGuard}
 }
 
 var escalationRequestSourceValues = map[string]bool{"Customer": true, "Internal": true}
@@ -269,8 +269,8 @@ func optionalQueryParam(r *http.Request, key string) *string {
 }
 
 // GetAccountEscalations handles GET /accounts/{accountId}/escalations.
-func (h *SplAccountHandler) GetAccountEscalations(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+func (h *ViewerAccountHandler) GetAccountEscalations(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
@@ -303,12 +303,12 @@ func (h *SplAccountHandler) GetAccountEscalations(w http.ResponseWriter, r *http
 }
 
 // EscalateCase handles POST /accounts/{accountId}/cases/{caseId}/escalate.
-func (h *SplAccountHandler) EscalateCase(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+func (h *ViewerAccountHandler) EscalateCase(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
-	if !requireSPLPermission(w, user, h.accessGuard, PermEscalate) {
+	if !requireViewerPermission(w, user, h.accessGuard, PermEscalate) {
 		return
 	}
 

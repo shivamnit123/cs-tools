@@ -18,10 +18,8 @@ package repository
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 )
@@ -31,15 +29,14 @@ import (
 // project <-> opportunity join. Every write records its
 // salesforce_ingest_state row in the same transaction.
 type SalesforceOpportunityLinkRepository interface {
-	// UpsertFromSalesforce writes one link by link_sf_id (update every row
-	// carrying it, else insert) and records state. created is true for an
-	// insert.
+	// UpsertFromSalesforce writes one link row by link_sf_id (else inserts) and
+	// records state. created is true for an insert.
 	UpsertFromSalesforce(ctx context.Context, row domain.SalesforceOpportunityLinkUpsert, state domain.UpsertSalesforceIngestStateRequest) (created bool, err error)
 	// DeleteByLinkSfID hard-deletes every link carrying linkSfID and records
 	// state; it returns how many rows went (0 when never ingested).
 	DeleteByLinkSfID(ctx context.Context, linkSfID string, state domain.UpsertSalesforceIngestStateRequest) (int64, error)
-	// LookupOpportunityIDBySfID returns the id of the oldest sf_opportunity
-	// row carrying sfID, or nil when there is none.
+	// LookupOpportunityIDBySfID returns the sf_opportunity row the ingest writes
+	// for sfID (resolveOpportunityBySfIDQuery), or nil when there is none.
 	LookupOpportunityIDBySfID(ctx context.Context, sfID string) (*string, error)
 }
 
@@ -56,8 +53,8 @@ func NewSalesforceOpportunityLinkRepository(db *pgxpool.Pool) SalesforceOpportun
 // not unique, so two concurrent events for a new link would both insert.
 func sfOpportunityLinkLockKey(sfID string) string { return "sf-opportunity-link:" + sfID }
 
-// updateSfOpportunityLinkQuery: every column of the table has a Salesforce
-// source (number is the LO-... Name), so all of them are written.
+// updateSfOpportunityLinkQuery writes every column of one copy: the one already joining
+// the same opportunity and project, then the oldest.
 const updateSfOpportunityLinkQuery = `
 	UPDATE sf_opportunity_link SET
 		number = $2,
@@ -66,7 +63,11 @@ const updateSfOpportunityLinkQuery = `
 		updated_on = now(),
 		updated_by = $1,
 		sync_time_stamp = now()
-	WHERE link_sf_id = $5`
+	FROM (SELECT l.id, count(*) OVER () AS n FROM sf_opportunity_link l WHERE l.link_sf_id = $5
+		ORDER BY (l.opportunity_id IS NOT DISTINCT FROM $3::uuid AND l.project_id IS NOT DISTINCT FROM $4::uuid) DESC,
+			l.created_on, l.id LIMIT 1) t
+	WHERE sf_opportunity_link.id = t.id
+	RETURNING sf_opportunity_link.id::text, t.n`
 
 const insertSfOpportunityLinkQuery = `
 	INSERT INTO sf_opportunity_link (
@@ -96,18 +97,18 @@ func (r *sfOpportunityLinkRepo) UpsertFromSalesforce(ctx context.Context, row do
 }
 
 // writeSfOpportunityLink is UpsertFromSalesforce's body, run on q (the
-// transaction): lock, update by link_sf_id, else insert, then the ledger.
+// transaction): lock, update one row by link_sf_id, else insert, then the ledger.
 func writeSfOpportunityLink(ctx context.Context, q querier, row domain.SalesforceOpportunityLinkUpsert, state domain.UpsertSalesforceIngestStateRequest) (bool, error) {
 	if _, err := q.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0::bigint))`, sfOpportunityLinkLockKey(row.LinkSfID)); err != nil {
 		return false, fmt.Errorf("upsert opportunity link from salesforce: lock: %w", err)
 	}
 	args := []any{domain.SalesforceSyncActor, row.Number, row.OpportunityID, row.ProjectID, row.LinkSfID}
-	tag, err := q.Exec(ctx, updateSfOpportunityLinkQuery, args...)
+	_, n, err := updateOneBySfID(ctx, q, updateSfOpportunityLinkQuery, "sf_opportunity_link", row.LinkSfID, args...)
 	if err != nil {
 		return false, fmt.Errorf("upsert opportunity link from salesforce: update: %w", err)
 	}
 	created := false
-	if tag.RowsAffected() == 0 {
+	if n == 0 {
 		if _, err := q.Exec(ctx, insertSfOpportunityLinkQuery, args...); err != nil {
 			return false, fmt.Errorf("upsert opportunity link from salesforce: insert: %w", err)
 		}
@@ -150,13 +151,5 @@ func deleteSfOpportunityLink(ctx context.Context, q querier, linkSfID string, st
 }
 
 func (r *sfOpportunityLinkRepo) LookupOpportunityIDBySfID(ctx context.Context, sfID string) (*string, error) {
-	var id string
-	err := r.db.QueryRow(ctx, selectSfOpportunityIDQuery, sfID).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("lookup opportunity id by sf_id: %w", err)
-	}
-	return &id, nil
+	return resolveIDBySfID(ctx, r.db, resolveOpportunityBySfIDQuery, "sf_opportunity", sfID)
 }

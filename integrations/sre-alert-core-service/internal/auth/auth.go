@@ -56,7 +56,11 @@ type User struct {
 
 // IsExpired reports whether ExpiresAt is set and in the past relative to now.
 func (u User) IsExpired(now time.Time) bool {
-	return !u.ExpiresAt.IsZero() && now.After(u.ExpiresAt)
+	// Cosmos DB round-trips an unset expires_at as the Unix epoch, not a zero time.
+	if u.ExpiresAt.IsZero() || !u.ExpiresAt.After(time.Unix(0, 0)) {
+		return false
+	}
+	return now.After(u.ExpiresAt)
 }
 
 // GenerateSalt returns SaltLen random bytes for a new user.

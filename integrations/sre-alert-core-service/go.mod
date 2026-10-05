@@ -8,8 +8,11 @@ require (
 	github.com/cenkalti/backoff/v4 v4.3.0
 	github.com/gocql/gocql v1.7.0
 	github.com/scylladb/gocqlx/v2 v2.8.0
+	github.com/sony/gobreaker/v2 v2.4.0
+	go.uber.org/goleak v1.3.0
 	golang.org/x/crypto v0.57.0
 	golang.org/x/oauth2 v0.27.0
+	golang.org/x/sync v0.23.0
 )
 
 require (

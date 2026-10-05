@@ -1720,6 +1720,23 @@ export interface BeCreateUserPayload {
   lastName?: string;
   email: string;
   roles?: string[];
+  /**
+   * Portal role keys (see `GET /roles/grantable`) to additionally grant via
+   * SCIM once the user is created — admin-only, same as this whole endpoint.
+   * Distinct from `roles` above: this never reaches entity-service, it only
+   * controls which identity-provider role(s) the new user is added to.
+   */
+  grantRoles?: string[];
+}
+
+/** One portal role key `GET /roles/grantable` reports as grantable in this
+ * deployment — pass `key` back in `BeCreateUserPayload.grantRoles`. */
+export interface BeGrantableRole {
+  key: string;
+}
+
+export interface BeGrantableRolesResponse {
+  roles: BeGrantableRole[];
 }
 
 export interface BeUserSearchFilters {
@@ -2725,7 +2742,9 @@ export interface BeChangeRequestApprover {
   id: string;
   name?: string | null;
   status: string;
+  createdOn?: string | null;
   respondedOn?: string | null;
+  comments?: string | null;
 }
 
 /** One approval stage on a change request, with its individual approvers. */
@@ -4438,6 +4457,14 @@ export interface BeOutage {
   affectedConfigurationItems: BeOutageConfigurationItemRef[] | null;
   publishesToStatusPage: boolean;
   statusPageCloud: string | null;
+  /** Opt-in for the internal-stakeholder notification email. */
+  notifyInternalStakeholders?: boolean;
+  /** Opt-in for the SRE outage-communication email. */
+  outageCommunication?: boolean;
+  /** "Impact:" line of the outage-communication email. */
+  impact?: string | null;
+  /** "Current Status:" line of the outage-communication email. */
+  state?: string | null;
   createdOn: string;
   createdBy: string;
   updatedOn: string;
@@ -4477,6 +4504,13 @@ export interface BeCreateOutagePayload {
   externalCommunication?: string;
   internalCommunication?: string;
   acknowledgePublicPublication?: boolean;
+  notifyInternalStakeholders?: boolean;
+  outageCommunication?: boolean;
+  impact?: string;
+  state?: string;
+  /** Service offerings this outage also affects (ServiceNow Affected CIs). On
+   *  PATCH the list replaces the whole set; [] clears it. */
+  affectedConfigurationItemIds?: string[];
 }
 
 /** `POST /outages` response. */
@@ -4500,6 +4534,15 @@ export interface BePatchOutagePayload {
   configurationItemId?: string | null;
   incidentId?: string | null;
   acknowledgePublicPublication?: boolean;
+  notifyInternalStakeholders?: boolean;
+  outageCommunication?: boolean;
+  /** An empty string clears it. */
+  impact?: string;
+  /** An empty string clears it. */
+  state?: string;
+  /** Service offerings this outage also affects (ServiceNow Affected CIs). On
+   *  PATCH the list replaces the whole set; [] clears it. */
+  affectedConfigurationItemIds?: string[];
 }
 
 /** `PATCH /outages/{id}` response. */
@@ -4544,6 +4587,9 @@ export interface BeSearchOutagesResponse {
 export interface BeAddOutageCommunicationPayload {
   channel: BeOutageCommunicationChannel;
   body: string;
+  /** Required by the backend (409 otherwise) only for an external entry on an
+   *  outage that publishes to the status page; omit it everywhere else. */
+  acknowledgePublicPublication?: boolean;
 }
 
 /** A single communication journal entry. `isPublic` is true only for the

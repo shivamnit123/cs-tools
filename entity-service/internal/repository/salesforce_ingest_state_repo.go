@@ -50,18 +50,20 @@ type SalesforceIngestStateRepository interface {
 	// ListMissingParentFailures returns the FAILED rows the delayed-retry
 	// job can act on: entity in entities (those with a registered retrier),
 	// last_error a missing-parent error (missingParentErrorPatterns),
-	// attempt_count below maxAttempts and the last write older than
+	// retry_count below maxAttempts and the last write older than
 	// olderThan; oldest first, at most limit of them. Filtering before the
 	// LIMIT keeps a backlog of rows the job would skip from starving the
 	// ones it would retry.
 	ListMissingParentFailures(ctx context.Context, entities []string, olderThan time.Duration, maxAttempts, limit int) ([]domain.SalesforceIngestState, error)
-	// RecordRetryAttempt counts one failed re-run of a FAILED row that the
-	// re-run itself did not record (it failed before its own ledger write,
-	// e.g. the Sales Entity fetch): attempt_count + 1 and updated_on = now(),
-	// last_error kept. It only applies while the row is still FAILED and its
-	// updated_on is still seenUpdatedOn, so an outcome written in the
-	// meantime is never overwritten. Reports whether a row was updated.
-	RecordRetryAttempt(ctx context.Context, entity, sfID string, seenUpdatedOn time.Time) (bool, error)
+	// RecordRetryAttempt counts one failed delayed-retry re-run: retry_count
+	// + 1 and updated_on = now(), last_error kept, while the row is still
+	// FAILED. Only the job calls it, so Service Bus redeliveries and new
+	// events never use up the job's cap. Reports whether a row was updated.
+	RecordRetryAttempt(ctx context.Context, entity, sfID string) (bool, error)
+	// RequeueMissingParentFailures resets retry_count on the FAILED rows, of
+	// any entity, whose missing-parent error names parent, so the job retries
+	// them again now that it is in CSM. Returns how many rows it reset.
+	RequeueMissingParentFailures(ctx context.Context, parent MissingParent) (int64, error)
 }
 
 type salesforceIngestStateRepo struct {
@@ -75,14 +77,14 @@ func NewSalesforceIngestStateRepository(db *pgxpool.Pool) SalesforceIngestStateR
 
 const salesforceIngestStateColumns = `
 	entity, sf_id, event_modified_on, event_type, status, last_error, attempt_count,
-	created_on, updated_on`
+	created_on, updated_on, retry_count`
 
 func scanSalesforceIngestState(row pgx.Row) (domain.SalesforceIngestState, error) {
 	var s domain.SalesforceIngestState
 	var status string
 	if err := row.Scan(
 		&s.Entity, &s.SfID, &s.EventModifiedOn, &s.EventType, &status, &s.LastError, &s.AttemptCount,
-		&s.CreatedOn, &s.UpdatedOn,
+		&s.CreatedOn, &s.UpdatedOn, &s.RetryCount,
 	); err != nil {
 		return domain.SalesforceIngestState{}, err
 	}
@@ -124,6 +126,8 @@ func (r *salesforceIngestStateRepo) Upsert(ctx context.Context, req domain.Upser
 // consecutive failures: it goes up while the row stays FAILED and restarts
 // at 1 on a success or on the first failure after one, so a record that
 // Salesforce saves often never reaches the retry job's cap by succeeding.
+// retry_count, the job's own counter, follows the same rule but only the job
+// increments it (RecordRetryAttempt).
 func upsertSalesforceIngestState(ctx context.Context, q querier, req domain.UpsertSalesforceIngestStateRequest) (domain.SalesforceIngestState, error) {
 	row, err := scanSalesforceIngestState(q.QueryRow(ctx, `
 		INSERT INTO salesforce_ingest_state (
@@ -140,6 +144,10 @@ func upsertSalesforceIngestState(ctx context.Context, q querier, req domain.Upse
 			                          AND (NOT (EXCLUDED.event_modified_on >= salesforce_ingest_state.event_modified_on OR salesforce_ingest_state.event_type = 'DELETED')
 			                               OR EXCLUDED.status = 'FAILED')
 			                         THEN salesforce_ingest_state.attempt_count + 1 ELSE 1 END,
+			retry_count       = CASE WHEN salesforce_ingest_state.status = 'FAILED'
+			                          AND (NOT (EXCLUDED.event_modified_on >= salesforce_ingest_state.event_modified_on OR salesforce_ingest_state.event_type = 'DELETED')
+			                               OR EXCLUDED.status = 'FAILED')
+			                         THEN salesforce_ingest_state.retry_count ELSE 0 END,
 			updated_on        = NOW()
 		RETURNING `+salesforceIngestStateColumns,
 		req.Entity, req.SfID, req.EventModifiedOn, req.EventType, string(req.Status), req.LastError,
@@ -159,7 +167,7 @@ func (r *salesforceIngestStateRepo) ListMissingParentFailures(ctx context.Contex
 		WHERE status = $1
 		  AND entity = ANY($2::text[])
 		  AND last_error ILIKE ANY($3::text[])
-		  AND attempt_count < $4
+		  AND retry_count < $4
 		  AND updated_on < NOW() - make_interval(secs => $5::int)
 		ORDER BY updated_on, entity, sf_id
 		LIMIT $6`, string(domain.SalesforceIngestFailed), entities, missingParentErrorPatterns,
@@ -182,14 +190,33 @@ func (r *salesforceIngestStateRepo) ListMissingParentFailures(ctx context.Contex
 	return out, nil
 }
 
-func (r *salesforceIngestStateRepo) RecordRetryAttempt(ctx context.Context, entity, sfID string, seenUpdatedOn time.Time) (bool, error) {
+func (r *salesforceIngestStateRepo) RecordRetryAttempt(ctx context.Context, entity, sfID string) (bool, error) {
 	tag, err := r.db.Exec(ctx, `
 		UPDATE salesforce_ingest_state
-		   SET attempt_count = attempt_count + 1, updated_on = NOW()
-		 WHERE entity = $1 AND sf_id = $2 AND status = $3 AND updated_on = $4`,
-		entity, sfID, string(domain.SalesforceIngestFailed), seenUpdatedOn)
+		   SET retry_count = retry_count + 1, updated_on = NOW()
+		 WHERE entity = $1 AND sf_id = $2 AND status = $3`,
+		entity, sfID, string(domain.SalesforceIngestFailed))
 	if err != nil {
 		return false, fmt.Errorf("record salesforce ingest retry attempt: %w", err)
 	}
 	return tag.RowsAffected() == 1, nil
+}
+
+func (r *salesforceIngestStateRepo) RequeueMissingParentFailures(ctx context.Context, parent MissingParent) (int64, error) {
+	prefix, needles := parent.match()
+	if len(needles) == 0 {
+		return 0, nil
+	}
+	tag, err := r.db.Exec(ctx, `
+		UPDATE salesforce_ingest_state
+		   SET retry_count = 0
+		 WHERE status = $1
+		   AND retry_count > 0
+		   AND last_error ILIKE $2
+		   AND EXISTS (SELECT 1 FROM unnest($3::text[]) AS n WHERE strpos(last_error, n) > 0)`,
+		string(domain.SalesforceIngestFailed), prefix, needles)
+	if err != nil {
+		return 0, fmt.Errorf("requeue salesforce ingest states for missing parent: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }

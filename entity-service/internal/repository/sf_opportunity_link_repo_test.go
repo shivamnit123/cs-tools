@@ -39,13 +39,9 @@ type linkQuerier struct {
 func (q *linkQuerier) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	q.statements = append(q.statements, sql)
 	switch sql {
-	case updateSfOpportunityLinkQuery, insertSfOpportunityLinkQuery:
-		id := args[4].(string)
-		if _, ok := q.links[id]; !ok && sql == updateSfOpportunityLinkQuery {
-			return pgconn.NewCommandTag("UPDATE 0"), nil
-		}
-		q.links[id] = domain.SalesforceOpportunityLinkUpsert{LinkSfID: id, Number: args[1].(*string), OpportunityID: args[2].(string), ProjectID: args[3].(string)}
-		return pgconn.NewCommandTag("UPDATE 1"), nil
+	case insertSfOpportunityLinkQuery:
+		q.put(args)
+		return pgconn.NewCommandTag("INSERT 0 1"), nil
 	case deleteSfOpportunityLinkQuery:
 		if _, ok := q.links[args[0].(string)]; !ok {
 			return pgconn.NewCommandTag("DELETE 0"), nil
@@ -62,11 +58,23 @@ func (q *linkQuerier) Query(context.Context, string, ...any) (pgx.Rows, error) {
 
 func (q *linkQuerier) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
 	q.statements = append(q.statements, sql)
+	if sql == updateSfOpportunityLinkQuery {
+		if _, ok := q.links[args[4].(string)]; !ok {
+			return scanRow{err: pgx.ErrNoRows}
+		}
+		q.put(args)
+		return scanRow{vals: []any{"link-row", int64(1)}}
+	}
 	if strings.Contains(sql, "INSERT INTO salesforce_ingest_state") {
 		q.ledger = append(q.ledger, args[3].(string))
 		return scanRow{}
 	}
 	return scanRow{err: fmt.Errorf("unexpected QueryRow: %.60s", sql)}
+}
+
+func (q *linkQuerier) put(args []any) {
+	id := args[4].(string)
+	q.links[id] = domain.SalesforceOpportunityLinkUpsert{LinkSfID: id, Number: args[1].(*string), OpportunityID: args[2].(string), ProjectID: args[3].(string)}
 }
 
 func linkState(eventType string) domain.UpsertSalesforceIngestStateRequest {

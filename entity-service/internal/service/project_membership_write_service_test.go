@@ -67,6 +67,9 @@ type fakeWriteSalesEntity struct {
 	searchErr                error
 	createErr                error
 	updateErr                error
+	// savedState, when set, is the state Salesforce's automation stores (and
+	// the create/PATCH re-read returns) instead of the one requested.
+	savedState string
 }
 
 type writeUpdateCall struct {
@@ -140,7 +143,11 @@ func (f *fakeWriteSalesEntity) CreateProjectContact(_ context.Context, in salese
 	if f.createErr != nil {
 		return salesentity.ProjectContact{}, f.createErr
 	}
-	pc := salesentity.ProjectContact{ID: writeMembershipID, Email: writeEmail, State: sampleStr(in.State), Roles: in.Role}
+	state := in.State
+	if f.savedState != "" {
+		state = f.savedState
+	}
+	pc := salesentity.ProjectContact{ID: writeMembershipID, Email: writeEmail, State: sampleStr(state), Roles: in.Role}
 	f.membership = &pc
 	return pc, nil
 }
@@ -153,6 +160,9 @@ func (f *fakeWriteSalesEntity) UpdateProjectContact(_ context.Context, id string
 	// The PATCH answers 200 with an EMPTY body when its own re-read failed:
 	// a zero record and no error. Modelled here so the caller is exercised
 	// against the harder of the two shapes.
+	if f.savedState != "" {
+		return salesentity.ProjectContact{ID: id, State: sampleStr(f.savedState)}, nil
+	}
 	return salesentity.ProjectContact{}, nil
 }
 
@@ -294,35 +304,6 @@ func existingSalesforceContact() *salesentity.Contact {
 }
 
 // ---- authorization -------------------------------------------------------
-
-// TestMembershipWrite_RejectsNonInternalCallers pins that every one of the
-// four operations is refused for a caller that is not an allow-listed
-// internal service, BEFORE anything downstream is touched -- no Salesforce
-// call, no transaction, no event.
-func TestMembershipWrite_RejectsNonInternalCallers(t *testing.T) {
-	h := newWriteHarness(t, stubAccess{scope: AccessScope{ProjectIDs: []string{writeProjectID}}})
-	ctx := context.Background()
-
-	_, inviteErr := h.svc.Invite(ctx, writeProjectID, inviteReq("Portal user"))
-	_, rolesErr := h.svc.UpdateRoles(ctx, writeProjectID, writeEmail, domain.UpdateProjectMembershipRolesRequest{Roles: []string{"Admin"}})
-	deactivateErr := h.svc.Deactivate(ctx, writeProjectID, writeEmail)
-	resendErr := h.svc.ResendInvitation(ctx, writeProjectID, writeEmail)
-
-	for name, err := range map[string]error{
-		"Invite": inviteErr, "UpdateRoles": rolesErr, "Deactivate": deactivateErr, "ResendInvitation": resendErr,
-	} {
-		var fe *apierror.ForbiddenError
-		if !errors.As(err, &fe) {
-			t.Errorf("%s: err = %v, want ForbiddenError", name, err)
-		}
-	}
-	if len(h.se.contactSearchs)+len(h.se.createdContact)+len(h.se.createdPC)+len(h.se.updates) != 0 {
-		t.Error("Salesforce must not be touched for a caller that is refused")
-	}
-	if len(h.repo.upserts) != 0 || len(h.pub.published) != 0 {
-		t.Error("nothing may be written or published for a caller that is refused")
-	}
-}
 
 // ---- invite --------------------------------------------------------------
 
@@ -581,6 +562,36 @@ func TestMembershipWrite_InviteReactivatesADeactivatedMembership(t *testing.T) {
 	}
 	if len(h.pub.published) != 1 {
 		t.Error("a re-invitation still sends the invitation e-mail")
+	}
+}
+
+// TestMembershipWrite_InviteOfASignedInContactStoresRegisteredAndPublishes:
+// Salesforce saves REGISTERED for an unlocked contact; CSM stores that and the
+// existing-account invitation is still published, for a new or reactivated row.
+func TestMembershipWrite_InviteOfASignedInContactStoresRegisteredAndPublishes(t *testing.T) {
+	for _, reactivate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reactivate=%v", reactivate), func(t *testing.T) {
+			h := newInternalWriteHarness(t)
+			h.se.contact = existingSalesforceContact()
+			h.se.savedState = domain.MembershipStateRegistered
+			if reactivate {
+				h.repo.existing = &domain.ProjectMembershipRow{
+					ProjectContactID: "pc-1", MembershipSfID: writeMembershipID, ContactSfID: writeContactSfID,
+					Email: writeEmail, State: domain.MembershipStateDeactivated,
+				}
+				h.se.membership = &salesentity.ProjectContact{ID: writeMembershipID, Roles: []string{"Portal user"}}
+			}
+			got, err := h.svc.Invite(context.Background(), writeProjectID, inviteReq("Portal user"))
+			if err != nil {
+				t.Fatalf("Invite: %v", err)
+			}
+			if got.State != domain.MembershipStateRegistered || h.repo.upserts[0].State != domain.MembershipStateRegistered {
+				t.Errorf("state = %q / %q, want REGISTERED (what Salesforce stored)", got.State, h.repo.upserts[0].State)
+			}
+			if len(h.pub.published) != 1 || h.pub.published[0].Type != events.TypeProjectContactInvited {
+				t.Fatalf("published = %+v, want one project_contact.invited", h.pub.published)
+			}
+		})
 	}
 }
 

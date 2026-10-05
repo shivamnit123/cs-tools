@@ -45,6 +45,10 @@ type UserService interface {
 	// any particular data source -- ids are this platform's own primary
 	// keys, so an id-based lookup works the same way regardless of source.
 	GetUsersByIDs(ctx context.Context, ids []string) (domain.GetUsersByIDsResponse, error)
+	// PatchMe updates mutable fields (today: just TimeZone) on the currently
+	// authenticated user, resolved the same way GetMe resolves its caller. A
+	// ValidationError is returned for a blank TimeZone.
+	PatchMe(ctx context.Context, req domain.PatchUserMeRequest) (domain.PatchUserMeResponse, error)
 	// GetUser returns one user's profile: the user row, roles, groups, and for a
 	// customer the project-contact rows with whether each grants access. A
 	// ValidationError is returned for a malformed id and a NotFoundError when no
@@ -216,7 +220,7 @@ type OnboardingStepService interface {
 // the ordering that makes "both or neither" hold without a distributed
 // transaction, and why the database commits last.
 //
-// Every method is restricted to internal callers (AUTH_INTERNAL_CLIENT_IDS).
+// Every method is restricted to internal callers (an Unrestricted AccessScope).
 // The portal backends decide who may invite whom; this service does not.
 type ProjectMembershipWriteService interface {
 	// Invite adds a contact to a project: state INVITED (RE-INVITED when a
@@ -501,7 +505,7 @@ type AccountContactService interface {
 }
 
 // OpportunityService defines the operations available on the opportunity entity.
-// All methods require the ServiceNow data source; there is no Postgres fallback.
+// Postgres modes read sf_opportunity, internal callers only.
 type OpportunityService interface {
 	// SearchOpportunities returns a paginated list of opportunities matching the
 	// filters in req.
@@ -512,7 +516,7 @@ type OpportunityService interface {
 }
 
 // InvoiceService defines the operations available on the invoice entity.
-// All methods require the ServiceNow data source; there is no Postgres fallback.
+// Postgres modes read sf_invoice, internal callers only.
 type InvoiceService interface {
 	// SearchInvoices returns a paginated list of invoices matching the filters in req.
 	SearchInvoices(ctx context.Context, req domain.SearchInvoicesRequest) (domain.SearchInvoicesResponse, error)
@@ -522,9 +526,8 @@ type InvoiceService interface {
 }
 
 // ProjectOpportunityLinkService defines the operations available on
-// project-opportunity links. ServiceNow data source only; there is no Postgres
-// fallback, and no by-id fetch -- the underlying ServiceNow data has no
-// single-record endpoint for this resource (search only).
+// project-opportunity links. Postgres modes read sf_opportunity_link, internal
+// callers only. No by-id fetch -- ServiceNow has no single-record endpoint for it.
 type ProjectOpportunityLinkService interface {
 	// SearchProjectOpportunityLinks returns a paginated list of project-opportunity
 	// links matching the filters in req.
@@ -639,6 +642,23 @@ type CaseService interface {
 	// case there simply falls back to the account's default watchers, same
 	// as an empty real result.
 	ProjectContactEmailsByRole(ctx context.Context, projectID, role string) ([]string, error)
+	// AccountDefaultWatcherEmails returns the account owning projectID's four
+	// named stakeholders' email addresses (technical owner, secondary
+	// technical owner, account manager, renewal account manager) -- see
+	// CaseRepository.AccountDefaultWatcherEmails' own doc comment for why
+	// these are resolved fresh at publish time rather than read from a
+	// persisted watch list. A project with no linked account, or no Postgres
+	// access at all (a pure ServiceNow data source with no pgFallback
+	// configured), returns an empty slice and no error.
+	AccountDefaultWatcherEmails(ctx context.Context, projectID string) ([]string, error)
+	// GetCaseEtaSharedOn returns work_item.eta_shared_on for caseID -- see
+	// CaseRepository.GetCaseEtaSharedOn's own doc comment. Lets the plain
+	// ServiceNow data source's own GetCaseByID (which has no Postgres row of
+	// its own to read this from, unlike BestCaseFixEta/etc., which ARE real
+	// ServiceNow fields) merge in the one fix-ETA-related fact that only
+	// ever lives in Postgres. A deployment with no Postgres access at all
+	// (pgFallback nil) returns nil and no error.
+	GetCaseEtaSharedOn(ctx context.Context, caseID string) (*time.Time, error)
 	// SearchCases returns a paginated list of cases filtered by optional project IDs,
 	// deployment IDs, deployed product IDs, state keys, severity keys, and search query.
 	// A ValidationError is returned for invalid input; any other error indicates an
@@ -1066,9 +1086,10 @@ type IncidentService interface {
 
 	// UpdateIncident partially updates an existing incident. At least one field must be
 	// provided. A NotFoundError is returned if the incident does not exist.
-	// On DATA_SOURCE=postgres-servicenow-dual-write only WorkNotes and AdditionalComments
-	// are supported -- every other field is rejected with a ValidationError (see
-	// incidentService.UpdateIncident's own doc comment for why).
+	// On DATA_SOURCE=postgres-servicenow-dual-write only the state-transition fields
+	// (State, AssignedEngineerID, ResolutionCode, ResolutionNotes, ResolvedByID) and
+	// WorkNotes/AdditionalComments are supported -- every other field is rejected with
+	// a ValidationError (see incidentService.UpdateIncident's own doc comment).
 	UpdateIncident(ctx context.Context, req domain.UpdateIncidentRequest) (domain.UpdateIncidentResponse, error)
 
 	// SearchIncidentActivities returns a paginated activity feed for an incident.
@@ -1352,4 +1373,19 @@ type CloudStatusService interface {
 	// The record-triggered counterpart to Sweep, reaching the same conclusions
 	// by the same code -- see CloudStatusDrainer.
 	HandleOutages(ctx context.Context, outageIDs []string) error
+}
+
+// OutageCommunicationService is the port of ServiceNow's `Outage
+// Communication` flow: the SRE-facing declaration and resolution emails.
+//
+// Distinct from OutageNotificationService, which ports the internal
+// STAKEHOLDER notifier. Different flow, different audience, different
+// idempotency mechanism — this one keys on its own communication log
+// because ServiceNow's version relies on "Run Trigger: Once" and writes no
+// state to the outage at all.
+type OutageCommunicationService interface {
+	// Sweep returns the emails owed, recording each before returning it.
+	Sweep(ctx context.Context, limit int) (domain.OutageCommunicationSweepResponse, error)
+	// Log returns one outage's communication history, newest first.
+	Log(ctx context.Context, number string) ([]domain.OutageCommunicationLogEntry, error)
 }

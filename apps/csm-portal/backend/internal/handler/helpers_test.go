@@ -35,7 +35,7 @@ import (
 // is NOT the platform's own user record id (see testPlatformUserID). Roles
 // holds every test role testAccessConfig() (access_test.go) grants a
 // permission for, so testUser passes every /spl/* handler's gates by
-// default (PermSPLAccess plus every sub-permission) — a test needing to
+// default (PermViewerAccess plus every sub-permission) — a test needing to
 // exercise a denial builds its own narrower *middleware.UserInfo instead
 // (see e.g. spl_accounts_test.go's TestSplEscalateCase_RequiresEscalation).
 var testUser = &middleware.UserInfo{
@@ -47,11 +47,11 @@ var testUser = &middleware.UserInfo{
 	},
 }
 
-// splAccessGuard is the shared AccessGuard every /spl/* handler test wires
+// viewerAccessGuard is the shared AccessGuard every /spl/* handler test wires
 // its handler with, built from the same testAccessConfig() (access_test.go)
 // every non-SPL handler test already uses — one guard, one set of test role
 // names, for the whole package.
-var splAccessGuard = NewAccessGuard(testAccessConfig())
+var viewerAccessGuard = NewAccessGuard(testAccessConfig())
 
 // testPlatformUserID is the id GET /users/me resolves for testUser: the
 // platform's own user record id, from a different id space than
@@ -63,6 +63,42 @@ const testPlatformUserID = "94a1b01b-1b3c-f050-cb68-98aebd4bcb27"
 // withUser returns r with testUser stored in its context.
 func withUser(r *http.Request) *http.Request {
 	return r.WithContext(middleware.WithUserInfo(r.Context(), testUser))
+}
+
+// testCsEngineerUser holds PermWrite (test-cs-engineer) -- unlike testUser
+// (deliberately SPL-only, see its own doc comment), for CreateCaseComment
+// subtests exercising the PermWrite narrowing PermCreateWorkNote's own doc
+// comment describes: a non-work_note (customer-visible) comment needs full
+// PermWrite, which testUser doesn't hold. Identity resolution for the
+// ownership check (resolveCurrentUserID) goes through the mocked entity
+// client's GetUserMe, not this struct's own fields, so which UserInfo is
+// injected doesn't affect it.
+var testCsEngineerUser = &middleware.UserInfo{
+	Email:  "engineer@example.com",
+	UserID: "f2d9bf5b-7067-43dc-8578-802c8623af5e",
+	Roles:  []string{"test-cs-engineer"},
+}
+
+// withCsEngineerUser returns r with testCsEngineerUser stored in its context.
+func withCsEngineerUser(r *http.Request) *http.Request {
+	return r.WithContext(middleware.WithUserInfo(r.Context(), testCsEngineerUser))
+}
+
+// testWorknoteCreatorUser holds ONLY PermCreateWorkNote (test-worknote-creator)
+// -- not PermWrite -- for CreateCaseComment subtests pinning the boundary
+// PermCreateWorkNote's own doc comment describes: this caller may post a
+// work_note, never anything else.
+var testWorknoteCreatorUser = &middleware.UserInfo{
+	Email:     "worknote-creator@example.com",
+	UserID:    "f2d9bf5b-7067-43dc-8578-802c8623af5f",
+	FirstName: "Worknote",
+	LastName:  "Creator",
+	Roles:     []string{"test-worknote-creator"},
+}
+
+// withWorknoteCreatorUser returns r with testWorknoteCreatorUser stored in its context.
+func withWorknoteCreatorUser(r *http.Request) *http.Request {
+	return r.WithContext(middleware.WithUserInfo(r.Context(), testWorknoteCreatorUser))
 }
 
 // ----- assertion helpers -----
@@ -140,6 +176,7 @@ type mockEntityCaseClient struct {
 	removeCaseTagFn            func(ctx context.Context, caseID, tagID string) ([]byte, error)
 	searchTagsFn               func(ctx context.Context, body []byte) ([]byte, error)
 	getUserMeFn                func(ctx context.Context) ([]byte, error)
+	createUserFn               func(ctx context.Context, body []byte) ([]byte, error)
 	// getChangeRequestFn/getIncidentFn back the attachmentStorageEntityClient
 	// interface (see attachment_storage.go) so this same mock serves
 	// AttachmentStorageHandler's per-reference-type access checks.
@@ -169,6 +206,13 @@ func (m *mockEntityCaseClient) GetUserMe(ctx context.Context) ([]byte, error) {
 		return m.getUserMeFn(ctx)
 	}
 	return []byte(`{"id":"` + testPlatformUserID + `","email":"` + testUser.Email + `"}`), nil
+}
+
+func (m *mockEntityCaseClient) CreateUser(ctx context.Context, body []byte) ([]byte, error) {
+	if m.createUserFn != nil {
+		return m.createUserFn(ctx, body)
+	}
+	return []byte(`{}`), nil
 }
 
 func (m *mockEntityCaseClient) CreateCase(ctx context.Context, body []byte) ([]byte, error) {
@@ -399,6 +443,8 @@ type mockSCIMClient struct {
 	searchUserFn         func(ctx context.Context, email string) (*scim.UserInfo, error)
 	searchExternalUserFn func(ctx context.Context, email string) (*scim.ExternalUserInfo, error)
 	updateUserPhoneFn    func(ctx context.Context, userID, mobile string) (*string, error)
+	getRoleFn            func(ctx context.Context, roleID string) ([]scim.RoleMember, error)
+	addRoleMembersFn     func(ctx context.Context, roleID string, emails []string) error
 }
 
 func (m *mockSCIMClient) SearchUser(ctx context.Context, email string) (*scim.UserInfo, error) {
@@ -420,6 +466,20 @@ func (m *mockSCIMClient) UpdateUserPhone(ctx context.Context, userID, mobile str
 		return m.updateUserPhoneFn(ctx, userID, mobile)
 	}
 	return nil, nil
+}
+
+func (m *mockSCIMClient) GetRole(ctx context.Context, roleID string) ([]scim.RoleMember, error) {
+	if m.getRoleFn != nil {
+		return m.getRoleFn(ctx, roleID)
+	}
+	return nil, nil
+}
+
+func (m *mockSCIMClient) AddRoleMembers(ctx context.Context, roleID string, emails []string) error {
+	if m.addRoleMembersFn != nil {
+		return m.addRoleMembersFn(ctx, roleID, emails)
+	}
+	return nil
 }
 
 // ----- mock entity user client -----

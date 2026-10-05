@@ -25,31 +25,31 @@ import (
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/servicenow"
 )
 
-// splReportsClient abstracts the ServiceNow report operations used by
-// SplReportsHandler.
-type splReportsClient interface {
+// reportsClient abstracts the ServiceNow report operations used by
+// ReportsHandler.
+type reportsClient interface {
 	GetSLAReport(ctx context.Context, projectSysID, from, to string) (servicenow.SLAReportDetails, error)
 	GetProjectReportDetails(ctx context.Context, projectSysID, from, to string) (servicenow.CSReportDetails, error)
 	GetTimeLogBreakdown(ctx context.Context, projectID string) (servicenow.TimeLogBreakdownDetails, error)
 }
 
-// SplReportsHandler handles HTTP requests for SupportPortalLite's
+// ReportsHandler handles HTTP requests for SupportPortalLite's
 // project-level reports, delegating to the ServiceNow service.
-type SplReportsHandler struct {
-	servicenow  splReportsClient
+type ReportsHandler struct {
+	servicenow  reportsClient
 	accessGuard *AccessGuard
 }
 
-// NewSplReportsHandler creates a SplReportsHandler backed by the given
-// ServiceNow client. accessGuard enforces PermSPLAccess, SupportPortalLite's
+// NewReportsHandler creates a ReportsHandler backed by the given
+// ServiceNow client. accessGuard enforces PermViewerAccess, SupportPortalLite's
 // blanket audience gate.
-func NewSplReportsHandler(sn splReportsClient, accessGuard *AccessGuard) *SplReportsHandler {
-	return &SplReportsHandler{servicenow: sn, accessGuard: accessGuard}
+func NewReportsHandler(sn reportsClient, accessGuard *AccessGuard) *ReportsHandler {
+	return &ReportsHandler{servicenow: sn, accessGuard: accessGuard}
 }
 
 // GenerateSLAReport handles GET /generate-sla-report.
-func (h *SplReportsHandler) GenerateSLAReport(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+func (h *ReportsHandler) GenerateSLAReport(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
@@ -76,8 +76,8 @@ func (h *SplReportsHandler) GenerateSLAReport(w http.ResponseWriter, r *http.Req
 }
 
 // GetReportDetails handles GET /report-details.
-func (h *SplReportsHandler) GetReportDetails(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+func (h *ReportsHandler) GetReportDetails(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
@@ -104,8 +104,8 @@ func (h *SplReportsHandler) GetReportDetails(w http.ResponseWriter, r *http.Requ
 }
 
 // GenerateTimelogsBreakdownReport handles GET /generate-timelogs-breakdown-report.
-func (h *SplReportsHandler) GenerateTimelogsBreakdownReport(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+func (h *ReportsHandler) GenerateTimelogsBreakdownReport(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}

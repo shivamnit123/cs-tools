@@ -118,6 +118,10 @@ func slaBreachColor(tier string) string {
 //     something the case.*/incident.created cards happen to use
 //     themselves.
 //
+// teamLeadName, when non-empty, is appended to the Team line in parens
+// ("<team> (<lead>)") — "" leaves the Team line as the bare team name, same
+// convention as the SLA breach team email's own Team line.
+//
 // Header wording distinguishes a genuine breach from an early warning:
 // "[<SEVERITY>] <ClockTypeLabel> SLA Violation - <caseRef>" at 100%
 // elapsed (severity uppercase, unresolved — e.g. "CRITICAL", not the
@@ -125,7 +129,7 @@ func slaBreachColor(tier string) string {
 // "<ClockTypeLabel> SLA at Risk - <caseRef>" at 50/75%. No Subtitle: unlike
 // the case.*/incident.* cards, this card's header is the whole heading on
 // one line.
-func (c *GoogleChatClient) SendSLABreachAlert(ctx context.Context, audience, clockType, tier, caseNumber, wso2CaseID, caseTitle, caseType, productName, team, severity, state, openedAt, caseLink string) error {
+func (c *GoogleChatClient) SendSLABreachAlert(ctx context.Context, audience, clockType, tier, caseNumber, wso2CaseID, caseTitle, caseType, productName, team, teamLeadName, severity, state, openedAt, caseLink string) error {
 	if caseNumber == "" {
 		return fmt.Errorf("notifications: caseNumber is required")
 	}
@@ -156,7 +160,11 @@ func (c *GoogleChatClient) SendSLABreachAlert(ctx context.Context, audience, clo
 		lines = append(lines, caseAlertLine(`<b>Product :</b> %s`, productName))
 	}
 	if team != "" {
-		lines = append(lines, caseAlertLine(`<b>Team :</b> <b>%s</b>`, team))
+		teamDisplay := team
+		if teamLeadName != "" {
+			teamDisplay = team + " (" + teamLeadName + ")"
+		}
+		lines = append(lines, caseAlertLine(`<b>Team :</b> <b>%s</b>`, teamDisplay))
 	}
 	lines = append(lines, caseAlertLine(`<b>Priority :</b> <font color="%s">%s</font>`, severityColor, severityLabel))
 	if state != "" {

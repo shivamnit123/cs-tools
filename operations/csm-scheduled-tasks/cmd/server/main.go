@@ -39,6 +39,7 @@ import (
 
 	"github.com/adhocore/gronx"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/announcementpublish"
+	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/availability"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/cloudstatus"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/engine"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/entitycases"
@@ -46,8 +47,6 @@ import (
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/ledger"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/notify"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/opencases"
-	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/outagenotify"
-	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/outagenotifytask"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/registry"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/stalecases"
 )
@@ -106,19 +105,33 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Outage internal-stakeholder notification. Its own narrow client: the
-	// sweep is a completely different question from case search or the
-	// query-hour recompute, and shares no endpoint with either.
-	outageNotifyClient, err := outagenotify.NewClient(outagenotify.Config{
-		BaseURL:      entityServiceBaseURL,
-		TokenURL:     oauthTokenURL,
-		ClientID:     oauthClientID,
-		ClientSecret: oauthClientSecret,
-		Scopes:       entityServiceScopes,
-	})
-	if err != nil {
-		slog.Error("failed to construct entity-service outage-notification client", "err", err)
-		os.Exit(1)
+	// The availability sweep's own client. Same deployment and credentials
+	// again, and a separate client for the same reason as the others: a
+	// distinct endpoint whose timeout differs materially. This one allows
+	// five minutes where the neighbouring sweeps allow sixty seconds --
+	// ~146 subjects, each with a twelve-month outage query and up to eight
+	// rows written, is a normal run here rather than a sign of trouble.
+	//
+	// *** OFF UNLESS AVAILABILITY_RECALC_ENABLED=true. *** ServiceNow's
+	// "Calculate Availability" job still writes service_availability (mirrored
+	// in by csm-sync-service), and that table has no unique constraint on a
+	// period's natural key: with both running, matching periods can end up
+	// with two rows. Turning this on is a paired change with switching
+	// ServiceNow's job off -- the same shape as CLOUD_STATUS_ENABLED.
+	availabilityEnabled := envBool("AVAILABILITY_RECALC_ENABLED", false)
+	var availabilityClient *availability.Client
+	if availabilityEnabled {
+		availabilityClient, err = availability.NewClient(availability.Config{
+			BaseURL:      entityServiceBaseURL,
+			TokenURL:     oauthTokenURL,
+			ClientID:     oauthClientID,
+			ClientSecret: oauthClientSecret,
+			Scopes:       entityServiceScopes,
+		})
+		if err != nil {
+			slog.Error("failed to construct entity-service availability client", "err", err)
+			os.Exit(1)
+		}
 	}
 
 	// Same entity-service deployment and credentials again — a fourth,
@@ -241,8 +254,8 @@ func main() {
 	const housekeepingTaskName = "housekeeping_cleanup"
 	housekeepingTo, housekeepingCc := recipientsFor(recipientOverrides, housekeepingTaskName)
 
-	const outageNotifyTaskName = "outage_internal_notification"
-	outageNotifyTo, outageNotifyCc := recipientsFor(recipientOverrides, outageNotifyTaskName)
+	const availabilityTaskName = "availability_recalculation"
+	availabilityTo, availabilityCc := recipientsFor(recipientOverrides, availabilityTaskName)
 
 	const staleCasesTaskName = "stale_cases_report"
 	staleCasesTo, staleCasesCc := recipientsFor(recipientOverrides, staleCasesTaskName)
@@ -321,30 +334,10 @@ func main() {
 			To:       publishScheduledAnnouncementsTo,
 			Cc:       publishScheduledAnnouncementsCc,
 		},
-		// The internal-stakeholder outage notice.
-		//
-		// Every 5 minutes, not hourly: an outage declaration that arrives an
-		// hour late has missed the event it is announcing. The sweep is cheap
-		// — only outages opted into notification and not yet resolved — so the
-		// cadence costs little.
-		//
-		// SUB_CRON_RECIPIENTS here is the REPORT AUDIENCE, not failure alerts:
-		// an empty `to` skips the sweep entirely, which matters because
-		// sweeping marks decisions as sent and would consume notices nobody
-		// receives.
-		//
-		// NOT yet a paired ServiceNow deactivation. Registering this is a
-		// paired change with turning off `Internal Stakeholders Email
-		// Notification - Outage Communication`, per the double-fire rule.
-		{
-			Name:     outageNotifyTaskName,
-			Schedule: scheduleFor(scheduleOverrides, outageNotifyTaskName, "*/5 * * * *"),
-			Handler: outagenotifytask.SendNotices(
-				outageNotifyClient, emailClient, outageNotifyTo, outageNotifyCc, alertsEnabled,
-			),
-			To: outageNotifyTo,
-			Cc: outageNotifyCc,
-		},
+		// The two outage emails (internal-stakeholder notification and SRE
+		// outage communication) used to be sub-crons here. They moved to
+		// entity-service's outage notice drainer and csm-notification-service,
+		// which send them seconds after the change rather than on this tick.
 	}
 
 	// Registered only when enabled, rather than registered-and-inert, so the
@@ -362,6 +355,40 @@ func main() {
 			Handler:  cloudstatus.DeliverDue(cloudStatusClient, cloudStatusWebhook),
 			To:       cloudStatusTo,
 			Cc:       cloudStatusCc,
+		})
+	}
+
+	// Recomputes every committed service offering's uptime and rewrites
+	// service_availability -- the Go port of ServiceNow's "Calculate
+	// Availability" job, which has run nightly since 2022 and whose
+	// 212,904 rows the Cloud Status Dashboard reads on every page load.
+	//
+	// *** THIS IS THE PRODUCER FOR THREE ALREADY-PORTED ENDPOINTS. ***
+	// /cloud-status/monitors, /availabilities and /availability-history
+	// all read that table, and nothing in Postgres has ever written it:
+	// csm-sync-service mirrors ServiceNow's output. At cutover the
+	// dashboard's figures would simply stop advancing, with no error
+	// anywhere, because reading a table nobody updates looks exactly
+	// like reading a table where nothing happened.
+	//
+	// *** 03:00 UTC, NOT 10:00. *** ServiceNow fires at 10:00 UTC and
+	// computes the PREVIOUS day under the legacy engine. v2 computes
+	// TODAY, continuously, so the hour no longer carries that meaning
+	// and the only thing it needs to be is quiet. 03:00 UTC is 08:30 in
+	// Asia/Colombo -- before the working day, after the overnight
+	// batch window.
+	//
+	// Registering this is a paired change with disabling ServiceNow's
+	// "Calculate Availability" job: two writers on one table, keyed
+	// differently, would double every subject's rows. Hence
+	// AVAILABILITY_RECALC_ENABLED, default false (see the client above).
+	if availabilityEnabled {
+		tasks = append(tasks, registry.Task{
+			Name:     availabilityTaskName,
+			Schedule: scheduleFor(scheduleOverrides, availabilityTaskName, "0 3 * * *"),
+			Handler:  availability.RecalculateAvailability(availabilityClient),
+			To:       availabilityTo,
+			Cc:       availabilityCc,
 		})
 	}
 

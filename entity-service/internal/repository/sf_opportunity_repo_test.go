@@ -48,18 +48,6 @@ type oppQuerier struct {
 func (q *oppQuerier) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	q.statements = append(q.statements, sql)
 	switch sql {
-	case updateSfOpportunityQuery:
-		if _, ok := q.opportunities[args[9].(string)]; ok {
-			return pgconn.NewCommandTag("UPDATE 1"), nil
-		}
-		return pgconn.NewCommandTag("UPDATE 0"), nil
-	case updateSfOpportunityProductQuery:
-		id := args[16].(string)
-		if _, ok := q.products[id]; ok {
-			q.products[id] = args[1].(string)
-			return pgconn.NewCommandTag("UPDATE 1"), nil
-		}
-		return pgconn.NewCommandTag("UPDATE 0"), nil
 	case insertSfOpportunityProductQuery:
 		q.products[args[16].(string)] = args[1].(string)
 		return pgconn.NewCommandTag("INSERT 0 1"), nil
@@ -101,8 +89,18 @@ func (q *oppQuerier) QueryRow(_ context.Context, sql string, args ...any) pgx.Ro
 		id := fmt.Sprintf("opp-row-%d", q.nextID)
 		q.opportunities[args[9].(string)] = id
 		return oppRow{id: id}
-	case selectSfOpportunityIDQuery:
-		return oppRow{id: q.opportunities[args[0].(string)]}
+	case updateSfOpportunityQuery:
+		if id, ok := q.opportunities[args[9].(string)]; ok {
+			return scanRow{vals: []any{id, int64(1)}}
+		}
+		return scanRow{err: pgx.ErrNoRows}
+	case updateSfOpportunityProductQuery:
+		id := args[16].(string)
+		if _, ok := q.products[id]; ok {
+			q.products[id] = args[1].(string)
+			return scanRow{vals: []any{"li-row", int64(1)}}
+		}
+		return scanRow{err: pgx.ErrNoRows}
 	}
 	if strings.Contains(sql, "salesforce_ingest_state") {
 		q.ledger = append(q.ledger, domain.UpsertSalesforceIngestStateRequest{

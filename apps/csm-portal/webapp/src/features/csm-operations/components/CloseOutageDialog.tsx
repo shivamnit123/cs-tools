@@ -48,10 +48,17 @@ interface CloseOutageDialogProps {
 }
 
 /**
- * Close an outage — `PATCH { end: … }` is the only close mechanism (there is
- * no separate state field or close verb; see `BePatchOutagePayload`'s doc
- * comment). Defaults to "now" but lets the engineer record a different
- * actual end time.
+ * End an outage — `PATCH { end: … }` is the only close mechanism (there is no
+ * separate state field or close verb; see `BePatchOutagePayload`'s doc
+ * comment).
+ *
+ * Named for ServiceNow's own verb: its outage form pairs "Begin Outage" with
+ * ending the record, and the create page now carries the matching action.
+ *
+ * The end time still defaults to "now" and stays editable, for the same
+ * reason the create page keeps its Begin field: an outage is routinely
+ * noticed as over some minutes after it actually recovered, and stamping
+ * "now" there overstates the duration on the public status page.
  */
 export default function CloseOutageDialog({
   begin,
@@ -71,7 +78,7 @@ export default function CloseOutageDialog({
 
   return (
     <Dialog open onClose={onClose} maxWidth="xs" fullWidth>
-      <DialogTitle>Close outage</DialogTitle>
+      <DialogTitle>End outage</DialogTitle>
       <DialogContent dividers>
         <Box sx={{ display: "flex", flexDirection: "column", gap: 2, pt: 0.5 }}>
           {endBeforeBegin && (
@@ -103,7 +110,7 @@ export default function CloseOutageDialog({
           onClick={() => endUtc && onConfirm(endUtc)}
           disabled={!canConfirm}
         >
-          {isSaving ? "Closing…" : "Close outage"}
+          {isSaving ? "Ending…" : "End outage"}
         </Button>
       </DialogActions>
     </Dialog>

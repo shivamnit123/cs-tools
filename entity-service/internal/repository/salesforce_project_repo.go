@@ -22,7 +22,6 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 )
@@ -41,8 +40,8 @@ type SalesforceProjectRepository interface {
 	// (is_active = FALSE) and records state. found is false when no project
 	// carries it; the ledger row is written regardless.
 	SoftDeleteBySfID(ctx context.Context, sfID string, state domain.UpsertSalesforceIngestStateRequest) (bool, error)
-	// LookupProjectIDBySfID returns the id of the oldest project carrying
-	// sfID, or nil when there is none.
+	// LookupProjectIDBySfID returns the project row resolveProjectBySfIDQuery
+	// picks for sfID, or nil when there is none.
 	LookupProjectIDBySfID(ctx context.Context, sfID string) (*string, error)
 	// LookupProjectTypeIDByName returns project_type.id for an exact name,
 	// or nil when no type has that name. The ingest never creates types:
@@ -50,12 +49,17 @@ type SalesforceProjectRepository interface {
 	LookupProjectTypeIDByName(ctx context.Context, name string) (*string, error)
 }
 
+// salesforceProjectRepo is the Salesforce ingest's own, so every method runs as
+// the system: the webhook and the retry worker carry no caller identity, and
+// resolveSalesforceProjectQuery and resolveProjectBySfIDQuery rank duplicate
+// sf_id rows by projectReferencedOrder's EXISTS over work_item (RLS-protected),
+// which must see every work_item for the same row to be picked as before RLS.
 type salesforceProjectRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
-// NewSalesforceProjectRepository constructs a SalesforceProjectRepository backed by the pool.
-func NewSalesforceProjectRepository(db *pgxpool.Pool) SalesforceProjectRepository {
+// NewSalesforceProjectRepository constructs a SalesforceProjectRepository backed by the scoped pool.
+func NewSalesforceProjectRepository(db *Scoped) SalesforceProjectRepository {
 	return &salesforceProjectRepo{db: db}
 }
 
@@ -68,12 +72,13 @@ func salesforceProjectLockKey(sfID string) string { return "project-sf:" + sfID 
 // sf_id (preferring one whose key already matches), else the row with the
 // key (a ServiceNow-synced row whose sf_id is empty or different; its sf_id
 // is stamped). by_key is true in the second case. key is UNIQUE, so the key
-// arm matches at most one row.
+// arm matches at most one row; among sf_id copies, projectReferencedOrder decides.
 const resolveSalesforceProjectQuery = `
-	SELECT id::text, (sf_id IS DISTINCT FROM $1) AS by_key
-	FROM project
-	WHERE sf_id = $1 OR key = $2
-	ORDER BY CASE WHEN sf_id = $1 AND key = $2 THEN 0 WHEN sf_id = $1 THEN 1 ELSE 2 END, created_on, id
+	SELECT p.id::text, (p.sf_id IS DISTINCT FROM $1) AS by_key, count(*) FILTER (WHERE p.sf_id = $1) OVER ()
+	FROM project p
+	WHERE p.sf_id = $1 OR p.key = $2
+	ORDER BY CASE WHEN p.sf_id = $1 AND p.key = $2 THEN 0 WHEN p.sf_id = $1 THEN 1 ELSE 2 END,
+		` + projectReferencedOrder + `
 	LIMIT 1`
 
 // updateSalesforceProjectQuery lists ONLY the ten columns Salesforce owns
@@ -136,19 +141,10 @@ const softDeleteSalesforceProjectQuery = `
 	WHERE sf_id = $1`
 
 func (r *salesforceProjectRepo) UpsertFromSalesforce(ctx context.Context, row domain.SalesforceProjectUpsert, state domain.UpsertSalesforceIngestStateRequest) (domain.SalesforceProjectUpsertResult, error) {
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return domain.SalesforceProjectUpsertResult{}, fmt.Errorf("upsert project from salesforce: begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	res, err := writeSalesforceProject(ctx, tx, row, state)
-	if err != nil {
-		return domain.SalesforceProjectUpsertResult{}, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return domain.SalesforceProjectUpsertResult{}, fmt.Errorf("upsert project from salesforce: commit: %w", err)
-	}
-	return res, nil
+	ctx = WithSystemIdentity(ctx)
+	return InTxReturning(ctx, r.db, func(tx pgx.Tx) (domain.SalesforceProjectUpsertResult, error) {
+		return writeSalesforceProject(ctx, tx, row, state)
+	})
 }
 
 // writeSalesforceProject is UpsertFromSalesforce's body, run on q (the
@@ -172,7 +168,9 @@ func writeSalesforceProject(ctx context.Context, q querier, row domain.Salesforc
 		row.SfID, row.Key, row.Name, row.AccountID, row.StartDate, row.EndDate, row.Description,
 		row.ProjectTypeID, row.ComplianceViolationDate, row.GoLiveDate,
 	}
-	err := q.QueryRow(ctx, resolveSalesforceProjectQuery, row.SfID, row.Key).Scan(&res.ProjectID, &res.LinkedByKey)
+	var copies int64
+	err := q.QueryRow(ctx, resolveSalesforceProjectQuery, row.SfID, row.Key).Scan(&res.ProjectID, &res.LinkedByKey, &copies)
+	warnDuplicateSfID(ctx, "project", row.SfID, res.ProjectID, copies)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		if !row.AllowInsert {
@@ -217,19 +215,10 @@ func writeSalesforceProject(ctx context.Context, q querier, row domain.Salesforc
 }
 
 func (r *salesforceProjectRepo) SoftDeleteBySfID(ctx context.Context, sfID string, state domain.UpsertSalesforceIngestStateRequest) (bool, error) {
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return false, fmt.Errorf("soft-delete project by sf_id: begin: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	found, err := softDeleteSalesforceProject(ctx, tx, sfID, state)
-	if err != nil {
-		return false, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("soft-delete project by sf_id: commit: %w", err)
-	}
-	return found, nil
+	ctx = WithSystemIdentity(ctx)
+	return InTxReturning(ctx, r.db, func(tx pgx.Tx) (bool, error) {
+		return softDeleteSalesforceProject(ctx, tx, sfID, state)
+	})
 }
 
 func softDeleteSalesforceProject(ctx context.Context, q querier, sfID string, state domain.UpsertSalesforceIngestStateRequest) (bool, error) {
@@ -247,18 +236,11 @@ func softDeleteSalesforceProject(ctx context.Context, q querier, sfID string, st
 }
 
 func (r *salesforceProjectRepo) LookupProjectIDBySfID(ctx context.Context, sfID string) (*string, error) {
-	var id string
-	err := r.db.QueryRow(ctx, `SELECT id::text FROM project WHERE sf_id = $1 ORDER BY created_on, id LIMIT 1`, sfID).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("lookup project id by sf_id: %w", err)
-	}
-	return &id, nil
+	return resolveIDBySfID(WithSystemIdentity(ctx), r.db, resolveProjectBySfIDQuery, "project", sfID)
 }
 
 func (r *salesforceProjectRepo) LookupProjectTypeIDByName(ctx context.Context, name string) (*string, error) {
+	ctx = WithSystemIdentity(ctx)
 	var id string
 	err := r.db.QueryRow(ctx, `SELECT id::text FROM project_type WHERE name = $1`, name).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {

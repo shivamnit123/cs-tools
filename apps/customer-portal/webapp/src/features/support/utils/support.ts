@@ -1240,7 +1240,34 @@ export type { InlineAttachment };
 export const INLINE_COMMENT_HTML_PURIFY: Record<string, never> = {};
 
 /**
+ * Matches a `src` that is exactly an attachment id: an optional single leading
+ * slash, a canonical hyphenated UUID or 32 hex chars (case-insensitive), and an
+ * optional `.iix` suffix, and nothing else (no query string, extra path
+ * segments, scheme or `//` prefix). Content migrated from the legacy data
+ * source carries inline images in this shape (`<img src="/<uuid>">`, with the
+ * `.iix` suffix dropped). Kept deliberately exact so ordinary image URLs are
+ * never mistaken for attachment references.
+ */
+const BARE_ATTACHMENT_SRC =
+  /^\/?([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}|[a-f0-9]{32})(?:\.iix)?$/i;
+
+/**
+ * Whether an inline `<img>` `src` is an attachment reference that must be
+ * resolved through the backend: either a `.iix` reference or a bare attachment
+ * id as found in migrated content (see {@link BARE_ATTACHMENT_SRC}).
+ *
+ * @param src - Raw src attribute.
+ * @returns {boolean} True when the src should be resolved as an attachment.
+ */
+export function isInlineImageRefSrc(src: string): boolean {
+  return src.includes(".iix") || BARE_ATTACHMENT_SRC.test(src.trim());
+}
+
+/**
  * Extracts ServiceNow-style attachment id from img src (relative /id.iix or absolute https://host/id.iix).
+ * A bare hyphenated UUID (`/<uuid>`, migrated content) is normalized to the
+ * 32-char lowercase form so it dedupes with the `.iix` form of the same
+ * attachment and reaches the existing fetch path in the shape it expects.
  *
  * @param src - Raw src attribute.
  * @returns {string} Suspected attachment id/sys_id or empty string.
@@ -1250,6 +1277,10 @@ export function extractInlineImageRefId(src: string): string {
   const fromPath = s.match(/\/([a-f0-9]{32})\.iix(?:\?|#|$)/i);
   if (fromPath) {
     return fromPath[1];
+  }
+  const bare = s.match(BARE_ATTACHMENT_SRC);
+  if (bare && bare[1].includes("-")) {
+    return bare[1].replace(/-/g, "").toLowerCase();
   }
   const tail =
     s
@@ -1992,7 +2023,12 @@ export function toUtcStartOfDay(date: Date): string {
     throw new TypeError(`toUtcStartOfDay: invalid Date argument — ${String(date)}`);
   }
   const pad = (n: number) => String(n).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T00:00:00Z`;
+  // The year is zero-padded too, not just month/day: getFullYear() can
+  // legitimately return fewer than 4 digits (e.g. a Date constructed from a
+  // partially-typed year), and an un-padded short year here previously
+  // serialized straight into a malformed RFC3339 string (e.g.
+  // "2-01-10T00:00:00Z") that entity-service's own filter parser rejects.
+  return `${String(date.getFullYear()).padStart(4, "0")}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T00:00:00Z`;
 }
 
 export function toUtcEndOfDay(date: Date): string {
@@ -2004,8 +2040,14 @@ export function toUtcEndOfDay(date: Date): string {
   // ServiceNow applies a strict < comparison on the date portion, so
   // "2026-06-10T23:59:59Z" becomes < 2026-06-10 (excludes Jun 10).
   // Sending "2026-06-11T00:00:00Z" becomes < 2026-06-11 (includes Jun 10).
-  const next = new Date(date.getFullYear(), date.getMonth(), date.getDate() + 1);
-  return `${next.getFullYear()}-${pad(next.getMonth() + 1)}-${pad(next.getDate())}T00:00:00Z`;
+  // Built with setDate on a copy, not `new Date(year, month, day+1)` --
+  // that 3-arg form re-triggers the Date constructor's year special-casing
+  // (a year argument 0-99 becomes 1900+year), which would silently corrupt
+  // an already-short year a second time.
+  const next = new Date(date.getTime());
+  next.setDate(next.getDate() + 1);
+  // Year zero-padded too -- see toUtcStartOfDay's identical comment above.
+  return `${String(next.getFullYear()).padStart(4, "0")}-${pad(next.getMonth() + 1)}-${pad(next.getDate())}T00:00:00Z`;
 }
 
 /**

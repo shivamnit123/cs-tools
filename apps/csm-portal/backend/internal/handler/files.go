@@ -26,29 +26,29 @@ import (
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/googledrive"
 )
 
-// splDriveClient abstracts the Google Drive operations used by
-// SplFilesHandler.
-type splDriveClient interface {
+// driveClient abstracts the Google Drive operations used by
+// FilesHandler.
+type driveClient interface {
 	ListFiles(ctx context.Context, folderID string) ([]googledrive.DriveFile, error)
 	SearchFolder(ctx context.Context, folderName string) (*googledrive.DriveFolder, error)
 }
 
-// SplFilesHandler handles HTTP requests for SupportPortalLite's Google
+// FilesHandler handles HTTP requests for SupportPortalLite's Google
 // Drive browsing endpoints (GET /files, GET /files/search).
-type SplFilesHandler struct {
-	drive       splDriveClient
+type FilesHandler struct {
+	drive       driveClient
 	accessGuard *AccessGuard
 }
 
-// NewSplFilesHandler creates a SplFilesHandler backed by the given Drive
-// client. accessGuard enforces PermSPLAccess, SupportPortalLite's blanket
+// NewFilesHandler creates a FilesHandler backed by the given Drive
+// client. accessGuard enforces PermViewerAccess, SupportPortalLite's blanket
 // audience gate — these endpoints have no additional
 // fine-grained permission check beyond it (confirmed by reading service.bal: the
 // `files`/`files/search` resource functions take no http:RequestContext and
 // never call authJWT/isUserAuthorized beyond the global request
 // interceptor).
-func NewSplFilesHandler(drive splDriveClient, accessGuard *AccessGuard) *SplFilesHandler {
-	return &SplFilesHandler{drive: drive, accessGuard: accessGuard}
+func NewFilesHandler(drive driveClient, accessGuard *AccessGuard) *FilesHandler {
+	return &FilesHandler{drive: drive, accessGuard: accessGuard}
 }
 
 // ListFiles handles GET /files.
@@ -60,8 +60,8 @@ func NewSplFilesHandler(drive splDriveClient, accessGuard *AccessGuard) *SplFile
 // — deliberately adopted here instead of the Ballerina status code, since
 // this is our own input-validation response, not a change to which external
 // endpoint is called or how.
-func (h *SplFilesHandler) ListFiles(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+func (h *FilesHandler) ListFiles(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
@@ -87,8 +87,8 @@ func (h *SplFilesHandler) ListFiles(w http.ResponseWriter, r *http.Request) {
 // See ListFiles's doc comment: the empty-folderName case deliberately
 // returns 400 here rather than the Ballerina original's 500, matching this
 // backend's own input-validation convention.
-func (h *SplFilesHandler) SearchFolder(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+func (h *FilesHandler) SearchFolder(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}

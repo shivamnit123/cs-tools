@@ -137,42 +137,32 @@ func (c *Client) CreateCaseComment(ctx context.Context, caseID string, body []by
 }
 
 // SearchOpportunities calls POST /opportunities/search on the entity service.
-// ServiceNow data source only; a pure M2M call succeeds here, unlike UpdateProject —
-// this operation does not require a forwarded end-user identity token. Response is
-// returned as raw JSON; typed response structs are deferred.
+// M2M-safe on both data sources (Postgres reads sf_opportunity). Raw JSON passthrough.
 func (c *Client) SearchOpportunities(ctx context.Context, body []byte) ([]byte, error) {
 	return c.do(ctx, http.MethodPost, "/opportunities/search", body)
 }
 
 // GetOpportunity calls GET /opportunities/{id} on the entity service.
-// ServiceNow data source only; a pure M2M call succeeds here (read-only, no
-// forwarded identity required). Response is returned as raw JSON; typed response
-// structs are deferred.
+// M2M-safe on both data sources (Postgres reads sf_opportunity). Raw JSON passthrough.
 func (c *Client) GetOpportunity(ctx context.Context, id string) ([]byte, error) {
 	return c.do(ctx, http.MethodGet, fmt.Sprintf("/opportunities/%s", url.PathEscape(id)), nil)
 }
 
 // SearchInvoices calls POST /invoices/search on the entity service.
-// ServiceNow data source only; a pure M2M call succeeds here (read-only, no
-// forwarded identity required). Response is returned as raw JSON; typed response
-// structs are deferred.
+// M2M-safe on both data sources (Postgres reads sf_invoice). Raw JSON passthrough.
 func (c *Client) SearchInvoices(ctx context.Context, body []byte) ([]byte, error) {
 	return c.do(ctx, http.MethodPost, "/invoices/search", body)
 }
 
 // GetInvoice calls GET /invoices/{id} on the entity service.
-// ServiceNow data source only; a pure M2M call succeeds here (read-only, no
-// forwarded identity required). Response is returned as raw JSON; typed response
-// structs are deferred.
+// M2M-safe on both data sources (Postgres reads sf_invoice). Raw JSON passthrough.
 func (c *Client) GetInvoice(ctx context.Context, id string) ([]byte, error) {
 	return c.do(ctx, http.MethodGet, fmt.Sprintf("/invoices/%s", url.PathEscape(id)), nil)
 }
 
 // SearchProjectOpportunityLinks calls POST /project-opportunity-links/search on the
-// entity service. ServiceNow data source only; a pure M2M call succeeds here
-// (read-only, no forwarded identity required). There is no by-id fetch for this
-// resource — the underlying ServiceNow data has no single-record endpoint. Response
-// is returned as raw JSON; typed response structs are deferred.
+// entity service. M2M-safe on both data sources (Postgres reads sf_opportunity_link).
+// Search only, no by-id fetch. Raw JSON passthrough.
 func (c *Client) SearchProjectOpportunityLinks(ctx context.Context, body []byte) ([]byte, error) {
 	return c.do(ctx, http.MethodPost, "/project-opportunity-links/search", body)
 }

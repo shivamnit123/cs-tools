@@ -56,6 +56,27 @@ func requestsInternalUserType(roles []string) bool {
 	return false
 }
 
+// externalUserTypeRoles mirrors the identically-named list in entity-service's
+// own user_service.go -- the role names its recompute_user_type trigger
+// resolves to user_type = EXTERNAL. Creating an EXTERNAL-type user is
+// temporarily disabled; see requestsExternalUserType.
+var externalUserTypeRoles = []string{"external", "partner", "customer", "partner_admin", "customer_admin"}
+
+// requestsExternalUserType reports whether granting roles at user creation
+// would resolve the new user's user_type to EXTERNAL. Checked here so POST
+// /users can reject it with a friendly 400 before ever reaching entity-service,
+// which enforces the same rule as the real, authoritative check.
+func requestsExternalUserType(roles []string) bool {
+	for _, role := range roles {
+		for _, external := range externalUserTypeRoles {
+			if strings.EqualFold(role, external) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // externalAccountStatus is the SCIM "external" org lock/existence status
 // appended to GET /users/{id} for external contacts, mirroring the
 // asgardeo-user-check service's {exists, locked} contract. Locked is null

@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
@@ -49,6 +50,24 @@ func requestsInternalUserType(roles []domain.UserRole) bool {
 	for _, role := range roles {
 		for _, internal := range internalUserTypeRoles {
 			if strings.EqualFold(string(role), internal) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// externalUserTypeRoles are the role names recompute_user_type's trigger
+// resolves to user_type = EXTERNAL. Creating an EXTERNAL-type user via this
+// endpoint is temporarily disabled -- see requestsExternalUserType.
+var externalUserTypeRoles = []string{"external", "partner", "customer", "partner_admin", "customer_admin"}
+
+// requestsExternalUserType reports whether granting roles at user creation
+// would resolve the new user's user_type to EXTERNAL via that trigger.
+func requestsExternalUserType(roles []domain.UserRole) bool {
+	for _, role := range roles {
+		for _, external := range externalUserTypeRoles {
+			if strings.EqualFold(string(role), external) {
 				return true
 			}
 		}
@@ -344,6 +363,42 @@ func (s *userService) GetUsersByIDs(ctx context.Context, ids []string) (domain.G
 	return domain.GetUsersByIDsResponse{Users: users}, nil
 }
 
+// PatchMe implements UserService. Resolves the caller the same way GetMe
+// does (x-user-id-token's email claim -> GetUserByEmail), so there is no
+// caller-supplied id to trust -- a user can only ever update their own
+// timezone through this endpoint.
+func (s *userService) PatchMe(ctx context.Context, req domain.PatchUserMeRequest) (domain.PatchUserMeResponse, error) {
+	if req.TimeZone == "" {
+		return domain.PatchUserMeResponse{}, &apierror.ValidationError{Msg: "timeZone is required"}
+	}
+	token := middleware.UserIDTokenFromContext(ctx)
+	if token == "" {
+		return domain.PatchUserMeResponse{}, &apierror.UnauthorizedError{Msg: "x-user-id-token header is required"}
+	}
+	email, err := emailFromJWT(token)
+	if err != nil {
+		return domain.PatchUserMeResponse{}, &apierror.ValidationError{Msg: "x-user-id-token: " + err.Error()}
+	}
+	user, err := s.repo.GetUserByEmail(ctx, email)
+	if err != nil {
+		return domain.PatchUserMeResponse{}, err
+	}
+
+	updatedOn, err := s.repo.UpdateUserTimeZone(ctx, user.ID, req.TimeZone)
+	if err != nil {
+		return domain.PatchUserMeResponse{}, err
+	}
+
+	return domain.PatchUserMeResponse{
+		Message: "User updated successfully",
+		User: domain.PatchUserMeUpdated{
+			ID:        user.ID,
+			UpdatedBy: email,
+			UpdatedOn: updatedOn.UTC().Format(time.RFC3339),
+		},
+	}, nil
+}
+
 // CreateUser implements UserService.
 func (s *userService) CreateUser(ctx context.Context, req domain.CreateUserRequest) (domain.User, error) {
 	token := middleware.UserIDTokenFromContext(ctx)
@@ -366,6 +421,9 @@ func (s *userService) CreateUser(ctx context.Context, req domain.CreateUserReque
 	}
 	if requestsInternalUserType(req.Roles) && !strings.HasSuffix(strings.ToLower(req.Email), wso2EmailDomain) {
 		return domain.User{}, &apierror.ValidationError{Msg: "an internal-type user must have a " + wso2EmailDomain + " email address"}
+	}
+	if requestsExternalUserType(req.Roles) {
+		return domain.User{}, &apierror.ValidationError{Msg: "creating an external-type user is not available at this time"}
 	}
 
 	return s.repo.CreateUser(ctx, req, actor)

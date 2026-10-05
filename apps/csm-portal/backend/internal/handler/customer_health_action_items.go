@@ -27,7 +27,7 @@ import (
 // CreateActionItem handles POST
 // /customer-health/risks/{riskId}/action-items.
 func (h *CustomerHealthHandler) CreateActionItem(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
@@ -58,7 +58,7 @@ func (h *CustomerHealthHandler) CreateActionItem(w http.ResponseWriter, r *http.
 // UpdateActionItemStatus handles PUT
 // /customer-health/action-items/{actionItemId}/status.
 func (h *CustomerHealthHandler) UpdateActionItemStatus(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
@@ -89,7 +89,7 @@ func (h *CustomerHealthHandler) UpdateActionItemStatus(w http.ResponseWriter, r 
 // UpdateActionItem handles PUT
 // /customer-health/action-items/{actionItemId}.
 func (h *CustomerHealthHandler) UpdateActionItem(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
@@ -120,7 +120,7 @@ func (h *CustomerHealthHandler) UpdateActionItem(w http.ResponseWriter, r *http.
 // GetActionItemsByRisk handles GET
 // /customer-health/risks/{riskId}/action-items.
 func (h *CustomerHealthHandler) GetActionItemsByRisk(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
@@ -142,7 +142,7 @@ func (h *CustomerHealthHandler) GetActionItemsByRisk(w http.ResponseWriter, r *h
 // GetActionItemsByAccount handles GET
 // /customer-health/accounts/{accountSysId}/action-items.
 func (h *CustomerHealthHandler) GetActionItemsByAccount(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
@@ -166,7 +166,7 @@ func (h *CustomerHealthHandler) GetActionItemsByAccount(w http.ResponseWriter, r
 // CreateActionItemComment handles POST
 // /customer-health/action-items/{actionItemId}/comments.
 func (h *CustomerHealthHandler) CreateActionItemComment(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
@@ -197,7 +197,7 @@ func (h *CustomerHealthHandler) CreateActionItemComment(w http.ResponseWriter, r
 // GetActionItemComments handles GET
 // /customer-health/action-items/{actionItemId}/comments.
 func (h *CustomerHealthHandler) GetActionItemComments(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}

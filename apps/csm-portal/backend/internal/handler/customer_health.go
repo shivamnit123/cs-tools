@@ -29,9 +29,9 @@ import (
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/servicenow"
 )
 
-// splRiskClient abstracts the risk-tracking MySQL operations used by
+// riskClient abstracts the risk-tracking MySQL operations used by
 // CustomerHealthHandler.
-type splRiskClient interface {
+type riskClient interface {
 	OpenProjectRisk(ctx context.Context, projectSysID, accountSysID, comment, email string) (*risk.ProjectRisk, error)
 	CloseProjectRisk(ctx context.Context, riskID int, comment, email string) (*risk.ProjectRisk, error)
 	MarkProjectHealthy(ctx context.Context, projectSysID, accountSysID, email string, comment *string) (*risk.HealthStatusRecord, error)
@@ -51,10 +51,10 @@ type splRiskClient interface {
 	GetActionItemComments(ctx context.Context, actionItemID int) ([]risk.ActionItemComment, error)
 }
 
-// splCustomerHealthSNClient abstracts the two ServiceNow-backed
+// customerHealthSNClient abstracts the two ServiceNow-backed
 // customer-health lookups used by CustomerHealthHandler (the rest of this
-// domain is pure MySQL, via splRiskClient).
-type splCustomerHealthSNClient interface {
+// domain is pure MySQL, via riskClient).
+type customerHealthSNClient interface {
 	GetCustomerHealthSummary(ctx context.Context, email, phrase, risks *string, region []string, product, abtTeam *string, offset, limit int) (*servicenow.AccountSummaryResponse, error)
 	GetCustomerHealthDetail(ctx context.Context, accountID string) (*servicenow.AccountDetail, error)
 }
@@ -64,18 +64,18 @@ type splCustomerHealthSNClient interface {
 // delegating to MySQL (risk-tracking state) and ServiceNow (account/project
 // summary data) as each endpoint requires.
 type CustomerHealthHandler struct {
-	risk        splRiskClient
-	sn          splCustomerHealthSNClient
+	risk        riskClient
+	sn          customerHealthSNClient
 	accessGuard *AccessGuard
 }
 
 // NewCustomerHealthHandler creates a CustomerHealthHandler. accessGuard
-// enforces PermSPLAccess, SupportPortalLite's blanket audience gate — no
+// enforces PermViewerAccess, SupportPortalLite's blanket audience gate — no
 // endpoint in this domain has an additional fine-grained permission check
 // beyond it (confirmed by reading every customer-health resource function in
 // service.bal: none call a group list beyond the global request
 // interceptor).
-func NewCustomerHealthHandler(riskClient splRiskClient, sn splCustomerHealthSNClient, accessGuard *AccessGuard) *CustomerHealthHandler {
+func NewCustomerHealthHandler(riskClient riskClient, sn customerHealthSNClient, accessGuard *AccessGuard) *CustomerHealthHandler {
 	return &CustomerHealthHandler{risk: riskClient, sn: sn, accessGuard: accessGuard}
 }
 
@@ -126,7 +126,7 @@ type accountSummary struct {
 // Without a health-status filter, it fetches one page from ServiceNow
 // directly and enriches it with health-status values from MySQL.
 func (h *CustomerHealthHandler) GetSummary(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
@@ -294,7 +294,7 @@ type initHealthTrackingRequest struct {
 // InitHealthTracking handles POST
 // /customer-health/accounts/{accountSysId}/init-health-tracking.
 func (h *CustomerHealthHandler) InitHealthTracking(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
@@ -319,7 +319,7 @@ func (h *CustomerHealthHandler) InitHealthTracking(w http.ResponseWriter, r *htt
 
 // GetAccountDetail handles GET /customer-health/accounts/{accountId}.
 func (h *CustomerHealthHandler) GetAccountDetail(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
@@ -344,7 +344,7 @@ func (h *CustomerHealthHandler) GetAccountDetail(w http.ResponseWriter, r *http.
 
 // OpenRisk handles POST /customer-health/projects/{projectSysId}/risk.
 func (h *CustomerHealthHandler) OpenRisk(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
@@ -370,7 +370,7 @@ func (h *CustomerHealthHandler) OpenRisk(w http.ResponseWriter, r *http.Request)
 
 // CloseRisk handles PUT /customer-health/risks/{riskId}/close.
 func (h *CustomerHealthHandler) CloseRisk(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
@@ -401,7 +401,7 @@ func (h *CustomerHealthHandler) CloseRisk(w http.ResponseWriter, r *http.Request
 // MarkHealthy handles POST
 // /customer-health/projects/{projectSysId}/mark-healthy.
 func (h *CustomerHealthHandler) MarkHealthy(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
@@ -428,7 +428,7 @@ func (h *CustomerHealthHandler) MarkHealthy(w http.ResponseWriter, r *http.Reque
 // RevertReview handles POST
 // /customer-health/projects/{projectSysId}/revert-review.
 func (h *CustomerHealthHandler) RevertReview(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
@@ -455,7 +455,7 @@ func (h *CustomerHealthHandler) RevertReview(w http.ResponseWriter, r *http.Requ
 // GetAccountHealthStatus handles GET
 // /customer-health/accounts/{accountSysId}/health-status.
 func (h *CustomerHealthHandler) GetAccountHealthStatus(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
@@ -477,7 +477,7 @@ func (h *CustomerHealthHandler) GetAccountHealthStatus(w http.ResponseWriter, r 
 // GetAccountHealthSummary handles GET
 // /customer-health/accounts/{accountSysId}/health-summary.
 func (h *CustomerHealthHandler) GetAccountHealthSummary(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
@@ -499,7 +499,7 @@ func (h *CustomerHealthHandler) GetAccountHealthSummary(w http.ResponseWriter, r
 // GetProjectRiskHistory handles GET
 // /customer-health/projects/{projectSysId}/risk-history.
 func (h *CustomerHealthHandler) GetProjectRiskHistory(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}

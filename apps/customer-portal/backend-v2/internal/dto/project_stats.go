@@ -104,6 +104,11 @@ type ProjectFilterOptions struct {
 	TimeCardStates              []ReferenceItem `json:"timeCardStates"`
 	EngagementTypes             []ReferenceItem `json:"engagementTypes"`
 	EngagementPaymentTypes      []ReferenceItem `json:"engagementPaymentTypes"`
+	// ResolutionCodes/Causes back the resolution fields the webapp must
+	// collect before closing (or proposing a solution for) a case — see
+	// PATCH /cases/{id}'s own dto.UpdateCaseRequest doc comment.
+	ResolutionCodes             []ReferenceItem `json:"resolutionCodes"`
+	Causes                      []ReferenceItem `json:"causes"`
 	SeverityBasedAllocationTime map[string]int  `json:"severityBasedAllocationTime"`
 }
 
@@ -130,6 +135,8 @@ func MapProjectFilterOptions(m entity.ProjectMetadataResponse) ProjectFilterOpti
 		TimeCardStates:              mapChoiceListItems(m.TimeCardStates),
 		EngagementTypes:             normalizeCaseEngagementTypeChoices(mapChoiceListItems(m.EngagementTypes)),
 		EngagementPaymentTypes:      mapChoiceListItems(m.EngagementPaymentTypes),
+		ResolutionCodes:             mapChoiceListItems(m.ResolutionCodes),
+		Causes:                      mapChoiceListItems(m.Causes),
 		SeverityBasedAllocationTime: m.SeverityBasedAllocationTime,
 	}
 }
@@ -432,13 +439,22 @@ type ProjectChangeRequestStats struct {
 
 // MapProjectChangeRequestStats builds the portal response from
 // entity-service's ProjectChangeRequestStatsResponse.
+//
+// StateCount is normalized the same way GET /projects/{id}/filters'
+// changeRequestStates is (see normalizeChangeRequestStateChoices): on the
+// Postgres data source entity-service returns the raw enum as both id and
+// label (e.g. {"id":"SCHEDULED","label":"SCHEDULED"}), but the Operations page
+// finds its Scheduled / Customer Approval / Customer Review counts by the
+// display label, so an un-normalized "SCHEDULED" never matched and the
+// Upcoming Changes card fell back to "--" while the list beside it showed
+// Scheduled changes.
 func MapProjectChangeRequestStats(r entity.ProjectChangeRequestStatsResponse) ProjectChangeRequestStats {
 	return ProjectChangeRequestStats{
 		TotalCount:          r.TotalCount,
 		ActiveCount:         r.ActiveCount,
 		OutstandingCount:    r.OutstandingCount,
 		ActionRequiredCount: r.ActionRequiredCount,
-		StateCount:          mapChoiceListItems(r.StateCount),
+		StateCount:          normalizeChangeRequestStateChoices(mapChoiceListItems(r.StateCount)),
 		ResolvedCount:       mapResolvedCountBreakdown(r.ResolvedCount),
 	}
 }

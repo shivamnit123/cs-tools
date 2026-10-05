@@ -29,10 +29,10 @@ import (
 const (
 	// salesforceIngestRetryMaxAttempts caps how many times one record is
 	// re-run before the job leaves it alone: every failed re-run bumps the
-	// row's attempt_count, so a parent that never arrives stops costing a
-	// Sales Entity round trip after this many ticks (an hour at the 5m
-	// default). The row stays FAILED and visible; a later event for the
-	// record, or a manual re-sync, starts it again.
+	// row's retry_count (only this job does), so a parent that never arrives
+	// stops costing a Sales Entity round trip after this many ticks (an hour
+	// at the 5m default). The row stays FAILED and visible; ingesting the
+	// parent resets retry_count (RequeueMissingParentFailures).
 	salesforceIngestRetryMaxAttempts = 12
 	// salesforceIngestRetryBatchSize bounds one tick's work per source table.
 	salesforceIngestRetryBatchSize = 100
@@ -58,12 +58,12 @@ type MembershipReingester interface {
 // whose last_error says "project not found" / "account not found"
 // (repository.OnboardingStepRepository.ListMissingParentFailures), skips
 // anything written within the last interval (the parent needs time to
-// arrive) or already at the attempt cap, and calls
+// arrive) or already at the retry cap, and calls
 // MembershipReingester.RetryMembershipIngest for each. The re-run is the
 // ordinary ingest, so it reads the current record from Sales Entity, writes
-// the row, records the step (SUCCEEDED, or FAILED with attempt_count + 1)
-// and publishes project_contact.invited when the membership moved into an
-// invited state.
+// the row, records the step and publishes project_contact.invited when the
+// membership moved into an invited state; a failed re-run then counts
+// against the cap (RecordRetryAttempt), which redeliveries never touch.
 //
 // The salesforce_ingest_state ledger (accounts, projects, opportunities) is
 // read the same way through EntityRetriers: a FAILED missing-parent row is
@@ -148,15 +148,12 @@ func (w *SalesforceIngestRetryWorker) retryMemberships(ctx context.Context) {
 			return
 		}
 		slog.InfoContext(ctx, "salesforce: ingest retry: re-running membership",
-			"membershipSfId", st.MembershipSfID, "attempt", st.AttemptCount+1, "lastError", derefString(st.LastError), "failedOn", st.UpdatedOn)
+			"membershipSfId", st.MembershipSfID, "attempt", st.RetryCount+1, "lastError", derefString(st.LastError), "failedOn", st.UpdatedOn)
 		if err := w.retryOne(ctx, func(c context.Context) error { return w.Memberships.RetryMembershipIngest(c, st.MembershipSfID) }); err != nil {
 			slog.WarnContext(ctx, "salesforce: ingest retry: membership still failing", "membershipSfId", st.MembershipSfID, "err", err)
-			// Where the ingest got as far as the upsert it has re-recorded
-			// the step (new updated_on, attempt + 1) and this is a no-op.
-			// Where it failed earlier (the Sales Entity fetch), this counts
-			// the attempt, so the cap is reached and the next try waits an
-			// interval instead of repeating on every tick.
-			if _, rerr := w.Steps.RecordRetryAttempt(ctx, st.ID, st.UpdatedOn); rerr != nil {
+			// Counts toward the cap and restarts the interval, also when the
+			// re-run failed before recording the step (the Sales Entity fetch).
+			if _, rerr := w.Steps.RecordRetryAttempt(ctx, st.ID); rerr != nil {
 				slog.ErrorContext(ctx, "salesforce: ingest retry: record membership attempt", "membershipSfId", st.MembershipSfID, "err", rerr)
 			}
 			continue
@@ -195,18 +192,17 @@ func (w *SalesforceIngestRetryWorker) retryLedger(ctx context.Context) {
 			return
 		}
 		retrier := w.EntityRetriers[row.Entity]
-		if retrier == nil || row.AttemptCount >= w.MaxAttempts || !repository.IsMissingParentError(derefString(row.LastError)) {
+		if retrier == nil || row.RetryCount >= w.MaxAttempts || !repository.IsMissingParentError(derefString(row.LastError)) {
 			skipped++
 			continue
 		}
 		retried++
 		slog.InfoContext(ctx, "salesforce: ingest retry: re-running record",
-			"entity", row.Entity, "sfId", row.SfID, "attempt", row.AttemptCount+1, "lastError", derefString(row.LastError), "failedOn", row.UpdatedOn)
+			"entity", row.Entity, "sfId", row.SfID, "attempt", row.RetryCount+1, "lastError", derefString(row.LastError), "failedOn", row.UpdatedOn)
 		if err := w.retryOne(ctx, func(c context.Context) error { return retrier(c, row.SfID) }); err != nil {
 			slog.WarnContext(ctx, "salesforce: ingest retry: record still failing", "entity", row.Entity, "sfId", row.SfID, "err", err)
-			// Same as for memberships: counts a failure the re-run did not
-			// record itself; a no-op when it did.
-			if _, rerr := w.States.RecordRetryAttempt(ctx, row.Entity, row.SfID, row.UpdatedOn); rerr != nil {
+			// Same as for memberships.
+			if _, rerr := w.States.RecordRetryAttempt(ctx, row.Entity, row.SfID); rerr != nil {
 				slog.ErrorContext(ctx, "salesforce: ingest retry: record ledger attempt", "entity", row.Entity, "sfId", row.SfID, "err", rerr)
 			}
 			continue
@@ -235,4 +231,25 @@ func (s *salesforceEventService) RetryMembershipIngest(ctx context.Context, memb
 		return errMembershipIngestDisabled
 	}
 	return s.ingestMembership(ctx, membershipSfID, domain.SalesforceEventUpdated, nil)
+}
+
+// requeueChildrenOf resets the retry budget of the FAILED memberships and
+// ledger rows waiting for parent, best-effort: the parent write has committed.
+func (s *salesforceEventService) requeueChildrenOf(ctx context.Context, parent repository.MissingParent) {
+	reqCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancel()
+	if s.membership != nil && s.membership.Steps != nil {
+		if n, err := s.membership.Steps.RequeueMissingParentFailures(reqCtx, parent); err != nil {
+			slog.ErrorContext(ctx, "salesforce: requeue memberships waiting for parent", "parent", parent.Kind, "sfId", parent.SfID, "err", err)
+		} else if n > 0 {
+			slog.InfoContext(ctx, "salesforce: requeued memberships waiting for parent", "parent", parent.Kind, "sfId", parent.SfID, "count", n)
+		}
+	}
+	if s.support.States != nil {
+		if n, err := s.support.States.RequeueMissingParentFailures(reqCtx, parent); err != nil {
+			slog.ErrorContext(ctx, "salesforce: requeue ledger rows waiting for parent", "parent", parent.Kind, "sfId", parent.SfID, "err", err)
+		} else if n > 0 {
+			slog.InfoContext(ctx, "salesforce: requeued ledger rows waiting for parent", "parent", parent.Kind, "sfId", parent.SfID, "count", n)
+		}
+	}
 }

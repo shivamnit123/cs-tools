@@ -77,33 +77,33 @@ type entitySearchUsersResponse struct {
 // carry — mirrors Ballerina modules/types.bal's MembershipType enum
 // (CUSTOMER = "OWN CONTACT", PARTNER = "PARTNER CONTACT").
 const (
-	splMembershipTypeCustomer = "OWN CONTACT"
-	splMembershipTypePartner  = "PARTNER CONTACT"
+	membershipTypeCustomer = "OWN CONTACT"
+	membershipTypePartner  = "PARTNER CONTACT"
 )
 
-// splAccountClassificationPartner mirrors Ballerina constants:PARTNER, an
+// accountClassificationPartner mirrors Ballerina constants:PARTNER, an
 // Account.Classification value.
-const splAccountClassificationPartner = "Partner"
+const accountClassificationPartner = "Partner"
 
-// splProjectStateOpen mirrors Ballerina modules/types.bal's ProjectState
+// projectStateOpen mirrors Ballerina modules/types.bal's ProjectState
 // enum's OPEN value, compared against Project.WSO2ClosureState.
-const splProjectStateOpen = "Open"
+const projectStateOpen = "Open"
 
-// splScanSystem* mirror Ballerina modules/types.bal's System enum.
+// scanSystem* mirror Ballerina modules/types.bal's System enum.
 const (
-	splScanSystemSalesforce = "Salesforce"
-	splScanSystemServicenow = "Servicenow"
+	scanSystemSalesforce = "Salesforce"
+	scanSystemServicenow = "Servicenow"
 )
 
-// SplUserScanRequest is the request body for POST /scan-user — mirrors
+// UserScanRequest is the request body for POST /scan-user — mirrors
 // Ballerina modules/types.bal's UserScanPayload.
-type SplUserScanRequest struct {
+type UserScanRequest struct {
 	Email           string `json:"email"`
 	SubscriptionKey string `json:"subscriptionKey"`
 	IsPartner       bool   `json:"isPartner"`
 }
 
-// SplScanInformation is additional detail attached to a SplScanResult —
+// SplScanInformation is additional detail attached to a ScanResult —
 // mirrors Ballerina modules/types.bal's Information. Fields are omitted from
 // the JSON response when unset, matching Ballerina's optional (?) fields.
 type SplScanInformation struct {
@@ -112,97 +112,97 @@ type SplScanInformation struct {
 	Documentation string `json:"documentation,omitempty"`
 }
 
-// SplScanResult is one row of a scan-user system's results — mirrors
+// ScanResult is one row of a scan-user system's results — mirrors
 // Ballerina modules/types.bal's ScanResult.
-type SplScanResult struct {
+type ScanResult struct {
 	Order       int                `json:"order"`
 	Label       string             `json:"label"`
 	State       bool               `json:"state"`
 	Information SplScanInformation `json:"information"`
 }
 
-// SplScanResponse groups one system's SplScanResult rows — mirrors Ballerina
+// ScanResponse groups one system's ScanResult rows — mirrors Ballerina
 // modules/types.bal's Response (renamed to avoid colliding with this
 // package's own response.go helpers).
-type SplScanResponse struct {
-	System       string          `json:"system"`
-	SystemResult []SplScanResult `json:"systemResult"`
+type ScanResponse struct {
+	System       string       `json:"system"`
+	SystemResult []ScanResult `json:"systemResult"`
 }
 
-// splScanErrorBody mirrors Ballerina types:AppServerErrorResponse's body
+// scanErrorBody mirrors Ballerina types:AppServerErrorResponse's body
 // shape, used only for the upstream-lookup-failure branches of scan-user
 // (distinct from every other /spl/* endpoint's ErrMsg* fallback, since this
 // endpoint's Ballerina source returns its own bespoke message per lookup
 // rather than a generic one).
-type splScanErrorBody struct {
+type scanErrorBody struct {
 	Message string `json:"message"`
 }
 
-func writeSplScanError(w http.ResponseWriter, message string) {
-	writeJSONValue(w, http.StatusInternalServerError, splScanErrorBody{Message: message})
+func writeScanError(w http.ResponseWriter, message string) {
+	writeJSONValue(w, http.StatusInternalServerError, scanErrorBody{Message: message})
 }
 
 // Static Information values ported verbatim from
 // modules/constants/constants.bal — copy text, including the linked
 // documentation URLs, must not be paraphrased.
 var (
-	splInfoContactNotFound = SplScanInformation{
+	infoContactNotFound = SplScanInformation{
 		Issue:    "The contact not found in Salesforce.",
 		Solution: "We need to add the contact in Salesforce.",
 		Documentation: "https://docs.google.com/document/d/1OyVjCjgcULEsq7idFeWAh6IFOVfEx0DrugvSMULd94Q/edit#heading=h." +
 			"fw9vc1atxoc5",
 	}
-	splInfoSubscriptionNotFound = SplScanInformation{
+	infoSubscriptionNotFound = SplScanInformation{
 		Issue:    "The subscription not found in the salesforce.",
 		Solution: "We need to add the subscription in salesforce.",
 		Documentation: "https://docs.google.com/document/d/1OyVjCjgcULEsq7idFeWAh6IFOVfEx0DrugvSMULd94Q/edit#heading=h." +
 			"b9o03r3icco2",
 	}
-	splInfoMembershipNotFound = SplScanInformation{
+	infoMembershipNotFound = SplScanInformation{
 		Issue:    "The contact is not associated with any subscription.",
 		Solution: "We need to connect the project contact with the subscription.",
 		Documentation: "https://docs.google.com/document/d/1OyVjCjgcULEsq7idFeWAh6IFOVfEx0DrugvSMULd94Q/edit#heading=h." +
 			"rwkq1c6yzv6o",
 	}
-	splInfoMembershipNotFoundInSubscription = SplScanInformation{
+	infoMembershipNotFoundInSubscription = SplScanInformation{
 		Issue:    "The contact is not associated with provided subscription.",
 		Solution: "We need to check and bind the provided subscription with the contact.",
 		Documentation: "https://docs.google.com/document/d/1OyVjCjgcULEsq7idFeWAh6IFOVfEx0DrugvSMULd94Q/edit#heading=h." +
 			"rwkq1c6yzv6o",
 	}
-	splInfoInvalidMembership = SplScanInformation{
+	infoInvalidMembership = SplScanInformation{
 		Issue: "Partner is not added in the customer subscription.",
 		Solution: "Partners should be in the partner account. The partner account should have a partner relationship with " +
 			"the customer account. After that, partners should be added as partner contacts in the customer subscription.",
 		Documentation: "https://docs.google.com/document/d/1OyVjCjgcULEsq7idFeWAh6IFOVfEx0DrugvSMULd94Q/edit#heading=h." +
 			"rwkq1c6yzv6o",
 	}
-	splInfoInvalidCustomerMembership = SplScanInformation{
+	infoInvalidCustomerMembership = SplScanInformation{
 		Issue:    "Customer is added in the partner account.",
 		Solution: "Customer should never be in the partner account. Customer should be added as a customer contact in the customer project.",
 		Documentation: "https://docs.google.com/document/d/1OyVjCjgcULEsq7idFeWAh6IFOVfEx0DrugvSMULd94Q/edit#heading=h." +
 			"lm8ke89ptede",
 	}
-	splInfoSubscriptionNotFoundInAccount = SplScanInformation{
+	infoSubscriptionNotFoundInAccount = SplScanInformation{
 		Issue:    "The contact is not added in the correct account.",
 		Solution: "The contact and the subscription are in two different accounts. It's important to verify that the project is associated with the correct account.",
 		Documentation: "https://docs.google.com/document/d/1OyVjCjgcULEsq7idFeWAh6IFOVfEx0DrugvSMULd94Q/edit#heading=h." +
 			"b9o03r3icco2",
 	}
-	splInfoUserNotFound = SplScanInformation{
+	infoUserNotFound = SplScanInformation{
 		Issue: "The user is not in the Servicenow.",
 		Solution: "First check the relevant contact is there in the Salesforce or not. If not exists add the contact to " +
 			"the Salesforce. Otherwise talk to Digi-Ops team.",
 		Documentation: "https://docs.google.com/document/d/1OyVjCjgcULEsq7idFeWAh6IFOVfEx0DrugvSMULd94Q/edit#heading=h.rwkq1c6yzv6o",
 	}
-	splInfoUserLockedOutDocumentation = "https://docs.google.com/document/d/1OyVjCjgcULEsq7idFeWAh6IFOVfEx0DrugvSMULd94Q/edit#heading=h.rwkq1c6yzv6o"
-	splInfoProjectNotFound            = SplScanInformation{
+	infoUserLockedOutDocumentation = "https://docs.google.com/document/d/1OyVjCjgcULEsq7idFeWAh6IFOVfEx0DrugvSMULd94Q/edit#heading=h.rwkq1c6yzv6o"
+	infoProjectNotFound            = SplScanInformation{
 		Issue: "The project is not in the Servicenow.",
 		Solution: "First check the relevant subscription is there in the Salesforce or not. If not exist add the " +
 			"subscription the Salesforce. Otherwise talk to Digi-Ops team.",
 		Documentation: "https://docs.google.com/document/d/1OyVjCjgcULEsq7idFeWAh6IFOVfEx0DrugvSMULd94Q/edit#heading=h.b9o03r3icco2",
 	}
-	splInfoUserNotFoundInProject = SplScanInformation{
+	infoUserNotFoundInProject = SplScanInformation{
 		Issue:    "The project is not in the Servicenow. Due to that, Project contact is not in the Servicenow.",
 		Solution: "First add the project and after that add the project contact.",
 		Documentation: "https://docs.google.com/document/d/1OyVjCjgcULEsq7idFeWAh6IFOVfEx0DrugvSMULd94Q/edit#heading=h." +
@@ -220,7 +220,7 @@ type SplUserScanHandler struct {
 }
 
 // NewSplUserScanHandler creates a SplUserScanHandler backed by the given
-// sales-side and entity clients. accessGuard enforces PermSPLAccess,
+// sales-side and entity clients. accessGuard enforces PermViewerAccess,
 // SupportPortalLite's blanket audience gate.
 func NewSplUserScanHandler(sales salesEntityClient, entityClient entityScanClient, accessGuard *AccessGuard) *SplUserScanHandler {
 	return &SplUserScanHandler{sales: sales, entity: entityClient, accessGuard: accessGuard}
@@ -231,7 +231,7 @@ func NewSplUserScanHandler(sales salesEntityClient, entityClient entityScanClien
 // `post scan\-user` resource function. See that function for the
 // authoritative behavior; comments below reference its structure.
 func (h *SplUserScanHandler) ScanUser(w http.ResponseWriter, r *http.Request) {
-	user, ok := requireSPLAccess(w, r, h.accessGuard)
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
 	if !ok {
 		return
 	}
@@ -247,7 +247,7 @@ func (h *SplUserScanHandler) ScanUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var payload SplUserScanRequest
+	var payload UserScanRequest
 	if err := json.Unmarshal(rawBody, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, ErrMsgBadRequest)
 		return
@@ -264,29 +264,29 @@ func (h *SplUserScanHandler) ScanUser(w http.ResponseWriter, r *http.Request) {
 
 	// ----- Salesforce-side: contact / subscription / membership -----
 
-	contactResult := SplScanResult{Order: 1, Label: "Contact Details"}
-	subscriptionResult := SplScanResult{Order: 2, Label: "Subscription Contact Details"}
-	membershipResult := SplScanResult{Order: 3, Label: "Membership Details"}
+	contactResult := ScanResult{Order: 1, Label: "Contact Details"}
+	subscriptionResult := ScanResult{Order: 2, Label: "Subscription Contact Details"}
+	membershipResult := ScanResult{Order: 3, Label: "Membership Details"}
 
 	contact, err := h.sales.GetContactByEmail(ctx, payload.Email)
 	if err != nil {
 		slog.ErrorContext(ctx, "sales entity GetContactByEmail failed", "userID", user.UserID, "err", err)
-		writeSplScanError(w, "Error occurred when retrieving contact information")
+		writeScanError(w, "Error occurred when retrieving contact information")
 		return
 	}
 
 	subscription, err := h.sales.GetSubscriptionByKey(ctx, payload.SubscriptionKey)
 	if err != nil {
 		slog.ErrorContext(ctx, "sales entity GetSubscriptionByKey failed", "userID", user.UserID, "err", err)
-		writeSplScanError(w, "Error occurred when retrieving subscription information")
+		writeScanError(w, "Error occurred when retrieving subscription information")
 		return
 	}
 
 	if contact == nil {
-		contactResult.Information = splInfoContactNotFound
-		membershipResult.Information = splInfoMembershipNotFound
+		contactResult.Information = infoContactNotFound
+		membershipResult.Information = infoMembershipNotFound
 		if subscription == nil {
-			subscriptionResult.Information = splInfoSubscriptionNotFound
+			subscriptionResult.Information = infoSubscriptionNotFound
 		} else {
 			subscriptionResult.State = true
 		}
@@ -294,11 +294,11 @@ func (h *SplUserScanHandler) ScanUser(w http.ResponseWriter, r *http.Request) {
 		contactResult.State = true
 
 		if len(contact.Memberships) == 0 {
-			membershipResult.Information = splInfoMembershipNotFound
+			membershipResult.Information = infoMembershipNotFound
 		}
 		if subscription == nil {
-			subscriptionResult.Information = splInfoSubscriptionNotFound
-			membershipResult.Information = splInfoMembershipNotFound
+			subscriptionResult.Information = infoSubscriptionNotFound
+			membershipResult.Information = infoMembershipNotFound
 		} else {
 			subscriptionResult.State = true
 			subscriptionID := subscription.ID
@@ -311,65 +311,65 @@ func (h *SplUserScanHandler) ScanUser(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if len(subscriptionMembership) == 0 {
-				membershipResult.Information = splInfoMembershipNotFoundInSubscription
+				membershipResult.Information = infoMembershipNotFoundInSubscription
 			}
 			contactAccountID := contact.Account.ID
 
 			if contactAccountID != subscription.CustomerID {
 				if !payload.IsPartner {
-					subscriptionResult.Information = splInfoSubscriptionNotFoundInAccount
+					subscriptionResult.Information = infoSubscriptionNotFoundInAccount
 				}
 			}
 
 			if subscription.ID != "" && len(subscriptionMembership) > 0 {
-				if contact.Account.Classification == splAccountClassificationPartner {
-					if (!payload.IsPartner && subscriptionMembership[0].Type == splMembershipTypeCustomer) ||
-						(payload.IsPartner && subscriptionMembership[0].Type == splMembershipTypePartner) {
+				if contact.Account.Classification == accountClassificationPartner {
+					if (!payload.IsPartner && subscriptionMembership[0].Type == membershipTypeCustomer) ||
+						(payload.IsPartner && subscriptionMembership[0].Type == membershipTypePartner) {
 						membershipResult.State = true
 					} else {
-						membershipResult.Information = splInfoInvalidMembership
+						membershipResult.Information = infoInvalidMembership
 					}
 				} else {
-					if !payload.IsPartner && subscriptionMembership[0].Type == splMembershipTypeCustomer {
+					if !payload.IsPartner && subscriptionMembership[0].Type == membershipTypeCustomer {
 						membershipResult.State = true
 					} else {
-						membershipResult.Information = splInfoInvalidCustomerMembership
+						membershipResult.Information = infoInvalidCustomerMembership
 					}
 				}
 			}
 		}
 	}
 
-	salesResponse := []SplScanResult{contactResult, subscriptionResult, membershipResult}
+	salesResponse := []ScanResult{contactResult, subscriptionResult, membershipResult}
 
 	// ----- entity-service side: user lock state / project closure state -----
 
-	userStateResult := SplScanResult{Order: 1, Label: "Accept the invitation"}
-	projectStateResult := SplScanResult{Order: 2, Label: "Project closure state"}
+	userStateResult := ScanResult{Order: 1, Label: "Accept the invitation"}
+	projectStateResult := ScanResult{Order: 2, Label: "Project closure state"}
 
 	entityUser, err := h.lookupScanUser(ctx, payload.Email)
 	if err != nil {
 		slog.ErrorContext(ctx, "entity SearchUsers failed", "userID", user.UserID, "err", err)
-		writeSplScanError(w, "Error occurred when retrieving user information")
+		writeScanError(w, "Error occurred when retrieving user information")
 		return
 	}
 
 	project, err := h.lookupProjectByKey(ctx, payload.SubscriptionKey)
 	if err != nil {
 		slog.ErrorContext(ctx, "entity SearchProjects failed", "userID", user.UserID, "err", err)
-		writeSplScanError(w, "Error occurred when retrieving project information")
+		writeScanError(w, "Error occurred when retrieving project information")
 		return
 	}
 
 	var projectID string
 	if project == nil {
-		projectStateResult.Information = splInfoProjectNotFound
+		projectStateResult.Information = infoProjectNotFound
 		userStateResult.State = false
-		userStateResult.Information = splInfoUserNotFoundInProject
+		userStateResult.Information = infoUserNotFoundInProject
 	} else {
 		projectID = project.ID
 		closureState := derefStr(project.ClosureState)
-		if closureState != splProjectStateOpen {
+		if closureState != projectStateOpen {
 			projectStateResult.Information = SplScanInformation{
 				Issue: "The project is not in open state. The project is in " + closureState +
 					" state. The project should be in the Open state.",
@@ -380,7 +380,7 @@ func (h *SplUserScanHandler) ScanUser(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if entityUser == nil {
-			userStateResult.Information = splInfoUserNotFound
+			userStateResult.Information = infoUserNotFound
 		} else if entityUser.LockedOut {
 			// Resending here is a deliberate side effect, not just a status
 			// read: re-running this diagnostic for the same still-locked-out
@@ -390,7 +390,7 @@ func (h *SplUserScanHandler) ScanUser(w http.ResponseWriter, r *http.Request) {
 			// to.
 			info := SplScanInformation{
 				Issue:         "The user didn't accept the invitation.",
-				Documentation: splInfoUserLockedOutDocumentation,
+				Documentation: infoUserLockedOutDocumentation,
 			}
 			if _, err := h.entity.ResendProjectContactInvitation(ctx, projectID, payload.Email); err != nil {
 				slog.WarnContext(ctx, "entity ResendProjectContactInvitation failed", "userID", user.UserID, "memberEmail", payload.Email, "err", err)
@@ -404,11 +404,11 @@ func (h *SplUserScanHandler) ScanUser(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	csResponse := []SplScanResult{userStateResult, projectStateResult}
+	csResponse := []ScanResult{userStateResult, projectStateResult}
 
-	writeJSONValue(w, http.StatusOK, []SplScanResponse{
-		{System: splScanSystemSalesforce, SystemResult: salesResponse},
-		{System: splScanSystemServicenow, SystemResult: csResponse},
+	writeJSONValue(w, http.StatusOK, []ScanResponse{
+		{System: scanSystemSalesforce, SystemResult: salesResponse},
+		{System: scanSystemServicenow, SystemResult: csResponse},
 	})
 }
 

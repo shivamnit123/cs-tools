@@ -699,49 +699,53 @@ type snCreateIncidentResponse struct {
 	} `json:"incident"`
 }
 
-func (s *snIncidentService) CreateIncident(ctx context.Context, req domain.CreateIncidentRequest) (domain.CreateIncidentResponse, error) {
+// validateCreateIncidentRequest is the request validation both incident
+// create paths share: the ServiceNow one (before its POST) and the plain
+// Postgres one (before its insert), so the same input is rejected the same
+// way whichever data source is behind the endpoint.
+func validateCreateIncidentRequest(req domain.CreateIncidentRequest) error {
 	// Reject before the ServiceNow call, not after: createIncidentSNFirst
 	// creates the ServiceNow incident first and has no compensating delete,
 	// so a value too long for either ServiceNow's u_enviroment (max 40) or
 	// this service's own environment column (VARCHAR(40)) must fail fast
 	// here rather than leave an orphaned ServiceNow incident behind.
 	if req.Environment != nil && len([]rune(*req.Environment)) > 40 {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{
+		return &apierror.ValidationError{
 			Msg: "environment must not exceed 40 characters",
 		}
 	}
 	if req.Subject == "" {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "subject is required"}
+		return &apierror.ValidationError{Msg: "subject is required"}
 	}
 	if req.CallerID == "" {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "callerId is required"}
+		return &apierror.ValidationError{Msg: "callerId is required"}
 	}
 	if req.Category == "" {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "category is required"}
+		return &apierror.ValidationError{Msg: "category is required"}
 	}
 	if req.ServiceID == "" {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "serviceId is required"}
+		return &apierror.ValidationError{Msg: "serviceId is required"}
 	}
 	if req.Impact == "" {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "impact is required"}
+		return &apierror.ValidationError{Msg: "impact is required"}
 	}
 	if req.Urgency == "" {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "urgency is required"}
+		return &apierror.ValidationError{Msg: "urgency is required"}
 	}
 	if !validIncidentCategory[req.Category] {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "invalid category: " + string(req.Category)}
+		return &apierror.ValidationError{Msg: "invalid category: " + string(req.Category)}
 	}
 	if req.Subcategory != nil && !validIncidentSubcategory[*req.Subcategory] {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "invalid subcategory: " + string(*req.Subcategory)}
+		return &apierror.ValidationError{Msg: "invalid subcategory: " + string(*req.Subcategory)}
 	}
 	if req.ContactType != nil && !validIncidentContactType[*req.ContactType] {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "invalid contactType: " + string(*req.ContactType)}
+		return &apierror.ValidationError{Msg: "invalid contactType: " + string(*req.ContactType)}
 	}
 	if !validIncidentImpact[req.Impact] {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "invalid impact: " + string(req.Impact)}
+		return &apierror.ValidationError{Msg: "invalid impact: " + string(req.Impact)}
 	}
 	if !validIncidentUrgency[req.Urgency] {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "invalid urgency: " + string(req.Urgency)}
+		return &apierror.ValidationError{Msg: "invalid urgency: " + string(req.Urgency)}
 	}
 
 	uuidFields := map[string]string{
@@ -750,7 +754,7 @@ func (s *snIncidentService) CreateIncident(ctx context.Context, req domain.Creat
 	}
 	for field, val := range uuidFields {
 		if err := validateUUIDs(field, []string{val}); err != nil {
-			return domain.CreateIncidentResponse{}, err
+			return err
 		}
 	}
 	optionalUUIDs := map[string]*string{
@@ -767,9 +771,16 @@ func (s *snIncidentService) CreateIncident(ctx context.Context, req domain.Creat
 	for field, val := range optionalUUIDs {
 		if val != nil {
 			if err := validateUUIDs(field, []string{*val}); err != nil {
-				return domain.CreateIncidentResponse{}, err
+				return err
 			}
 		}
+	}
+	return nil
+}
+
+func (s *snIncidentService) CreateIncident(ctx context.Context, req domain.CreateIncidentRequest) (domain.CreateIncidentResponse, error) {
+	if err := validateCreateIncidentRequest(req); err != nil {
+		return domain.CreateIncidentResponse{}, err
 	}
 	token := middleware.UserIDTokenFromContext(ctx)
 

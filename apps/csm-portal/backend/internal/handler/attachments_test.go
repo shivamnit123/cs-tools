@@ -26,18 +26,18 @@ import (
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/servicenow"
 )
 
-type mockSplAttachmentsClient struct {
+type mockAttachmentsClient struct {
 	body                     []byte
 	contentType              string
 	err                      error
 	requireCaseAttachmentErr error
 }
 
-func (m *mockSplAttachmentsClient) RequireCaseAttachment(ctx context.Context, attachmentSysID string) error {
+func (m *mockAttachmentsClient) RequireCaseAttachment(ctx context.Context, attachmentSysID string) error {
 	return m.requireCaseAttachmentErr
 }
 
-func (m *mockSplAttachmentsClient) DownloadAttachment(ctx context.Context, attachmentSysID string) ([]byte, string, string, error) {
+func (m *mockAttachmentsClient) DownloadAttachment(ctx context.Context, attachmentSysID string) ([]byte, string, string, error) {
 	return m.body, m.contentType, "", m.err
 }
 
@@ -48,8 +48,8 @@ func newAttachmentDownloadRequest(attachmentID string) *http.Request {
 }
 
 func TestDownloadAttachment_Success(t *testing.T) {
-	mock := &mockSplAttachmentsClient{body: []byte("%PDF-1.4"), contentType: "application/pdf"}
-	h := NewSplAttachmentsHandler(mock, splAccessGuard)
+	mock := &mockAttachmentsClient{body: []byte("%PDF-1.4"), contentType: "application/pdf"}
+	h := NewAttachmentsHandler(mock, viewerAccessGuard)
 	w := httptest.NewRecorder()
 
 	h.DownloadAttachment(w, newAttachmentDownloadRequest("att-1"))
@@ -65,8 +65,8 @@ func TestDownloadAttachment_Success(t *testing.T) {
 }
 
 func TestDownloadAttachment_CoercesUnsafeContentType(t *testing.T) {
-	mock := &mockSplAttachmentsClient{body: []byte("<script>"), contentType: "text/html"}
-	h := NewSplAttachmentsHandler(mock, splAccessGuard)
+	mock := &mockAttachmentsClient{body: []byte("<script>"), contentType: "text/html"}
+	h := NewAttachmentsHandler(mock, viewerAccessGuard)
 	w := httptest.NewRecorder()
 
 	h.DownloadAttachment(w, newAttachmentDownloadRequest("att-1"))
@@ -75,8 +75,8 @@ func TestDownloadAttachment_CoercesUnsafeContentType(t *testing.T) {
 }
 
 func TestDownloadAttachment_RejectsNonCaseAttachment(t *testing.T) {
-	mock := &mockSplAttachmentsClient{requireCaseAttachmentErr: servicenow.ErrAttachmentNotFound}
-	h := NewSplAttachmentsHandler(mock, splAccessGuard)
+	mock := &mockAttachmentsClient{requireCaseAttachmentErr: servicenow.ErrAttachmentNotFound}
+	h := NewAttachmentsHandler(mock, viewerAccessGuard)
 	w := httptest.NewRecorder()
 
 	h.DownloadAttachment(w, newAttachmentDownloadRequest("att-1"))
@@ -85,9 +85,9 @@ func TestDownloadAttachment_RejectsNonCaseAttachment(t *testing.T) {
 }
 
 func TestDownloadAttachment_RejectsMissingDownloadPermission(t *testing.T) {
-	h := NewSplAttachmentsHandler(&mockSplAttachmentsClient{}, splAccessGuard)
+	h := NewAttachmentsHandler(&mockAttachmentsClient{}, viewerAccessGuard)
 	// SPL access (sales_solutions) but no attachment_downloader/cs_engineer/
-	// admin — passes PermSPLAccess, fails the additional
+	// admin — passes PermViewerAccess, fails the additional
 	// PermDownloadAttachment check.
 	req := httptest.NewRequest(http.MethodGet, "/attachments/att-1/download", nil)
 	req.SetPathValue("attachmentId", "att-1")
@@ -102,7 +102,7 @@ func TestDownloadAttachment_RejectsMissingDownloadPermission(t *testing.T) {
 }
 
 func TestDownloadAttachment_RejectsEmptyID(t *testing.T) {
-	h := NewSplAttachmentsHandler(&mockSplAttachmentsClient{}, splAccessGuard)
+	h := NewAttachmentsHandler(&mockAttachmentsClient{}, viewerAccessGuard)
 	req := withUser(httptest.NewRequest(http.MethodGet, "/attachments//download", nil))
 	req.SetPathValue("attachmentId", "")
 	w := httptest.NewRecorder()

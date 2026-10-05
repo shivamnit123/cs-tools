@@ -29,8 +29,8 @@ import (
 // write records its salesforce_ingest_state row in the same transaction, so
 // the ledger can never disagree with the tables.
 type SalesforceOpportunityRepository interface {
-	// UpsertFromSalesforce writes one opportunity by sf_id and makes its
-	// sf_opportunity_product rows equal to row.LineItems, then records state.
+	// UpsertFromSalesforce writes one opportunity row by sf_id (resolveOpportunityBySfIDQuery's
+	// pick) and makes its sf_opportunity_product rows equal to row.LineItems, then records state.
 	UpsertFromSalesforce(ctx context.Context, row domain.SalesforceOpportunityUpsert, state domain.UpsertSalesforceIngestStateRequest) (domain.SalesforceOpportunityUpsertResult, error)
 	// DeleteBySfID hard-deletes every sf_opportunity row carrying sfID and
 	// records state. The foreign keys cascade the line items and the project
@@ -69,7 +69,10 @@ const updateSfOpportunityQuery = `
 		updated_on = now(),
 		updated_by = $1,
 		sync_time_stamp = now()
-	WHERE sf_id = $10`
+	FROM (SELECT o.id, count(*) OVER () AS n FROM sf_opportunity o WHERE o.sf_id = $10
+		ORDER BY ` + opportunityReferencedOrder + ` LIMIT 1) t
+	WHERE sf_opportunity.id = t.id
+	RETURNING sf_opportunity.id::text, t.n`
 
 const insertSfOpportunityQuery = `
 	INSERT INTO sf_opportunity (
@@ -85,14 +88,8 @@ const insertSfOpportunityQuery = `
 	)
 	RETURNING id::text`
 
-// selectSfOpportunityIDQuery picks the row the line items belong to. Should
-// more than one row carry the sf_id (a ServiceNow-synced duplicate), all of
-// them were updated above, and the oldest — the one every earlier writer
-// used — owns the line items, as LookupAccountIDBySfID does for accounts.
-const selectSfOpportunityIDQuery = `SELECT id::text FROM sf_opportunity WHERE sf_id = $1 ORDER BY created_on, id LIMIT 1`
-
-// updateSfOpportunityProductQuery lists ONLY the columns Salesforce owns;
-// development_support_hours and engagement_code are ServiceNow-side.
+// updateSfOpportunityProductQuery lists ONLY the columns Salesforce owns; it writes one copy,
+// preferring the one already under the opportunity ($2), then the oldest.
 const updateSfOpportunityProductQuery = `
 	UPDATE sf_opportunity_product SET
 		opportunity_id = $2,
@@ -113,7 +110,10 @@ const updateSfOpportunityProductQuery = `
 		updated_on = now(),
 		updated_by = $1,
 		sync_time_stamp = now()
-	WHERE line_item_sf_id = $17`
+	FROM (SELECT li.id, count(*) OVER () AS n FROM sf_opportunity_product li WHERE li.line_item_sf_id = $17
+		ORDER BY (li.opportunity_id IS NOT DISTINCT FROM $2::uuid) DESC, li.created_on, li.id LIMIT 1) t
+	WHERE sf_opportunity_product.id = t.id
+	RETURNING sf_opportunity_product.id::text, t.n`
 
 const insertSfOpportunityProductQuery = `
 	INSERT INTO sf_opportunity_product (
@@ -160,7 +160,7 @@ func (r *sfOpportunityRepo) UpsertFromSalesforce(ctx context.Context, row domain
 // as a querier so it can be exercised without a database:
 //
 //  1. lock on the sf_id;
-//  2. update every row carrying the sf_id, else insert one with a new uuid;
+//  2. update the one resolved row carrying the sf_id, else insert one;
 //  3. upsert each line item by line_item_sf_id under the opportunity's row,
 //     then delete the row's line items the set does not mention;
 //  4. record the ledger.
@@ -176,17 +176,16 @@ func writeSfOpportunity(ctx context.Context, q querier, row domain.SalesforceOpp
 		row.EulaVersion, row.KeepExistingEula, row.EulaVersionDecimal,
 		row.SfID,
 	}
-	tag, err := q.Exec(ctx, updateSfOpportunityQuery, args...)
+	id, n, err := updateOneBySfID(ctx, q, updateSfOpportunityQuery, "sf_opportunity", row.SfID, args...)
 	if err != nil {
 		return res, fmt.Errorf("upsert opportunity from salesforce: update by sf_id: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
+	res.OpportunityID = id
+	if n == 0 {
 		if err := q.QueryRow(ctx, insertSfOpportunityQuery, args...).Scan(&res.OpportunityID); err != nil {
 			return res, fmt.Errorf("upsert opportunity from salesforce: insert: %w", err)
 		}
 		res.Created = true
-	} else if err := q.QueryRow(ctx, selectSfOpportunityIDQuery, row.SfID).Scan(&res.OpportunityID); err != nil {
-		return res, fmt.Errorf("upsert opportunity from salesforce: read back id: %w", err)
 	}
 
 	keep := make([]string, 0, len(row.LineItems))
@@ -199,11 +198,11 @@ func writeSfOpportunity(ctx context.Context, q querier, row domain.SalesforceOpp
 			li.Classification, li.Environment, li.TotalPrice,
 			li.LineItemSfID,
 		}
-		tag, err := q.Exec(ctx, updateSfOpportunityProductQuery, liArgs...)
+		_, n, err := updateOneBySfID(ctx, q, updateSfOpportunityProductQuery, "sf_opportunity_product", li.LineItemSfID, liArgs...)
 		if err != nil {
 			return res, fmt.Errorf("upsert opportunity line item %s: update: %w", li.LineItemSfID, err)
 		}
-		if tag.RowsAffected() == 0 {
+		if n == 0 {
 			if _, err := q.Exec(ctx, insertSfOpportunityProductQuery, liArgs...); err != nil {
 				return res, fmt.Errorf("upsert opportunity line item %s: insert: %w", li.LineItemSfID, err)
 			}
@@ -211,7 +210,7 @@ func writeSfOpportunity(ctx context.Context, q querier, row domain.SalesforceOpp
 		keep = append(keep, li.LineItemSfID)
 		res.LineItemsWritten++
 	}
-	tag, err = q.Exec(ctx, deleteStaleSfOpportunityProductsQuery, res.OpportunityID, keep)
+	tag, err := q.Exec(ctx, deleteStaleSfOpportunityProductsQuery, res.OpportunityID, keep)
 	if err != nil {
 		return res, fmt.Errorf("upsert opportunity from salesforce: delete stale line items: %w", err)
 	}

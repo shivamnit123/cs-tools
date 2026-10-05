@@ -27,7 +27,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"golang.org/x/sync/errgroup"
@@ -363,11 +362,13 @@ func (r *deployedProductRepo) SearchDeployedProductUsageCounts(ctx context.Conte
 }
 
 type deployedProductRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
-// NewDeployedProductRepository constructs a DeployedProductRepository backed by the given connection pool.
-func NewDeployedProductRepository(db *pgxpool.Pool) DeployedProductRepository {
+// NewDeployedProductRepository constructs a DeployedProductRepository whose
+// every query runs under the caller identity on ctx (deployed_product has
+// row-level security, migration 0176).
+func NewDeployedProductRepository(db *Scoped) DeployedProductRepository {
 	return &deployedProductRepo{db: db}
 }
 
@@ -384,7 +385,14 @@ func (r *deployedProductRepo) SearchDeployedProducts(ctx context.Context, req do
 	// DeployedProductView.Deployment/Product are non-pointer EntityRef
 	// values, so switching to LEFT joins isn't a safe alternative -- that
 	// would need a response-contract change and nullable scan handling.
-	where := "WHERE dp.deployment_id IS NOT NULL AND dp.product_id IS NOT NULL"
+	//
+	// dp.active is how a deployed product is soft-deleted (PATCH .../products/{id}
+	// {active: false} -- see DeployedProductRepository.UpdateDeployedProductFields).
+	// This query never filtered on it at all, so a deactivated product kept
+	// showing up in every list exactly as before, making "delete" appear to
+	// silently do nothing. NULL counts as active, the same convention
+	// AccessService.ResolveScope already uses for "user".is_active.
+	where := "WHERE dp.deployment_id IS NOT NULL AND dp.product_id IS NOT NULL AND (dp.active IS NULL OR dp.active = TRUE)"
 
 	if len(req.DeploymentIDs) > 0 {
 		where += fmt.Sprintf(" AND dp.deployment_id = ANY($%d::uuid[])", argIdx)
@@ -392,24 +400,27 @@ func (r *deployedProductRepo) SearchDeployedProducts(ctx context.Context, req do
 		argIdx++
 	}
 
-	// TODO(phase 2): req.ProductCategories is not applied here. The deployed_product
-	// schema has no category column today, so deployedProductService rejects any
-	// non-empty ProductCategories before this method is ever called (see
-	// deployed_product_service.go) rather than silently ignoring it. Filter it in here
-	// once the Postgres cohort's product-category modeling lands, and drop that
-	// rejection at the same time.
+	// deployed_product.product_category (deployed_product_category_enum:
+	// PDP/MS/PS/CL/PC) is already selected below -- the request's own
+	// lowercase values (SearchDeployedProductsRequest.ProductCategories'
+	// doc comment: e.g. "pdp") are upper-cased before the enum cast, same
+	// convention every other enum-array filter in this codebase uses.
+	if len(req.ProductCategories) > 0 {
+		categories := make([]string, len(req.ProductCategories))
+		for i, c := range req.ProductCategories {
+			categories[i] = strings.ToUpper(c)
+		}
+		where += fmt.Sprintf(" AND dp.product_category = ANY($%d::text[]::deployed_product_category_enum[])", argIdx)
+		filterArgs = append(filterArgs, categories)
+		argIdx++
+	}
 
 	countQuery := "SELECT COUNT(*) FROM deployed_product dp " + where
 
-	// update_level_info (JSONB) -- domain.DeployedProductView.Updates -- is
-	// deliberately not selected here: its actual JSON shape isn't confirmed
-	// against any real payload, so it's left unpopulated (nil, the correct
-	// "none recorded" value per that field's own doc comment) rather than
-	// guessed at. cores/tps/category, in contrast, are plain scalar columns
-	// with an unambiguous mapping, so they are selected.
 	dataQuery := fmt.Sprintf(
 		`SELECT dp.id, dp.created_on, dp.updated_on,
 		        dp.core_count, dp.tps_count, dp.product_category::TEXT,
+		        dp.description, dp.update_level_info,
 		        d.id, d.name,
 		        p.id, p.name, p.code,
 		        pv.id, pv.version, pv.release_date, pv.support_eol_date
@@ -449,9 +460,13 @@ func (r *deployedProductRepo) SearchDeployedProducts(ctx context.Context, req do
 			// Version fields are nullable (LEFT JOIN).
 			var pvID, pvName *string
 			var pvReleaseDate, pvEoLDate *time.Time
+			// update_level_info is nullable JSONB; decoded below into
+			// dp.Updates once the row is scanned.
+			var updateLevelInfo []byte
 			if err := rows.Scan(
 				&dp.ID, &dp.CreatedOn, &dp.UpdatedOn,
 				&dp.Cores, &dp.TPS, &dp.Category,
+				&dp.Description, &updateLevelInfo,
 				&dp.Deployment.ID, &dp.Deployment.Name,
 				&dp.Product.ID, &dp.Product.Name, &dp.Product.Abbreviation,
 				&pvID, &pvName, &pvReleaseDate, &pvEoLDate,
@@ -464,6 +479,16 @@ func (r *deployedProductRepo) SearchDeployedProducts(ctx context.Context, req do
 					Name:           *pvName,
 					ReleasedDate:   pvReleaseDate,
 					SupportEoLDate: pvEoLDate,
+				}
+			}
+			dp.Category = lowercaseCategory(dp.Category)
+			if len(updateLevelInfo) > 0 {
+				var updates []domain.ProductUpdateEntry
+				if err := json.Unmarshal(updateLevelInfo, &updates); err != nil {
+					return fmt.Errorf("unmarshal deployed product update_level_info: %w", err)
+				}
+				if len(updates) > 0 {
+					dp.Updates = updates
 				}
 			}
 			result = append(result, dp)
@@ -480,6 +505,21 @@ func (r *deployedProductRepo) SearchDeployedProducts(ctx context.Context, req do
 	}
 
 	return deployedProducts, total, nil
+}
+
+// lowercaseCategory converts deployed_product_category_enum's UPPER-case
+// label ("MS", "PDP", ...) read from the database into the lower-case code
+// the rest of the contract uses: the search request's ProductCategories
+// filter values and ProjectFeatures.SrProductCategories/
+// DefaultCaseProductCategories are all lower case, and clients compare the
+// returned category against them case-sensitively. A nil (NULL) category
+// stays nil, never an empty string. The input is not mutated.
+func lowercaseCategory(c *string) *string {
+	if c == nil {
+		return nil
+	}
+	v := strings.ToLower(*c)
+	return &v
 }
 
 // SearchProjectsByProductVersion implements DeployedProductRepository.

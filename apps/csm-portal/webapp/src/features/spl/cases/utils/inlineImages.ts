@@ -31,7 +31,11 @@
 // dataUrls/deniedIds are for HTML that's already fully resolved), so it
 // isn't reused as-is rather than extending that shared contract for one
 // caller.
-import { extractIixAttachmentIds, extractInlineImageRefId } from "@features/csm-cases/utils/inlineImages";
+import {
+  extractIixAttachmentIds,
+  extractInlineImageRefId,
+  isInlineImageRefSrc,
+} from "@features/csm-cases/utils/inlineImages";
 
 const RESTRICTED_PLACEHOLDER =
   '<span class="inline-attachment-placeholder inline-attachment-placeholder--restricted">' +
@@ -71,7 +75,7 @@ export function replaceInlineImageSources(
   const doc = new DOMParser().parseFromString(html, "text/html");
   for (const img of Array.from(doc.images)) {
     const src = img.getAttribute("src") ?? "";
-    if (!src.includes(".iix")) continue;
+    if (!isInlineImageRefSrc(src)) continue;
     if (unauthorized) {
       img.outerHTML = RESTRICTED_PLACEHOLDER;
       continue;
