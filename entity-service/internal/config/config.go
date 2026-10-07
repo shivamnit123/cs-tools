@@ -30,6 +30,16 @@ import (
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/validate"
 )
 
+// Defaults for the timeout settings. Create-case carries inline base64
+// attachments (up to 15 MiB), so the deadlines must be long enough for it to
+// finish. Operators may set any positive values.
+const (
+	DefaultServerReadTimeout     = 60 * time.Second
+	DefaultServerWriteTimeout    = 60 * time.Second
+	DefaultRequestTimeout        = 60 * time.Second
+	DefaultUpstreamClientTimeout = 60 * time.Second
+)
+
 // DataSource identifies which backend the service reads from.
 type DataSource string
 
@@ -75,8 +85,25 @@ type Config struct {
 	// "public" half of that fallback matters: entity-service's migrations
 	// create every table unqualified, so every deployment's real tables
 	// live there today.
-	DBSchema   string
-	ServerPort string
+	DBSchema string
+	// DBPoolMaxConns/DBPoolMinConns/DBPoolMaxConnLifetime/DBPoolMaxConnIdleTime
+	// tune internal/db.NewPool's pgxpool (DB_POOL_MAX_CONNS/DB_POOL_MIN_CONNS/
+	// DB_POOL_MAX_CONN_LIFETIME/DB_POOL_MAX_CONN_IDLE_TIME). Defaults (20/2/
+	// 30m/5m) are the values this file previously hardcoded in
+	// internal/db/postgres.go — an unset deployment behaves exactly as
+	// before these existed. DBPoolMaxConns falls back to its default on an
+	// unset, non-numeric, or non-positive value (a pool that may open no
+	// connections at all can never serve a single query). DBPoolMinConns
+	// falls back the same way EXCEPT zero is accepted — pgxpool genuinely
+	// permits a minimum of 0 (a deployment that doesn't want to retain any
+	// idle connections). DBPoolMaxConnLifetime/DBPoolMaxConnIdleTime fall
+	// back to theirs the same way every other duration here does
+	// (getDurationOrDefault), via loadErr.
+	DBPoolMaxConns        int32
+	DBPoolMinConns        int32
+	DBPoolMaxConnLifetime time.Duration
+	DBPoolMaxConnIdleTime time.Duration
+	ServerPort            string
 	// HealthPort is the listen port for the separate, minimal health
 	// server (internal/server.NewHealthServer). It is deliberately NOT
 	// ServerPort: that mux carries every business route and is exposed at
@@ -200,6 +227,22 @@ type Config struct {
 	// last pass came back short. A backlog drains at full speed regardless.
 	GithubOutboundInterval time.Duration
 
+	// SpecialistHandoffConfig is SPECIALIST_HANDOFF_CONFIG, raw: the JSON
+	// that routes "Escalate to specialist team" handoffs (products, their
+	// services, Special Ops teams and GitHub repository). Parsed and
+	// validated by service.ParseSpecialistHandoffConfig at startup; empty
+	// hands nothing off.
+	SpecialistHandoffConfig string
+	// SpecialistHandoffGithubTokens is SPECIALIST_HANDOFF_GITHUB_TOKENS, a
+	// secret: one line of JSON mapping a credential name to the GitHub token
+	// that files a specialist handoff's internal issue (ServiceNow's
+	// InternalGitHubIssues REST message), {"wso2-enterprise":"github_pat_..."}.
+	// A product's github.credential picks one, defaulting to its owner.
+	// A credential the map does not name uses GITHUB_TOKEN; with neither, the
+	// handoff still goes through and reports that no issue was filed.
+	// Independent of the change-request sync.
+	SpecialistHandoffGithubTokens string
+
 	// CSMPortalBaseURL builds the link back to a change request in comments
 	// posted to GitHub. Empty omits the link rather than rendering a broken one.
 	CSMPortalBaseURL string
@@ -245,6 +288,12 @@ type Config struct {
 	// (EVENT_HUB_BROKER + EVENT_PUBLISHING_ENABLED) and a database; the
 	// recipient lists below are what actually switch each email on.
 	OutageEventHubTopic string
+	// SREEventHubTopic, when set, is the ONE topic both the change-request
+	// notices and the outage emails publish to (sre-events), overriding
+	// CREventHubTopic and OutageEventHubTopic. csm-notification-service routes
+	// them by event type, as it already does on every topic. Empty keeps the
+	// two separate topics exactly as before.
+	SREEventHubTopic string
 	// OutageNoticePollInterval is the drainer's FALLBACK poll (default 60s).
 	// The emails normally go out about a second after an outage changes: the
 	// drainer LISTENs for migration 0186's NOTIFY. This interval only catches
@@ -379,9 +428,16 @@ type Config struct {
 	// forwarded user token, if present at all, is used only for
 	// attribution (created_by/updated_by), never for scoping.
 	//
-	// Not to be confused with M2MTrustedActorEmails below, which is a
-	// completely different list (acting-user emails an M2M caller may
-	// claim, not client ids).
+	// Also gates AddCaseTagRequest.ActorEmail/CreateCaseCommentRequest.ActorEmail
+	// (internal/handler/case_handler.go): a caller whose x-jwt-assertion
+	// names a client id in this same set may claim ANY actorEmail as the
+	// acting user for a tag/comment write -- the same "M2MClientIDs wins
+	// outright, unconditionally" trust this list already carries for
+	// scoping. This used to be a second, separate email-based allowlist
+	// (M2M_TRUSTED_ACTOR_EMAILS), replaced in favor of one list to keep
+	// trusted internal callers in: a caller already trusted to bypass RLS
+	// entirely needs no second, narrower list just to claim a comment/tag
+	// author.
 	//
 	// This is deliberately NOT where apps/csm-portal/backend or
 	// apps/customer-portal/backend-v2 belong, even though both are
@@ -439,14 +495,6 @@ type Config struct {
 	SalesEntityClientID     string
 	SalesEntityClientSecret string
 	SalesEntityScopes       string
-	// M2MTrustedActorEmails is the allowlist of service-account emails an
-	// M2M caller (no x-user-id-token, e.g. UMT via csm-integration-service)
-	// may claim as the acting user via AddCaseTagRequest.ActorEmail. An
-	// unset/empty var means no email is trusted and every such request is
-	// rejected -- this is deliberately not a default-open list, since it
-	// exists specifically to stop an M2M caller from spoofing an arbitrary
-	// actor. Compared case-insensitively in the handler.
-	M2MTrustedActorEmails []string
 
 	// Escalation* configure the fixed, deployment-specific notification
 	// recipient GROUPS EscalationService.CreateEscalation (Postgres data
@@ -481,12 +529,64 @@ type Config struct {
 	EscalationEL4CCOGroupID            string
 	EscalationEL4CROGroupID            string
 	EscalationEL5CEOGroupID            string
+
+	// RedisURL/RedisAddr/RedisPassword configure the optional user cache in
+	// front of GET /users/{id} and GET /users/me (internal/cache), with the
+	// same convention as integrations/csm-notification-service: RedisURL is a
+	// rediss://:<password>@<host>:<port> connection string for a managed,
+	// TLS-only Redis (Azure Managed Redis) and takes priority; RedisAddr/
+	// RedisPassword are the plain, non-TLS pair for a local Redis. Neither set
+	// means no cache: every read goes to Postgres, as before.
+	//
+	// The client is a plain redis.NewClient, so the target must be a
+	// non-clustered Redis or one under the "Enterprise" clustering policy, not
+	// "OSS Cluster".
+	RedisURL      string
+	RedisAddr     string
+	RedisPassword string
+	// UserCacheTTL bounds how long a cached user survives without an
+	// invalidation (USER_CACHE_TTL, default 10m). Every writer of user, role
+	// and membership data invalidates the affected user after it commits, so
+	// this is the backstop for a missed invalidation, not the main freshness
+	// mechanism.
+	UserCacheTTL time.Duration
+	// ServerReadTimeout and ServerWriteTimeout are the main API server's
+	// http.Server ReadTimeout/WriteTimeout (SERVER_READ_TIMEOUT,
+	// SERVER_WRITE_TIMEOUT). The health server keeps its own fixed timeouts.
+	ServerReadTimeout  time.Duration
+	ServerWriteTimeout time.Duration
+	// RequestTimeout cancels each request's context (REQUEST_TIMEOUT).
+	// Keeping it shorter than ServerWriteTimeout lets the handler write a
+	// clean error, but this is not enforced.
+	RequestTimeout time.Duration
+	// UpstreamClientTimeout is the data-source HTTP client timeout
+	// (UPSTREAM_CLIENT_TIMEOUT).
+	UpstreamClientTimeout time.Duration
+
+	// loadErr records the first unparsable environment value seen by Load,
+	// which has no error return. Validate reports it.
+	loadErr error
 }
 
 // Load reads configuration from environment variables and returns a populated
 // Config. Missing variables fall back to sensible defaults; callers should
 // validate required fields (e.g. DBUser, DBPassword, DBName) before use.
 func Load() *Config {
+	var loadErr error
+	duration := func(key string, def time.Duration) time.Duration {
+		d, err := getDurationOrDefault(key, def)
+		if err != nil && loadErr == nil {
+			loadErr = err
+		}
+		return d
+	}
+	intVal := func(key string, def int32, allowZero bool) int32 {
+		n, err := getInt32OrDefault(key, def, allowZero)
+		if err != nil && loadErr == nil {
+			loadErr = err
+		}
+		return n
+	}
 	cfg := &Config{
 		DBHost:                                   getEnvOrDefault("DB_HOST", "localhost"),
 		DBPort:                                   getEnvOrDefault("DB_PORT", "5432"),
@@ -496,6 +596,10 @@ func Load() *Config {
 		DBName:                                   os.Getenv("DB_NAME"),
 		DBSSLMode:                                os.Getenv("DB_SSLMODE"),
 		DBSchema:                                 os.Getenv("DB_SCHEMA"),
+		DBPoolMaxConns:                           intVal("DB_POOL_MAX_CONNS", 20, false),
+		DBPoolMinConns:                           intVal("DB_POOL_MIN_CONNS", 2, true),
+		DBPoolMaxConnLifetime:                    duration("DB_POOL_MAX_CONN_LIFETIME", 30*time.Minute),
+		DBPoolMaxConnIdleTime:                    duration("DB_POOL_MAX_CONN_IDLE_TIME", 5*time.Minute),
 		ServerPort:                               getEnvOrDefault("SERVER_PORT", "8080"),
 		HealthPort:                               getEnvOrDefault("HEALTH_PORT", "8081"),
 		DataSource:                               DataSource(getEnvOrDefault("DATA_SOURCE", string(DataSourcePostgres))),
@@ -514,6 +618,8 @@ func Load() *Config {
 		GithubIntegrationLogin:                   os.Getenv("GITHUB_INTEGRATION_LOGIN"),
 		GithubOutboundInterval:                   envDuration("GITHUB_OUTBOUND_INTERVAL", 15*time.Second),
 		CSMPortalBaseURL:                         os.Getenv("CSM_PORTAL_BASE_URL"),
+		SpecialistHandoffConfig:                  os.Getenv("SPECIALIST_HANDOFF_CONFIG"),
+		SpecialistHandoffGithubTokens:            os.Getenv("SPECIALIST_HANDOFF_GITHUB_TOKENS"),
 		GithubLabelTypeIncident:                  os.Getenv("GITHUB_LABEL_TYPE_INCIDENT"),
 		GithubLabelTypeServiceRequest:            os.Getenv("GITHUB_LABEL_TYPE_SERVICE_REQUEST"),
 		GithubLabelsClass:                        os.Getenv("GITHUB_LABELS_CLASS"),
@@ -526,6 +632,7 @@ func Load() *Config {
 		ProjectEventHubTopic:                          getEnvOrDefault("PROJECT_EVENT_HUB_TOPIC", "project-events"),
 		CRNoticePollInterval:                          envDuration("CR_NOTICE_POLL_INTERVAL", 5*time.Second),
 		OutageEventHubTopic:                           getEnvOrDefault("OUTAGE_EVENT_HUB_TOPIC", "outage-events"),
+		SREEventHubTopic:                              strings.TrimSpace(os.Getenv("SRE_EVENT_HUB_TOPIC")),
 		OutageNoticePollInterval:                      envDuration("OUTAGE_NOTICE_POLL_INTERVAL", 60*time.Second),
 		OutageNotificationRecipients:                  splitComma(os.Getenv("OUTAGE_NOTIFICATION_RECIPIENTS")),
 		OutageCommunicationRecipients:                 splitComma(os.Getenv("OUTAGE_COMMUNICATION_RECIPIENTS")),
@@ -551,7 +658,6 @@ func Load() *Config {
 		SalesEntityClientSecret:                       os.Getenv("SALES_ENTITY_CLIENT_SECRET"),
 		SalesEntityScopes:                             os.Getenv("SALES_ENTITY_SCOPES"),
 		CSMMigrationMembershipRegistrationEnabled:     os.Getenv("CSM_MIGRATION_MEMBERSHIP_REGISTRATION_ENABLED") == "true",
-		M2MTrustedActorEmails:                         splitComma(os.Getenv("M2M_TRUSTED_ACTOR_EMAILS")),
 		EscalationEL1AmericasTLGroupID:                os.Getenv("ESCALATION_EL1_AMERICAS_TL_GROUP_ID"),
 		EscalationEL2AmericasTUGroupID:                os.Getenv("ESCALATION_EL2_AMERICAS_TU_GROUP_ID"),
 		EscalationEL2ServiceProductGroupID:            os.Getenv("ESCALATION_EL2_SERVICE_PRODUCT_GROUP_ID"),
@@ -561,6 +667,11 @@ func Load() *Config {
 		EscalationEL4CCOGroupID:                       os.Getenv("ESCALATION_EL4_CCO_GROUP_ID"),
 		EscalationEL4CROGroupID:                       os.Getenv("ESCALATION_EL4_CRO_GROUP_ID"),
 		EscalationEL5CEOGroupID:                       os.Getenv("ESCALATION_EL5_CEO_GROUP_ID"),
+		ServerReadTimeout:                             duration("SERVER_READ_TIMEOUT", DefaultServerReadTimeout),
+		ServerWriteTimeout:                            duration("SERVER_WRITE_TIMEOUT", DefaultServerWriteTimeout),
+		RequestTimeout:                                duration("REQUEST_TIMEOUT", DefaultRequestTimeout),
+		UpstreamClientTimeout:                         duration("UPSTREAM_CLIENT_TIMEOUT", DefaultUpstreamClientTimeout),
+		loadErr:                                       loadErr,
 	}
 	cfg.M2MClientIDs = ParseInternalClientIDs(cfg.M2MClientIDsRaw)
 	if cfg.CustomerPortalBackendClientID != "" && cfg.M2MClientIDs[cfg.CustomerPortalBackendClientID] {
@@ -578,7 +689,18 @@ func Load() *Config {
 	cfg.CSMMigrationSalesforcePartnerIngestEnabled = os.Getenv("CSM_MIGRATION_SALESFORCE_PARTNER_INGEST_ENABLED") == "true"
 	cfg.CSMMigrationCustomerEngagementIngestEnabled = os.Getenv("CSM_MIGRATION_CUSTOMER_ENGAGEMENT_INGEST_ENABLED") == "true"
 	cfg.CustomerEngagementFirefightingTypeID = strings.TrimSpace(os.Getenv("CUSTOMER_ENGAGEMENT_FIREFIGHTING_TYPE_ID"))
+	cfg.RedisURL = strings.TrimSpace(os.Getenv("REDIS_URL"))
+	cfg.RedisAddr = strings.TrimSpace(os.Getenv("REDIS_ADDR"))
+	cfg.RedisPassword = os.Getenv("REDIS_PASSWORD")
+	cfg.UserCacheTTL = envDuration("USER_CACHE_TTL", 10*time.Minute)
+	cfg.applySREEventHubTopic()
 	return cfg
+}
+
+// HasRedis reports whether a Redis connection is configured, which turns on
+// the user cache. Either REDIS_URL or REDIS_ADDR is enough.
+func (c *Config) HasRedis() bool {
+	return c.RedisURL != "" || c.RedisAddr != ""
 }
 
 // ParseInternalClientIDs parses a comma-separated client id list (M2M_CLIENT_IDS)
@@ -591,6 +713,48 @@ func ParseInternalClientIDs(raw string) map[string]bool {
 		out[id] = true
 	}
 	return out
+}
+
+// getDurationOrDefault parses key as a Go duration string (e.g. "60s"). An
+// unset or empty value yields defaultVal; an unparsable one is an error.
+func getDurationOrDefault(key string, defaultVal time.Duration) (time.Duration, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultVal, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return defaultVal, fmt.Errorf("invalid %s %q: %w", key, v, err)
+	}
+	return d, nil
+}
+
+// getInt32OrDefault parses key as a base-10 integer. An unset/empty value
+// yields defaultVal; a non-numeric one is an error (and also falls back to
+// defaultVal) -- same fail-safe-to-default posture as an unparseable
+// duration (see getDurationOrDefault) rather than passing a bad value
+// through. allowZero distinguishes DB_POOL_MIN_CONNS (pgxpool genuinely
+// accepts 0 -- a deployment that doesn't want to retain any idle
+// connections at all) from DB_POOL_MAX_CONNS (0 or negative would
+// misconfigure pgxpool outright, since a pool that may open no connections
+// at all can never serve a single query).
+func getInt32OrDefault(key string, defaultVal int32, allowZero bool) (int32, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultVal, nil
+	}
+	n, err := strconv.ParseInt(v, 10, 32)
+	if err != nil {
+		return defaultVal, fmt.Errorf("invalid %s %q: %w", key, v, err)
+	}
+	if n < 0 || (n == 0 && !allowZero) {
+		want := "a positive integer"
+		if allowZero {
+			want = "a non-negative integer"
+		}
+		return defaultVal, fmt.Errorf("invalid %s %q: must be %s", key, v, want)
+	}
+	return int32(n), nil
 }
 
 func getEnvOrDefault(key, defaultVal string) string {
@@ -659,9 +823,26 @@ func (c *Config) HasDatabase() bool {
 // partially set in either mode, if
 // SERVICENOW_INTEGRATION_SERVICE_BASE_URL is missing when
 // DATA_SOURCE=servicenow, if EVENT_HUB_BROKER/EVENT_HUB_CONNECTION_STRING/
-// EVENT_HUB_TOPIC are only partially set, or if the SALES_ENTITY_* vars are
-// only partially set.
+// EVENT_HUB_TOPIC are only partially set, if the SALES_ENTITY_* vars are
+// only partially set, or if SERVER_READ_TIMEOUT/SERVER_WRITE_TIMEOUT/
+// REQUEST_TIMEOUT/UPSTREAM_CLIENT_TIMEOUT are unparsable or not positive.
 func (c *Config) Validate() error {
+	if c.loadErr != nil {
+		return c.loadErr
+	}
+	for _, t := range []struct {
+		name string
+		val  time.Duration
+	}{
+		{"SERVER_READ_TIMEOUT", c.ServerReadTimeout},
+		{"SERVER_WRITE_TIMEOUT", c.ServerWriteTimeout},
+		{"REQUEST_TIMEOUT", c.RequestTimeout},
+		{"UPSTREAM_CLIENT_TIMEOUT", c.UpstreamClientTimeout},
+	} {
+		if t.val <= 0 {
+			return fmt.Errorf("%s must be greater than 0, got %s", t.name, t.val)
+		}
+	}
 	// The health server is a separate listener precisely so that only its
 	// own routes are reachable at public visibility (see HealthPort). Two
 	// listeners cannot share a port: the second ListenAndServe would fail
@@ -811,6 +992,14 @@ func (c *Config) Validate() error {
 	}
 	if v := c.CustomerEngagementFirefightingTypeID; v != "" && !isSysID(v) {
 		return fmt.Errorf("CUSTOMER_ENGAGEMENT_FIREFIGHTING_TYPE_ID must be a 32-character hex sys_id")
+	}
+	// The URL carries the Redis password, so neither it nor url.Parse's own
+	// error (which quotes its input) may appear in this message.
+	if c.RedisURL != "" {
+		u, err := url.Parse(c.RedisURL)
+		if err != nil || (u.Scheme != "redis" && u.Scheme != "rediss") || u.Host == "" {
+			return fmt.Errorf("REDIS_URL must be a redis:// or rediss:// connection string with a host")
+		}
 	}
 	return nil
 }
@@ -969,4 +1158,15 @@ func envDurationOrOff(key string, def time.Duration) time.Duration {
 		return 0
 	}
 	return d
+}
+
+// applySREEventHubTopic points both operations publishers at SRE_EVENT_HUB_TOPIC
+// when it is set. Done once here so every reader of CREventHubTopic and
+// OutageEventHubTopic -- the publishers and their startup log lines -- agrees.
+func (c *Config) applySREEventHubTopic() {
+	if c.SREEventHubTopic == "" {
+		return
+	}
+	c.CREventHubTopic = c.SREEventHubTopic
+	c.OutageEventHubTopic = c.SREEventHubTopic
 }

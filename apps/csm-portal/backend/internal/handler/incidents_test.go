@@ -22,6 +22,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/apierror"
 )
 
 func TestSearchIncidents(t *testing.T) {
@@ -772,15 +774,46 @@ func TestHandOffIncidentToSpecialist(t *testing.T) {
 		assertContentType(t, w, "application/json")
 	})
 
-	t.Run("rejects unknown escalationTeam", func(t *testing.T) {
+	t.Run("forwards any team key: the entity service's config decides", func(t *testing.T) {
+		var forwarded string
+		h := NewIncidentHandler(&mockEntityIncidentClient{
+			handOffIncidentFn: func(_ context.Context, _ string, body []byte) ([]byte, error) {
+				forwarded = string(body)
+				return []byte(`{"message":"ok","handoff":{}}`), nil
+			},
+		})
+		const body = `{"reasonCode":"no-runbook","escalationTeam":"choreo-special-ops"}`
+		r := withUser(httptest.NewRequest(http.MethodPost, "/incidents/"+incidentID+"/specialist-handoffs", strings.NewReader(body)))
+		r.SetPathValue("id", incidentID)
+		w := httptest.NewRecorder()
+		h.HandOffIncidentToSpecialist(w, r)
+		assertStatus(t, w, http.StatusOK)
+		if forwarded != body {
+			t.Errorf("forwarded %s, want %s", forwarded, body)
+		}
+	})
+
+	t.Run("rejects an escalationTeam longer than a team key", func(t *testing.T) {
 		h := NewIncidentHandler(&mockEntityIncidentClient{})
-		r := withUser(httptest.NewRequest(http.MethodPost, "/incidents/"+incidentID+"/specialist-handoffs", strings.NewReader(`{"reasonCode":"no-runbook","escalationTeam":"some-other-team"}`)))
+		r := withUser(httptest.NewRequest(http.MethodPost, "/incidents/"+incidentID+"/specialist-handoffs", strings.NewReader(`{"reasonCode":"no-runbook","escalationTeam":"`+strings.Repeat("x", 65)+`"}`)))
 		r.SetPathValue("id", incidentID)
 		w := httptest.NewRecorder()
 		h.HandOffIncidentToSpecialist(w, r)
 		assertStatus(t, w, http.StatusBadRequest)
 		assertErrorMessage(t, w, ErrMsgBadRequest)
-		assertContentType(t, w, "application/json")
+	})
+
+	t.Run("relays the entity service's 400 for a team the product does not have", func(t *testing.T) {
+		h := NewIncidentHandler(&mockEntityIncidentClient{
+			handOffIncidentFn: func(context.Context, string, []byte) ([]byte, error) {
+				return nil, &apierror.Error{StatusCode: http.StatusBadRequest, Body: `{"message":"invalid escalationTeam for a Choreo incident: x (one of choreo-special-ops, choreo-runtime-team, choreo-apim-team)"}`}
+			},
+		})
+		r := withUser(httptest.NewRequest(http.MethodPost, "/incidents/"+incidentID+"/specialist-handoffs", strings.NewReader(`{"reasonCode":"no-runbook","escalationTeam":"x"}`)))
+		r.SetPathValue("id", incidentID)
+		w := httptest.NewRecorder()
+		h.HandOffIncidentToSpecialist(w, r)
+		assertStatus(t, w, http.StatusBadRequest)
 	})
 
 	t.Run("accepts a body with reasonCode only", func(t *testing.T) {
@@ -932,4 +965,38 @@ func TestIncidentLifecycle_WithoutSubcategory(t *testing.T) {
 			t.Errorf("request %d carries a subcategory: %s", i, forwarded[i])
 		}
 	}
+}
+
+func TestListSpecialistHandoffTeams(t *testing.T) {
+	t.Run("requires authenticated user", func(t *testing.T) {
+		h := NewIncidentHandler(&mockEntityIncidentClient{})
+		w := httptest.NewRecorder()
+		h.ListSpecialistHandoffTeams(w, httptest.NewRequest(http.MethodGet, "/specialist-handoff-teams", nil))
+		assertStatus(t, w, http.StatusUnauthorized)
+	})
+
+	t.Run("passes the service and the entity service's teams through", func(t *testing.T) {
+		const body = `{"teams":[{"key":"choreo-apim-team","label":"Choreo APIM Team"}]}`
+		const service = "b9c999f8-1b86-a010-00ae-86acdd4bcb61"
+		var gotService string
+		h := NewIncidentHandler(&mockEntityIncidentClient{
+			listSpecialistHandoffTeamsFn: func(_ context.Context, serviceID string) ([]byte, error) {
+				gotService = serviceID
+				return []byte(body), nil
+			},
+		})
+		w := httptest.NewRecorder()
+		h.ListSpecialistHandoffTeams(w, withUser(httptest.NewRequest(http.MethodGet, "/specialist-handoff-teams?serviceId="+service, nil)))
+		assertStatus(t, w, http.StatusOK)
+		if got := strings.TrimSpace(w.Body.String()); got != body || gotService != service {
+			t.Errorf("body %s service %q, want %s for %s", got, gotService, body, service)
+		}
+	})
+
+	t.Run("rejects a malformed serviceId", func(t *testing.T) {
+		h := NewIncidentHandler(&mockEntityIncidentClient{})
+		w := httptest.NewRecorder()
+		h.ListSpecialistHandoffTeams(w, withUser(httptest.NewRequest(http.MethodGet, "/specialist-handoff-teams?serviceId=choreo", nil)))
+		assertStatus(t, w, http.StatusBadRequest)
+	})
 }

@@ -181,6 +181,11 @@ func (h *UserHandler) GetUsersByIDs(w http.ResponseWriter, r *http.Request) {
 	if !decodeRequest(w, r, &req) {
 		return
 	}
+	if len(req.IDs) == 0 {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(domain.GetUsersByIDsResponse{})
+		return
+	}
 	resp, err := h.svc.GetUsersByIDs(r.Context(), req.IDs)
 	if err != nil {
 		writeServiceError(w, r, err)

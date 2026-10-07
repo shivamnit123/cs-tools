@@ -18,6 +18,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -68,6 +69,13 @@ func TestIncidentService_CreateIncidentPortal_PassesDerivedFieldsAndPublishes(t 
 			resp.Incident.ID = "66666666-6666-6666-6666-666666666666"
 			return resp, nil
 		},
+		// The publish this path makes is the enriched one, which reads the incident back to fill
+		// the escalation fields the ladder routes on (and panics on the bare stub without this).
+		getIncidentByID: func(_ context.Context, id string) (domain.IncidentView, error) {
+			v := newTestIncidentView(id)
+			v.AssignmentGroup = &domain.EntityRef{ID: "88888888-8888-8888-8888-888888888888", Name: "SRE - Apollo"}
+			return v, nil
+		},
 	}
 	publisher := &mockEventPublisher{}
 	svc := NewIncidentService(repo, publisher)
@@ -99,7 +107,16 @@ func TestIncidentService_CreateIncidentPortal_PassesDerivedFieldsAndPublishes(t 
 		t.Errorf("configurationItemId not passed through to the repository")
 	}
 	if len(publisher.calls) != 1 || publisher.calls[0].eventType != events.TypeIncidentCreated || publisher.calls[0].entityID != "66666666-6666-6666-6666-666666666666" {
-		t.Errorf("expected one incident.created publish for the new id, got %+v", publisher.calls)
+		t.Fatalf("expected one incident.created publish for the new id, got %+v", publisher.calls)
+	}
+	// The call-escalation ladders route on the assignment group, so the Postgres create's event
+	// must carry it, read back from the incident it just stored.
+	var payload events.IncidentCreatedPayload
+	if err := json.Unmarshal(publisher.calls[0].payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Team != "SRE - Apollo" {
+		t.Errorf("incident.created team = %q, want the stored assignment group", payload.Team)
 	}
 }
 

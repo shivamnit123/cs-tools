@@ -65,7 +65,9 @@ vi.mock("@api/useSearchConfigurationItems", () => ({ useSearchConfigurationItems
 vi.mock("@api/useSearchUsersByName", () => ({ useSearchInternalUsersByName: emptySearch }));
 // AsyncEntitySelect is a full type-ahead Autocomplete; stub it as a plain
 // labeled input that reports its id straight through onChange, same as
-// CreateProblemPage.test.tsx.
+// CreateProblemPage.test.tsx. The Service field also hands back the picked
+// service, with a support group, as the real one does.
+const SUPPORT_GROUP = { id: "33333333-3333-4333-8333-333333333333", name: "MS/PC SRE Group" };
 vi.mock("@components/AsyncEntitySelect", () => ({
   default: ({
     label,
@@ -74,9 +76,17 @@ vi.mock("@components/AsyncEntitySelect", () => ({
   }: {
     label: string;
     value: string;
-    onChange: (next: string) => void;
+    onChange: (next: string, item?: unknown) => void;
   }) => (
-    <input aria-label={label} value={value} onChange={(e) => onChange(e.target.value)} />
+    <input
+      aria-label={label}
+      value={value}
+      onChange={(e) =>
+        label === "Service"
+          ? onChange(e.target.value, { id: e.target.value, supportGroup: SUPPORT_GROUP })
+          : onChange(e.target.value)
+      }
+    />
   ),
 }));
 vi.mock("@components/AsyncEntityMultiSelect", () => ({
@@ -198,5 +208,25 @@ describe("CreateIncidentPage channel", () => {
 
     pickOption(/^channel/i, "Phone");
     expect(submitButton()).not.toBeDisabled();
+  });
+});
+
+describe("CreateIncidentPage assignment group", () => {
+  beforeEach(() => {
+    postIncidentMutateMock.mockReset();
+  });
+
+  // The backend sets the group from the service; the form only previews it.
+  // Sending it too would be a second way to set the same thing, and the
+  // backend refuses a create that does.
+  it("shows the service's support group but never sends an assignmentGroupId", () => {
+    render(<CreateIncidentPage />);
+    fillRequiredFields();
+
+    expect(screen.getByLabelText("Assignment group")).toHaveValue(SUPPORT_GROUP.name);
+    fireEvent.click(submitButton());
+
+    expect(postIncidentMutateMock).toHaveBeenCalledTimes(1);
+    expect(postIncidentMutateMock.mock.calls[0][0]).not.toHaveProperty("assignmentGroupId");
   });
 });

@@ -31,6 +31,8 @@ import {
   TZ2_WE,
   RND,
   TZ1_L1,
+  MOE_DAY,
+  MOE_NIGHT,
   absence,
   assignment,
   scopeControls,
@@ -417,5 +419,69 @@ describe("MonthRoster: a window around a day", () => {
     expect(heads[0].querySelector(".d")?.textContent).toBe("14");
     expect(heads[0].querySelector(".mo")).not.toBeNull();
     expect(heads[heads.length - 1].querySelector(".d")?.textContent).toBe("12");
+  });
+});
+
+describe("MonthRoster: an SME rotation", () => {
+  const smeProps = {
+    assignments: [
+      assignment({ name: "Moesif01", rotaDate: "2026-09-21", shiftCode: MOE_DAY.code, zoneCode: "MOE_D", tier: "L1", teamKey: "moesif" }),
+      assignment({ name: "Moesif02", rotaDate: "2026-09-21", shiftCode: MOE_NIGHT.code, zoneCode: "MOE_N", tier: "L2", teamKey: "moesif" }),
+    ],
+    shifts: shiftMap(MOE_DAY, MOE_NIGHT),
+    family: "SME" as const,
+    teams: ["moesif"],
+    families: ["SME"] as const,
+  };
+
+  it("splits each day into its Day and Night, on weekdays and at the weekend alike", () => {
+    const { container } = renderRoster(smeProps);
+    const heads = [...container.querySelectorAll("tr.zrow th.zc")].map((th) => th.textContent);
+    expect(heads.slice(0, 2)).toEqual(["Day", "Night"]);
+    // A rotation runs the same shape every day: a Saturday has both too.
+    expect(heads.filter((h) => h === "Day").length).toBe(heads.filter((h) => h === "Night").length);
+    expect(heads.length).toBeGreaterThanOrEqual(14);
+  });
+
+  it("does not split a CRE day even when an SME window is in the catalogue", () => {
+    const { container } = renderRoster({ shifts: shiftMap(REGULAR, EVENING, MOE_DAY, MOE_NIGHT) });
+    expect(container.querySelector("tr.zrow")).toBeNull();
+  });
+});
+
+describe("MonthRoster: every SME rota at once (All teams)", () => {
+  const ASG_DAY = { ...MOE_DAY, code: "SME_ASG_DAY", label: "Asgardeo day escalation", zoneCode: "ASG_D", startMinute: 570, endMinute: 1110 };
+  const ASG_NIGHT = { ...MOE_NIGHT, code: "SME_ASG_NIGHT", label: "Asgardeo night escalation", zoneCode: "ASG_N", startMinute: 1110, endMinute: 2010 };
+  const props = {
+    assignments: [
+      assignment({ name: "Moesif01", rotaDate: "2026-09-21", shiftCode: MOE_DAY.code, zoneCode: "MOE_D", tier: "L1", teamKey: "moesif" }),
+      assignment({ name: "Asgardeo01", rotaDate: "2026-09-21", shiftCode: ASG_NIGHT.code, zoneCode: "ASG_N", tier: "L2", teamKey: "asgardeo" }),
+    ],
+    shifts: shiftMap(MOE_DAY, MOE_NIGHT, ASG_DAY, ASG_NIGHT),
+    family: "SME" as const,
+    teams: ["asgardeo", "moesif"],
+    families: ["SME"] as const,
+  };
+
+  it("keeps one Day and one Night column a day, shared by the rotas", () => {
+    const { container } = renderRoster(props);
+    const heads = [...container.querySelectorAll("tr.zrow th.zc")].map((th) => th.textContent);
+    expect(heads.slice(0, 4)).toEqual(["Day", "Night", "Day", "Night"]);
+  });
+
+  it("shows every rota's people, each turn in its own column", () => {
+    renderRoster(props);
+    expect(screen.getByText("Moesif01")).toBeInTheDocument();
+    expect(screen.getByText("Asgardeo01")).toBeInTheDocument();
+  });
+
+  it("hands a lead's click the engineer's own rota's zone, not the column's name", () => {
+    const onEditCell = vi.fn();
+    const ZONES_BY_TEAM: Record<string, string> = { "moesif|Day": "MOE_D", "moesif|Night": "MOE_N", "asgardeo|Day": "ASG_D", "asgardeo|Night": "ASG_N" };
+    const zoneCodeFor = (teamKey: string, column: string) => ZONES_BY_TEAM[`${teamKey}|${column}`];
+    const { container } = renderRoster({ ...props, leadTeams: ["asgardeo"], editing: true, onEditCell, zoneCodeFor });
+    const cell = container.querySelector("td.z.editable") as HTMLElement;
+    fireEvent.click(cell);
+    expect(onEditCell).toHaveBeenCalledWith(expect.objectContaining({ teamKey: "asgardeo", zoneCode: "ASG_D" }));
   });
 });

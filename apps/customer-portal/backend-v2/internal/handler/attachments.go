@@ -19,6 +19,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 
@@ -40,41 +41,106 @@ type entityAttachmentClient interface {
 	// and DeleteAttachment's closed-case guard — this handler serves no case
 	// route of its own (see caseIsClosed in cases.go).
 	GetCase(ctx context.Context, id string) (entity.CaseView, error)
+	// SearchDeployments backs authorizeAttachmentAccess's deployment branch
+	// (see deploymentAttachmentIsVisible below).
+	SearchDeployments(ctx context.Context, req entity.SearchDeploymentsRequest) (entity.SearchDeploymentsResponse, error)
 }
 
-// authorizeAttachmentAccess verifies the caller may see attachment's
-// underlying case before GetAttachmentContent/GetAttachment/DeleteAttachment
-// act on it, and returns that case so DeleteAttachment's own closed-case
-// guard can reuse it instead of a second lookup. None of those three routes
-// is nested under a project/case path, so unlike every other authorization
-// check in this backend there is no path segment to trust — the attachment's
-// own opaque UUID is the only thing identifying the resource, and without
-// this check any authenticated caller could read or delete any other
-// customer's attachment just by guessing or observing its id.
+// deploymentAttachmentIsVisible reports whether deploymentID is visible to
+// the calling user, the same way DeploymentHandler.deploymentBelongsToProject
+// does: entity-service's SearchDeployments is evaluated under the caller's
+// own row-level-security scope (deployment has RLS, migration 0176), so a
+// result actually matching deploymentID already proves access — no second
+// project lookup needed. Unlike deploymentBelongsToProject, this doesn't need
+// to know the project up front: SearchDeployments' ids filter (entity-service's
+// SearchDeploymentsRequest.IDs) resolves the single deployment directly, which
+// is all an attachment's own ReferenceID ever carries.
 //
-// Deliberately does NOT gate on attachment.ReferenceType, even though it
-// looks like the obvious discriminator: entity-service's own SN-backed
-// GetAttachmentByID doc comment says it is left nil unconditionally ("the
-// upstream attachment-details response carries no reference type... callers
-// must fail closed on it") — attachments are SN-backed in the live
-// deployment today, so gating on ReferenceType would deny every attachment
-// unconditionally, not just the unauthorized ones.
+// Checks each returned DeploymentView.ID against deploymentID explicitly,
+// rather than trusting a non-empty result alone: the ServiceNow-backed
+// SearchDeployments adapter (snDeploymentService, plain DATA_SOURCE=servicenow)
+// doesn't forward the ids filter at all (see entity-service's own
+// SearchDeploymentsRequest.IDs doc comment — only the Postgres data source
+// applies it), so an unfiltered search could return an unrelated deployment
+// the caller happens to have access to. A bare len(resp.Deployments) > 0
+// check would then authorize against that unrelated deployment instead of
+// the one actually being asked about.
+func deploymentAttachmentIsVisible(ctx context.Context, client entityAttachmentClient, deploymentID string) (bool, error) {
+	resp, err := client.SearchDeployments(ctx, entity.SearchDeploymentsRequest{
+		IDs:        []string{deploymentID},
+		Pagination: entity.Pagination{Limit: 1},
+	})
+	if err != nil {
+		return false, err
+	}
+	for _, deployment := range resp.Deployments {
+		if deployment.ID == deploymentID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// authorizeAttachmentAccess verifies the caller may see an attachment's
+// underlying entity before GetAttachmentContent/GetAttachment/DeleteAttachment
+// act on it, and returns the case view (zero-valued for a non-case reference)
+// so DeleteAttachment's own closed-case guard can reuse it instead of a
+// second lookup. None of those three routes is nested under a project/case
+// path, so unlike every other authorization check in this backend there is
+// no path segment to trust — the attachment's own opaque UUID is the only
+// thing identifying the resource, and without this check any authenticated
+// caller could read or delete any other customer's attachment just by
+// guessing or observing its id.
 //
-// ReferenceID plus a scoped GetCase call is what actually verifies ownership
-// instead: entity-service's GetCase already 404s both a caller outside their
-// project scope AND an id that simply isn't a case at all (e.g. a
-// deployment-referenced attachment's ReferenceID, which never matches a real
-// case) — see entity-service's own CLAUDE.md, "Where this is actually
-// enforced". So this one call closes the IDOR for case attachments and
-// denies every other reference type (deployment, conversation,
-// change_request, incident — none of which has a scoped ownership check
-// anywhere in this codebase yet) in one step, without needing to tell them
-// apart first.
+// Does NOT reliably branch on attachment.ReferenceType — an earlier revision
+// of this function did, and it was wrong in practice, confirmed live: under
+// DATA_SOURCE=postgres-servicenow-dual-write, entity-service's
+// GetAttachmentByID reports ReferenceType "case" when it reads its own
+// Postgres case_attachment table (which hardcodes that value on every row —
+// see that repository method's own doc comment) and reports it nil when it
+// falls back to the ServiceNow mirror, which it always does for a
+// deployment-referenced attachment specifically (case_attachment.case_id has
+// a hard FK into "case", so such a row can never exist there in the first
+// place — see CreateCaseAttachmentFromServiceNow's own doc comment). So
+// ReferenceType is never actually "deployment" on any path this backend can
+// observe, live-dual-write or not.
+//
+// What actually happens here instead: try the case-based check (GetCase)
+// first, since that is the common case and entity-service already scopes it
+// correctly. Only on a 404-shaped failure — which an out-of-scope case and a
+// deployment-referenced attachment's ReferenceID both produce, and this
+// backend cannot tell apart from the response alone — fall back to
+// deploymentAttachmentIsVisible (RLS-scoped SearchDeployments by id, the only
+// other reference type actually reachable from the Deployed tab today).
+// Still fails closed on every type neither check can confirm (conversation/
+// change_request/incident — none of which has a scoped ownership check
+// anywhere in this codebase yet — see entity-service's own CLAUDE.md, "Where
+// this is actually enforced").
 func authorizeAttachmentAccess(ctx context.Context, client entityAttachmentClient, attachment entity.AttachmentDetails) (entity.CaseView, error) {
 	if attachment.ReferenceID == "" {
 		return entity.CaseView{}, &apierror.Error{StatusCode: http.StatusNotFound}
 	}
-	return client.GetCase(ctx, attachment.ReferenceID)
+
+	caseView, err := client.GetCase(ctx, attachment.ReferenceID)
+	if err == nil {
+		return caseView, nil
+	}
+	var apiErr *apierror.Error
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound {
+		return entity.CaseView{}, err
+	}
+
+	visible, derr := deploymentAttachmentIsVisible(ctx, client, attachment.ReferenceID)
+	if derr != nil {
+		return entity.CaseView{}, derr
+	}
+	if !visible {
+		// Neither check resolved it -- report the original GetCase error,
+		// not the deployment one, since GetCase is the common case and its
+		// 404 is the more informative of the two to log/map from.
+		return entity.CaseView{}, err
+	}
+	return entity.CaseView{}, nil
 }
 
 // AttachmentHandler handles HTTP requests for attachment operations.

@@ -268,6 +268,99 @@ This is the server-side half of a two-part fix — `apps/csm-portal/webapp`'s ow
 mitigation (added first, still in place) only ever hid the image *after* the bytes had already
 reached the browser; this is what stops them being sent at all to a caller who shouldn't see them.
 
+## Change request create/patch validation (`internal/handler/change_requests.go`)
+
+`POST /change-requests` and `PATCH /change-requests/{id}` forward their JSON body
+to the entity service as-is (no field allow-list), with two checks on top:
+
+* `POST` requires `type` of `standard`, `normal` or `emergency` (`validateChangeRequestCreateType`).
+* Both accept the creation form's two checkboxes, **`customerApprovalRequired`**
+  and **`customerReviewRequired`**, and refuse (400, "… must be a boolean (true
+  or false)") any value that is not a JSON boolean, `null` included
+  (`validateChangeRequestCustomerGateFlags`). Which transitions they enable, and
+  until when they are editable, is the entity service's call — see its CLAUDE.md,
+  "Customer Approval / Customer Review checkboxes". `PATCH` and `POST` echo the entity service's 400 message (`mapUpstreamError`), so its
+  refusals ("customerApprovalRequired can no longer be changed …", "customer
+  review is required …") reach the form verbatim (`POST` does the same, see below).
+* Both shape-check the customer-scope and journal fields
+  (`validateChangeRequestScopeFields`): `projectId` a UUID string; `deploymentIds`,
+  `deploymentProductIds` arrays of UUID strings (at most 100, `null` is not an
+  array); `category`, `comment`, `workNote` strings; on PATCH `comment`/`workNote`
+  not blank. **`customerGroupId` and `environmentIds` are no longer accepted** —
+  any value, `null` included, is refused at the BFF (no upstream call) with the
+  entity service's own 400 text: `customerGroupId is no longer accepted: the
+  customer group is derived from the customer project's registered contacts` /
+  `environmentIds is no longer supported: deployments carry the environment`.
+  Whether the deployments belong to the project, the deployment products match
+  (they are read-only/derived) and the edit window (only before the change reaches
+  `implement`) are the entity service's call — see its CLAUDE.md, "Customer
+  project, deployments and deployment products".
+* **`POST` now echoes the entity service's 400/409 message too** (`mapUpstreamError`,
+  like `PATCH`): the form has to show "deploymentIds contains a deployment that does
+  not belong to the selected project: …". 5xx and unmapped statuses still map to the
+  generic "Failed to create change request." — upstream internals are never echoed.
+* `POST /change-requests/link-options` (`PermViewOperations`) is the form's lookup:
+  `{projectId, deploymentIds?}` → `{deployments:[{id,name,type}],
+  deploymentProducts, customerContacts:[{id,name,email?}]}`. `projectId` is required
+  (400 "projectId is required"). Project search for the picker is the existing
+  `POST /projects/search`; the Customer Group is not searched or picked — it is the
+  project's registered contacts, returned here as `customerContacts` (read-only).
+  The body and the entity response are passed through untouched.
+* The detail response carries `customerApprovalRequired`/`customerReviewRequired`
+  and `legalNextStates` untouched; the webapp renders `legalNextStates` as-is. It also
+  carries `project`, `deployments`, `deploymentProducts`, `customerContacts` (the
+  derived, read-only Customer Group) and `category`.
+* **Customer Group approvals.** The change's customer group (the project's registered
+  contacts) answers Customer Approval / Customer Review through the approvals
+  (`POST /change-requests/{id}/approvals/decision`), with the stages "Customer
+  Approval" / "Customer Review" in `GET .../approvals` (see the entity service's
+  CLAUDE.md, "Customer Group"). While such a stage is live `legalNextStates` for
+  those states is just `["canceled"]` and a manual `{state: "scheduled"}` /
+  `{state: "closed"}` PATCH is a 400 whose message is echoed verbatim. A
+  non-contact's decision is a 403 whose reason is shown (`mapApprovalDecisionError`
+  already surfaces any 403 reason: `only members of the customer group (the
+  registered contacts of this change request's project) can approve or reject …`).
+  The decision route is `PermWrite` (cs_engineer / admin): registered customer
+  contacts cannot reach it through this BFF. A rejected Customer Approval cancels the change, a
+  rejected Customer Review moves it to `rollback`. No BFF code change was needed;
+  `TestCustomerGroupApprovalMessages` pins both messages.
+* **A stale approval is a 409.** A decision on a stage whose state the change has left
+  (a Review approver once the change is in Customer Review / Closed -- the entity
+  service cancels such rows when the change moves on, and refuses a decision on one it
+  missed; see its CLAUDE.md, "An approval is only actionable in its stage's state") comes
+  back as a **409** `this approval is no longer pending: the change request is in
+  Closed, but the Review stage can only be decided while it is in Review`.
+  `mapApprovalDecisionError` passes the entity service's message through for a **409
+  as well as a 403** on the decision endpoint (a 409 with no readable `message`
+  envelope stays the generic 409); every other endpoint keeps the generic mapping.
+  `TestDecideChangeRequestApproval` pins both ("a 409 carrying the entity service's
+  reason shows it", "... without a readable reason stays generic"). `canDecide` is
+  `false` on such a row, so the portal does not offer the buttons in the first place.
+
+## Opening an approval stage's assignment group (`GET /groups/{id}`)
+
+`GET /change-requests/{id}/approvals` now carries `assignmentGroup: {id, name}` on
+each stage (`null` for Customer Approval / Customer Review, whose approvers are the
+project's registered contacts rather than a group); the response is still passed
+through untouched. `GET /groups/{id}` (`GroupHandler.GetGroup`, `PermView` -- the same
+level as `POST /groups/search` and `POST /users/search`, which already expose staff
+names and emails) forwards to the entity service's `GET /groups/{id}` and returns its
+`{id, name, description, email, manager, members: [{id, name, email, userType, role}],
+total}` untouched.
+
+* `id` is a **group** id (the `assignmentGroup.id` from the approvals response), not a
+  team id -- `POST /groups/search` and `GET /teams/{id}/members` are the team registry.
+  It must be a UUID (400 `ErrMsgInvalidUUID` otherwise, no upstream call).
+* **Internal staff only.** The BFF does not widen it: entity-service refuses an
+  external caller with 403 and the BFF returns that as 403 (`mapUpstreamErrorGeneric`);
+  an unknown group is 404, and a group with no members is a 200 with `members: []`.
+* PostgreSQL data source only (entity-service does not register the route otherwise).
+* Declared in `openapi.yaml` (`/groups/{id}`, `GroupDetail`, and
+  `ChangeRequestApprovalGroup` on `ChangeRequestApproval`), so
+  `TestEveryRegisteredRouteIsInOpenAPI` does not list it. Tests: `TestGetGroup`,
+  `TestGetChangeRequestApprovals_PassesAssignmentGroupThrough` (`groups_test.go`) and
+  `TestGetGroupSendsGetToGroupsID` (`internal/entity/customer_client_test.go`).
+
 ## Health endpoints
 
 Two, registered directly on the mux in `cmd/server/main.go` (not through `route()`) and both exempt
@@ -323,6 +416,8 @@ New upstream services get their own package under `internal/` following the same
 **Notifications (email, Google Chat, and future channels like SMS/voice-Twilio) have moved out of this backend** into `integrations/csm-notification-service`, a standalone Go service invoked over HTTP. This backend no longer constructs or calls any notification client directly, and no longer publishes domain events to Azure Event Hub either — that responsibility (case.created/case.acknowledged/case.severity_changed/incident.created, and the like) now belongs entirely to `entity-service`, the one publisher of the `case-events` topic. This backend previously had its own producer-side pipeline (`internal/eventbus`/`internal/events`/`internal/eventpublisher`, publishing `case.comment_added`/`case.status_changed` from `CaseHandler`) — it was removed entirely to avoid two independent services writing to the same topic. Per-recipient portal-link resolution (which of the customer/CSM portal a given recipient's email lands on) **does not live in this backend** either — it's in `csm-notification-service`'s own `internal/recipientlinks`/`internal/entity`, since that's the service actually composing and sending the email.
 
 **Shared OAuth2 credentials**: `CustomerEntityClient` and `EngineeringEntityClient` (both in `entity`), `updates`, `scim`, and PLG's `internal/plg/entityclient` all authenticate as the same OAuth2 client-credentials app — `cmd/server/main.go` reads `OAUTH2_CLIENT_ID`/`OAUTH2_CLIENT_SECRET`/`OAUTH2_TOKEN_URL` once and passes them into every service's `Config`; only `<SERVICE>_BASE_URL`/`<SERVICE>_SCOPES` are per-service. `EngineeringEntityConfig` still has its own `ClientID`/`ClientSecret`/`TokenURL` fields (matching every other service's `Config` shape), but when it's wired into `main.go` those should be filled with the same shared `oauth2ClientID`/`oauth2ClientSecret`/`oauth2TokenURL` values, not new `ENGINEERING_ENTITY_*` env vars. Follow this pattern for any new upstream service client unless it genuinely uses a different OAuth2 app. PLG is the one client that **inherits** rather than being passed a `Config` per field: `main.go` hands `plg.Mount` a `plgconfig.EntityDefaults` carrying `CUSTOMER_ENTITY_BASE_URL` and the three shared `OAUTH2_*` values, because PLG reaches the same entity-service as `CustomerEntityClient` and a second copy of those settings is one that goes stale on the next secret rotation. `PLG_ENTITY_BASE_URL`/`PLG_ENTITY_OAUTH_*` exist as overrides and are normally unset.
+
+**Request timeouts**: `REST_READ_TIMEOUT` / `REST_WRITE_TIMEOUT` (default 60s) and `ENTITY_SERVICE_TIMEOUT` (default 60s, applied to `CustomerEntityClient` only) are parsed by the pure `loadTimeouts` in `cmd/server/timeouts.go`; all must be > 0, else startup fails; no ordering between them is enforced (client timeout < write timeout is advisable, not required). Defaults were raised from 30s/25s for large inline-attachment uploads. Other upstream clients (engineering, updates, SCIM, notifications, SFTPGo) keep their own fixed timeouts.
 
 ## Running locally
 

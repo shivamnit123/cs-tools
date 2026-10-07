@@ -24,9 +24,8 @@ export interface DiffToken {
  * be unreadable noise (e.g. every edit re-numbers Lexical's internal node
  * keys). Diffing the rendered text is what a reader actually cares about. */
 export function stripHtml(html: string): string {
-  const div = document.createElement("div");
-  div.innerHTML = html;
-  return (div.textContent ?? "").replace(/\s+/g, " ").trim();
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  return (doc.body.textContent ?? "").replace(/\s+/g, " ").trim();
 }
 
 /**

@@ -18,8 +18,10 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -36,11 +38,14 @@ import (
 //
 // IncidentView/SearchIncidentView render State/Priority/Category/Subcategory/
 // ContactType/ResolutionCode as plain, unvalidated strings (per those types'
-// own field comments), so reads need no enum reconciliation against
-// domain.IncidentState/IncidentPriority/etc at all -- the real enum column
-// text is simply passed through. Only the SEARCH FILTER path uses those
-// strict domain enums (SearchIncidentsFilters.Priorities, the generic
-// Filters array's "state"), and three of them have real, easy-to-miss
+// own field comments), and the real enum column text is passed through --
+// except where a label differs from the value the API accepts and the
+// ServiceNow data source returns: state 'CANCELED', resolution code
+// 'SOLVED_WORK_AROUND'/'NOT_ACTIONABLE_ALERT' and contact type 'SITE_24_7'
+// are mapped back on read (incidentStateFromEnum and its siblings), so a
+// client sees the same values in both data sources. The SEARCH FILTER path
+// uses the strict domain enums (SearchIncidentsFilters.Priorities, the
+// generic Filters array's "state"), and three of them have real, easy-to-miss
 // mismatches against their Postgres enum's actual labels:
 //   - incident_state_enum's "canceled" label is spelled with one L
 //     ('CANCELED'), not domain.IncidentStateCancelled's two ("CANCELLED").
@@ -51,20 +56,19 @@ import (
 //
 // See incidentStateToEnum/incidentPriorityToEnum for both mappings.
 //
-// UpdateIncident/HandOffIncidentToSpecialist have no Postgres
-// implementation: UpdateIncident touches several fields with no backing column at all
-// (AssignmentGroupID, ConfigurationItemID, WatchList) alongside ones that do,
-// and would need comment-table side effects for AdditionalComments/WorkNotes
-// -- deferred as a unit rather than half-implemented;
-// HandOffIncidentToSpecialist is an inherently ServiceNow-workflow-specific
-// feature (moves the incident to a specialist group, opens a task, files a
-// GitHub issue) with nothing in this schema to derive an equivalent from.
+// The specialist handoff writes through ApplySpecialistHandoff, and
+// GetIncidentByID derives IncidentView.SpecialistHandoff from its work notes
+// and runbook task (specialistHandoffSummary).
 //
 // CreateIncidentFromServiceNow (below) is the exception, same as
 // CaseRepository.CreateCaseFromServiceNow: it backs
 // DATA_SOURCE=postgres-servicenow-dual-write's SN-first incident creation,
 // where identity comes from ServiceNow rather than being generated here.
 type IncidentRepository interface {
+	// SupportGroupOfService returns the service's support group id, or ""
+	// when the service has none or does not exist. CreateIncident uses it to
+	// derive an incident's assignment group from its service.
+	SupportGroupOfService(ctx context.Context, serviceID string) (string, error)
 	// SearchIncidents returns a filtered, sorted, paginated slice of
 	// incidents together with the total count of matching rows before
 	// pagination. priorities/states are the already-mapped Postgres enum
@@ -105,6 +109,10 @@ type IncidentRepository interface {
 	// method's doc comment), so the caller (incidentService.UpdateIncident)
 	// resolves the actor and passes the email straight through.
 	CreateIncidentComment(ctx context.Context, incidentID string, commentType domain.CommentType, content, createdBy string) (domain.CaseComment, error)
+	// CreateIncidentNotes inserts a work note and/or a public comment on an incident in one
+	// transaction: both are saved or neither is, so a retried request never saves one twice.
+	// nil or blank texts are skipped.
+	CreateIncidentNotes(ctx context.Context, incidentID string, workNotes, additionalComments *string, createdBy string) error
 	// CreateIncidentFromServiceNow inserts a new incident row (both work_item
 	// and "incident"), for DATA_SOURCE=postgres-servicenow-dual-write's SN-first
 	// incident creation (see incidentService.createIncidentSNFirst's own doc
@@ -164,6 +172,48 @@ type IncidentRepository interface {
 	// caller can see, and ValidationError for an unknown assignee/resolver or
 	// a Resolved/Closed target with no resolution code or notes.
 	UpdateIncidentLifecycle(ctx context.Context, id string, u IncidentLifecycleUpdate, actorEmail string) error
+	// ApplySpecialistHandoff hands an incident to a specialist group in one
+	// transaction: it locks the incident, passes its current state to plan
+	// (which applies the eligibility rules and may refuse with an error),
+	// then moves the incident to plan's group, clears its assignee, opens the
+	// runbook task and writes plan's work notes. Returns NotFoundError when
+	// id is not an incident, and ValidationError when the group plan names
+	// is not in this database.
+	ApplySpecialistHandoff(ctx context.Context, id, actorEmail string, plan func(SpecialistHandoffSnapshot) (SpecialistHandoffPlan, error)) (SpecialistHandoffWritten, error)
+}
+
+// SpecialistHandoffSnapshot is the incident as ApplySpecialistHandoff found it,
+// locked, before the handoff. State is the incident_state_enum label.
+type SpecialistHandoffSnapshot struct {
+	IncidentID          string
+	Number              string
+	Subject             string
+	Description         *string
+	State               string
+	ServiceID           *string
+	AssignmentGroupID   *string
+	AssignmentGroupName *string
+}
+
+// SpecialistHandoffPlan is what a handoff writes: the group the incident
+// moves to, the runbook task, and the work notes, in order.
+type SpecialistHandoffPlan struct {
+	GroupID     string
+	TaskSubject string
+	// TaskGroupID is the runbook task's assignment group -- the Special Ops
+	// group itself, which owns the runbooks now. Nil, or a group not in this
+	// database, leaves the task unassigned rather than failing the handoff,
+	// as IncidentReportTx.CreateIncidentTask does.
+	TaskGroupID *string
+	WorkNotes   []string
+}
+
+// SpecialistHandoffWritten is what ApplySpecialistHandoff committed.
+type SpecialistHandoffWritten struct {
+	Before     SpecialistHandoffSnapshot
+	GroupName  string
+	TaskID     string
+	TaskNumber string
 }
 
 // IncidentLifecycleUpdate is UpdateIncidentLifecycle's input. Every field is
@@ -178,6 +228,9 @@ type IncidentRepository interface {
 // Closed need a resolution code and resolution notes, taken from the request
 // or already on the record. Entering Resolved stamps resolved_on, and
 // resolved_by_id from ResolvedByID, falling back to DefaultResolvedByID.
+// Entering Closed or Canceled also closes the incident's open incident tasks,
+// as ServiceNow's "Cascade closure of Incident Tasks" does (see
+// cascadeIncidentTaskClosure).
 type IncidentLifecycleUpdate struct {
 	State               *string // incident_state_enum label
 	AssignedEngineerID  *string
@@ -185,10 +238,28 @@ type IncidentLifecycleUpdate struct {
 	ResolutionNotes     *string // incident.close_notes
 	ResolvedByID        *string
 	DefaultResolvedByID *string // the acting user, used only when entering Resolved without ResolvedByID
+
+	// WorkNotes and AdditionalComments are written as comment rows in the same transaction as the
+	// state change, so a failed note leaves the state change unsaved too. Nil or blank writes nothing.
+	WorkNotes          *string
+	AdditionalComments *string
 }
 
 type incidentRepo struct {
 	db *Scoped
+}
+
+// SupportGroupOfService implements IncidentRepository.
+func (r *incidentRepo) SupportGroupOfService(ctx context.Context, serviceID string) (string, error) {
+	var group *string
+	err := r.db.QueryRow(ctx, `SELECT support_group_id::text FROM service WHERE id = $1::uuid`, serviceID).Scan(&group)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && group == nil) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read support group of service %s: %w", serviceID, err)
+	}
+	return *group, nil
 }
 
 // NewIncidentRepository constructs an IncidentRepository backed by the given connection pool.
@@ -315,7 +386,7 @@ func scanSearchIncidentView(row interface{ Scan(...any) error }) (domain.SearchI
 	}
 	v := domain.SearchIncidentView{
 		ID: &id, Number: &number, Subject: &subject,
-		Priority: priority, State: state, Category: category,
+		Priority: priority, State: incidentStateFromEnum(state), Category: category,
 		CreatedOn: createdOn.UTC().Format(time.RFC3339), CreatedBy: createdBy,
 		UpdatedOn: updatedOn.UTC().Format(time.RFC3339), UpdatedBy: updatedBy,
 	}
@@ -443,6 +514,9 @@ func (r *incidentRepo) AggregateIncidents(ctx context.Context, req domain.Search
 		if err := rows.Scan(&key, &count); err != nil {
 			return domain.AggregateResponse{}, fmt.Errorf("scan incident bucket: %w", err)
 		}
+		if groupBy == "state" {
+			key = *incidentStateFromEnum(&key)
+		}
 		lowerKey := strings.ToLower(key)
 		buckets = append(buckets, domain.AggregateBucket{Key: lowerKey, Label: lowerKey, Count: count})
 		totalRecords += count
@@ -538,18 +612,14 @@ func (r *incidentRepo) GetIncidentByID(ctx context.Context, id string) (domain.I
 
 	v := domain.IncidentView{
 		ID: &id2, Number: &number, Subject: &subject,
-		Priority: priority, State: state, Category: category, Subcategory: subcatL,
+		Priority: priority, State: incidentStateFromEnum(state), Category: category, Subcategory: subcatL,
 		ContactType: incidentContactTypeFromEnum(contactType), Impact: impact, Urgency: urgency,
-		ResolutionCode: resolutionCode, ResolutionNotes: closeNotes, IncidentReport: incidentReport,
+		ResolutionCode: incidentResolutionCodeFromEnum(resolutionCode), ResolutionNotes: closeNotes, IncidentReport: incidentReport,
 		Description:           description,
 		WatchList:             []domain.IncidentWatchListItem{},
 		LinkedServiceRequests: []domain.LinkedServiceRequestRef{},
 		CreatedOn:             createdOn.UTC().Format(time.RFC3339), CreatedBy: createdBy,
 		UpdatedOn: updatedOn.UTC().Format(time.RFC3339), UpdatedBy: updatedBy,
-		// SpecialistHandoff has no backing state anywhere in this schema --
-		// no assignment-group/handoff-tracking table exists -- so it's
-		// always nil here, the correct "never handed off" representation
-		// per its own doc comment.
 	}
 	if openedOn != nil {
 		s := openedOn.UTC().Format(time.RFC3339)
@@ -593,8 +663,209 @@ func (r *incidentRepo) GetIncidentByID(ctx context.Context, id string) (domain.I
 		name := stringOrEmpty(rbName)
 		v.ResolvedBy = &name
 	}
+	// Derived at read time from the handoff's work notes and runbook task,
+	// as ServiceNow's getHandoffSummary does; nothing is stored for it.
+	sum, err := r.specialistHandoffSummary(ctx, id2, v.AssignmentGroup)
+	if err != nil {
+		return domain.IncidentView{}, err
+	}
+	v.SpecialistHandoff = sum
 	return v, nil
 }
+
+// ApplySpecialistHandoff implements IncidentRepository.
+//
+// WithSystemIdentity: the route is internal-only, and the new runbook task's
+// work_item insert is admitted by work_item's RLS insert policy (0147) only
+// as internal -- the same stamp CreateIncidentFromServiceNow uses.
+func (r *incidentRepo) ApplySpecialistHandoff(ctx context.Context, id, actorEmail string, plan func(SpecialistHandoffSnapshot) (SpecialistHandoffPlan, error)) (SpecialistHandoffWritten, error) {
+	ctx = WithSystemIdentity(ctx)
+	return InTxReturning(ctx, r.db, func(tx pgx.Tx) (SpecialistHandoffWritten, error) {
+		var snap SpecialistHandoffSnapshot
+		err := tx.QueryRow(ctx, `
+			SELECT wi.id::text, wi.number, wi.subject, wi.description, inc.state::text,
+			       inc.service_id::text, wi.assignment_group_id::text, g.name
+			FROM incident inc
+			JOIN work_item wi ON wi.id = inc.id
+			LEFT JOIN "group" g ON g.id = wi.assignment_group_id
+			WHERE inc.id = $1 AND wi.type = 'INCIDENT'
+			FOR UPDATE OF inc, wi`, id).Scan(
+			&snap.IncidentID, &snap.Number, &snap.Subject, &snap.Description, &snap.State,
+			&snap.ServiceID, &snap.AssignmentGroupID, &snap.AssignmentGroupName)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return SpecialistHandoffWritten{}, &apierror.NotFoundError{Msg: "incident not found"}
+		}
+		if err != nil {
+			return SpecialistHandoffWritten{}, fmt.Errorf("specialist handoff: read incident: %w", err)
+		}
+		p, err := plan(snap)
+		if err != nil {
+			return SpecialistHandoffWritten{}, err
+		}
+
+		out := SpecialistHandoffWritten{Before: snap}
+		err = tx.QueryRow(ctx, `
+			WITH moved AS (
+				UPDATE work_item
+				SET assignment_group_id = $2::uuid, assigned_to_id = NULL, updated_on = NOW(), updated_by = $3
+				WHERE id = $1
+				RETURNING assignment_group_id
+			)
+			SELECT COALESCE(g.name, '') FROM moved LEFT JOIN "group" g ON g.id = moved.assignment_group_id`,
+			id, p.GroupID, actorEmail).Scan(&out.GroupName)
+		if err != nil {
+			if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "23503" {
+				return SpecialistHandoffWritten{}, &apierror.ValidationError{Msg: "specialist group " + p.GroupID + " does not exist in this database"}
+			}
+			return SpecialistHandoffWritten{}, fmt.Errorf("specialist handoff: move incident: %w", err)
+		}
+
+		// The runbook task: a TASK-numbered incident_task (migration 0201), OPEN and active,
+		// CRITICAL (ServiceNow's priority 1), on the incident's service.
+		err = tx.QueryRow(ctx, `
+			WITH inserted_work_item AS (
+				INSERT INTO work_item (
+					id, created_on, updated_on, created_by, updated_by,
+					number, subject, type, assignment_group_id
+				)
+				VALUES (
+					gen_random_uuid(), NOW(), NOW(), $1, $1,
+					next_work_item_number('INCIDENT_TASK'), $2, 'INCIDENT_TASK'::work_item_type_enum,
+					(SELECT g.id FROM "group" g WHERE g.id = $3::uuid)
+				)
+				RETURNING id, number
+			),
+			inserted_task AS (
+				INSERT INTO incident_task (id, opened_on, priority, state, is_active, incident_id, service_id, type)
+				SELECT id, NOW(), 'CRITICAL', 'OPEN', TRUE, $4::uuid, $5::uuid, 'DEFAULT'
+				FROM inserted_work_item
+				RETURNING id
+			)
+			SELECT iwi.id::text, iwi.number
+			FROM inserted_work_item iwi
+			JOIN inserted_task it ON it.id = iwi.id`,
+			actorEmail, p.TaskSubject, p.TaskGroupID, id, snap.ServiceID).Scan(&out.TaskID, &out.TaskNumber)
+		if err != nil {
+			return SpecialistHandoffWritten{}, fmt.Errorf("specialist handoff: create runbook task: %w", err)
+		}
+
+		// clock_timestamp, not NOW(): the notes must keep their order, and
+		// NOW() is the same instant for every statement in the transaction.
+		for _, note := range p.WorkNotes {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO comment (id, created_on, created_by, type, work_item_id, content)
+				VALUES (gen_random_uuid(), clock_timestamp(), $1, $2::comment_type_enum, $3, $4)`,
+				actorEmail, caseCommentTypeEnum[domain.CommentTypeWorkNote], id, note); err != nil {
+				return SpecialistHandoffWritten{}, fmt.Errorf("specialist handoff: work note: %w", err)
+			}
+		}
+		return out, nil
+	})
+}
+
+// specialistHandoffSummary ports ServiceNow's IncidentHandoffUtils
+// .getHandoffSummary: the newest work note holding a handoff reason blob
+// ({"reasonCode":...}) is the handoff; the GitHub link comes from the oldest
+// "Escalated to Special Ops team." note written after it; the task is the
+// incident's latest "[Runbook Task]" task. Nil when the incident was never
+// handed off. group is the incident's current assignment group.
+func (r *incidentRepo) specialistHandoffSummary(ctx context.Context, id string, group *domain.EntityRef) (*domain.IncidentSpecialistHandoffSummary, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT content, created_on, created_by
+		FROM comment
+		WHERE work_item_id = $1 AND type = $2::comment_type_enum
+		  AND (content LIKE '%"reasonCode"%' OR content LIKE 'Escalated to Special Ops team.%')
+		ORDER BY created_on DESC`, id, caseCommentTypeEnum[domain.CommentTypeWorkNote])
+	if err != nil {
+		return nil, fmt.Errorf("specialist handoff summary: %w", err)
+	}
+	defer rows.Close()
+
+	var (
+		blob          *specialistHandoffBlob
+		at            time.Time
+		by            string
+		noteAfterBlob string
+	)
+	for rows.Next() {
+		var content, createdBy string
+		var createdOn time.Time
+		if err := rows.Scan(&content, &createdOn, &createdBy); err != nil {
+			return nil, fmt.Errorf("specialist handoff summary: scan: %w", err)
+		}
+		if !strings.Contains(content, `"reasonCode"`) {
+			// Newest first, so these were written after the blob; keep the
+			// oldest of them -- the note the handoff itself wrote.
+			if strings.HasPrefix(content, "Escalated to Special Ops team.") {
+				noteAfterBlob = content
+			}
+			continue
+		}
+		var b specialistHandoffBlob
+		if json.Unmarshal([]byte(content), &b) == nil && b.ReasonCode != "" {
+			blob, at, by = &b, createdOn, createdBy
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("specialist handoff summary: %w", err)
+	}
+	if blob == nil {
+		return nil, nil
+	}
+
+	sum := &domain.IncidentSpecialistHandoffSummary{
+		ReasonCode:        domain.IncidentSpecialistHandoffReasonCode(blob.ReasonCode),
+		ReasonDescription: blob.ReasonDescription,
+		HandedOffAt:       at.UTC().Format(time.RFC3339),
+		HandedOffBy:       &by,
+	}
+	// The team as the blob names it; the service keeps it only when the
+	// handoff configuration knows it, as getHandoffSummary keeps only the
+	// teams IncidentHandoffUtils knows.
+	if team := stringOrEmpty(blob.EscalationTeam); team != "" {
+		t := domain.IncidentSpecialistHandoffEscalationTeam(team)
+		sum.EscalationTeam = &t
+	}
+	if m := githubIssueURLPattern.FindString(noteAfterBlob); m != "" {
+		u := strings.TrimRight(m, ").,")
+		sum.GithubIssueURL = &u
+	}
+	if group != nil {
+		sum.AssignmentGroup = *group
+	}
+
+	var number, subject string
+	var state *string
+	err = r.db.QueryRow(ctx, `
+		SELECT wi.number, wi.subject, it.state::text
+		FROM incident_task it
+		JOIN work_item wi ON wi.id = it.id
+		WHERE it.incident_id = $1 AND wi.subject LIKE '[Runbook Task]%'
+		ORDER BY wi.created_on DESC
+		LIMIT 1`, id).Scan(&number, &subject, &state)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("specialist handoff summary: runbook task: %w", err)
+	}
+	if err == nil {
+		sum.Task = domain.IncidentSpecialistHandoffSummaryTask{Number: number, Subject: subject}
+		if state != nil {
+			label := incidentTaskStateDisplay(*state)
+			sum.Task.State, sum.Task.StateLabel = state, &label
+		}
+	}
+	return sum, nil
+}
+
+// specialistHandoffBlob is the reason a handoff writes as its first work note
+// -- the JSON the "Escalate to Special Ops" modal submits.
+type specialistHandoffBlob struct {
+	ReasonCode        string  `json:"reasonCode"`
+	ReasonDescription string  `json:"reasonDescription"`
+	EscalationTeam    *string `json:"escalationTeam"`
+}
+
+var githubIssueURLPattern = regexp.MustCompile(`https://github\.com/\S+`)
 
 // SearchIncidentActivities implements IncidentRepository. Reuses
 // scanCaseActivity's exact query/column shape (case_repo.go) -- an activity
@@ -738,6 +1009,38 @@ func incidentContactTypeFromEnum(label *string) *string {
 	return label
 }
 
+// incidentStateFromEnum is incidentStateToEnum's (incident_service.go)
+// inverse, for reads: the enum's 'CANCELED' goes back out as "CANCELLED",
+// the value the API accepts and the ServiceNow data source returns. Every
+// other label is passed through unchanged.
+func incidentStateFromEnum(label *string) *string {
+	if label != nil && *label == "CANCELED" {
+		v := string(domain.IncidentStateCancelled)
+		return &v
+	}
+	return label
+}
+
+// incidentResolutionCodeFromEnum is incidentResolutionCodeToEnum's
+// (incident_service.go) inverse, for reads: 'SOLVED_WORK_AROUND' and
+// 'NOT_ACTIONABLE_ALERT' go back out as "SOLVED_WORKAROUND" and
+// "NOT_ACTIONABLE". Every other label is passed through unchanged.
+func incidentResolutionCodeFromEnum(label *string) *string {
+	if label == nil {
+		return nil
+	}
+	var v string
+	switch *label {
+	case "SOLVED_WORK_AROUND":
+		v = string(domain.IncidentResolutionCodeSolvedWorkaround)
+	case "NOT_ACTIONABLE_ALERT":
+		v = string(domain.IncidentResolutionCodeNotActionable)
+	default:
+		return label
+	}
+	return &v
+}
+
 // createIncidentCommentQuery mirrors createCaseCommentQuery's (case_repo.go,
 // inline in CreateCaseComment) INSERT ... SELECT shape: the SELECT's WHERE
 // confirms the referenced row exists in the same round trip, RETURNING zero
@@ -785,6 +1088,38 @@ func (r *incidentRepo) CreateIncidentComment(ctx context.Context, incidentID str
 	return c, nil
 }
 
+// CreateIncidentNotes implements IncidentRepository.
+func (r *incidentRepo) CreateIncidentNotes(ctx context.Context, incidentID string, workNotes, additionalComments *string, createdBy string) error {
+	return r.db.InTx(ctx, func(tx pgx.Tx) error {
+		return insertIncidentNotesTx(ctx, tx, incidentID, workNotes, additionalComments, createdBy)
+	})
+}
+
+// insertIncidentNotesTx inserts the non-blank work note and public comment on incidentID inside tx,
+// with createIncidentCommentQuery's own existence check: an incident that is not there is a
+// ValidationError, and rolls the whole transaction back.
+func insertIncidentNotesTx(ctx context.Context, tx pgx.Tx, incidentID string, workNotes, additionalComments *string, createdBy string) error {
+	for _, note := range []struct {
+		text *string
+		kind domain.CommentType
+	}{{workNotes, domain.CommentTypeWorkNote}, {additionalComments, domain.CommentTypeComment}} {
+		if note.text == nil || strings.TrimSpace(*note.text) == "" {
+			continue
+		}
+		var id string
+		err := tx.QueryRow(ctx, `WITH c AS (`+createIncidentCommentQuery+`) SELECT id FROM c`,
+			createdBy, caseCommentTypeEnum[note.kind], incidentID, *note.text,
+		).Scan(&id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return &apierror.ValidationError{Msg: "incident not found: " + incidentID}
+		}
+		if err != nil {
+			return fmt.Errorf("create incident %s: %w", strings.ToLower(string(note.kind)), err)
+		}
+	}
+	return nil
+}
+
 // incidentLifecycleFKField names the request field behind each foreign key
 // UpdateIncidentLifecycle can trip, so a bad id reads as a ValidationError
 // on that field instead of a 500.
@@ -796,7 +1131,10 @@ var incidentLifecycleFKField = map[string]string{
 // UpdateIncidentLifecycle implements IncidentRepository.
 func (r *incidentRepo) UpdateIncidentLifecycle(ctx context.Context, id string, u IncidentLifecycleUpdate, actorEmail string) error {
 	_, err := InTxReturning(ctx, r.db, func(tx pgx.Tx) (struct{}, error) {
-		return struct{}{}, r.updateIncidentLifecycleTx(ctx, tx, id, u, actorEmail)
+		if err := r.updateIncidentLifecycleTx(ctx, tx, id, u, actorEmail); err != nil {
+			return struct{}{}, err
+		}
+		return struct{}{}, insertIncidentNotesTx(ctx, tx, id, u.WorkNotes, u.AdditionalComments, actorEmail)
 	})
 	if err == nil {
 		return nil
@@ -819,20 +1157,82 @@ func (r *incidentRepo) UpdateIncidentLifecycle(ctx context.Context, id string, u
 	return fmt.Errorf("update incident: %w", err)
 }
 
+// Work notes ServiceNow's OOB "Cascade closure of Incident Tasks" writes on
+// each task it closes (incident, after insert/update, state changes to
+// Closed or Canceled; on when com.snc.incident.incident_task.closure is
+// "true", as it is on WSO2's instance). Discovery scripts 57-59 in
+// integrations/csm-flow-service/docs/servicenow-discovery have the evidence.
+const (
+	incidentTaskClosedOnCloseNote  = "Incident Task is Closed Incomplete based on closure of %s."
+	incidentTaskClosedOnCancelNote = "Incident Task is Closed Skipped based on cancelation of %s."
+)
+
+// cascadeIncidentTaskClosure ports "Cascade closure of Incident Tasks": when
+// the incident moves to CLOSED every active, open incident task becomes
+// CLOSED_INCOMPLETE; when it moves to CANCELED they become CLOSED_SKIPPED.
+// Each gets ServiceNow's work note, written as the acting user. Tasks
+// already in a closed state are left alone, as is a task with
+// is_active = false (ServiceNow's addActiveQuery). A NULL state counts as
+// open.
+//
+// The task side effects match ServiceNow's task rules ("mark closed" and
+// "Set Closure Fields"): is_active false, and closed_on / closed_by_id set
+// only when empty.
+func cascadeIncidentTaskClosure(ctx context.Context, tx pgx.Tx, incidentID, incidentNumber, incidentState, actorEmail string) error {
+	var taskState, note string
+	switch incidentState {
+	case "CLOSED":
+		taskState, note = "CLOSED_INCOMPLETE", fmt.Sprintf(incidentTaskClosedOnCloseNote, incidentNumber)
+	case "CANCELED":
+		taskState, note = "CLOSED_SKIPPED", fmt.Sprintf(incidentTaskClosedOnCancelNote, incidentNumber)
+	default:
+		return nil
+	}
+	closed := make([]string, 0, len(domain.IncidentTaskClosedStates))
+	for s := range domain.IncidentTaskClosedStates {
+		closed = append(closed, s)
+	}
+	if _, err := tx.Exec(ctx, `
+		WITH closed AS (
+			UPDATE incident_task it
+			SET state = $2::TEXT::incident_task_state_enum,
+			    is_active = FALSE,
+			    closed_on = COALESCE(it.closed_on, NOW()),
+			    closed_by_id = COALESCE(it.closed_by_id, (SELECT id FROM "user" WHERE LOWER(email) = LOWER($3) LIMIT 1))
+			WHERE it.incident_id = $1
+			  AND it.is_active = TRUE
+			  AND (it.state IS NULL OR NOT (it.state::TEXT = ANY($4::text[])))
+			RETURNING it.id
+		), touched AS (
+			UPDATE work_item wi
+			SET updated_on = NOW(), updated_by = $3
+			FROM closed
+			WHERE wi.id = closed.id
+			RETURNING wi.id
+		)
+		INSERT INTO comment (id, created_on, created_by, type, work_item_id, content)
+		SELECT gen_random_uuid(), NOW(), $3, $5::comment_type_enum, touched.id, $6
+		FROM touched`,
+		incidentID, taskState, actorEmail, closed, caseCommentTypeEnum[domain.CommentTypeWorkNote], note); err != nil {
+		return fmt.Errorf("update incident: close incident tasks: %w", err)
+	}
+	return nil
+}
+
 // updateIncidentLifecycleTx is UpdateIncidentLifecycle's body: lock the
 // incident row, check the Resolved/Closed resolution requirement against the
 // request plus what is already on record, then update work_item (always,
 // for updated_on/updated_by, plus the assignee) and incident (state and
 // resolution columns, only when one is being set).
 func (r *incidentRepo) updateIncidentLifecycleTx(ctx context.Context, tx pgx.Tx, id string, u IncidentLifecycleUpdate, actorEmail string) error {
-	var currentState string
+	var currentState, number string
 	var currentCode, currentNotes *string
 	err := tx.QueryRow(ctx, `
-		SELECT inc.state::text, inc.resolution_code::text, inc.close_notes
+		SELECT inc.state::text, inc.resolution_code::text, inc.close_notes, wi.number
 		FROM incident inc
 		JOIN work_item wi ON wi.id = inc.id
 		WHERE inc.id = $1
-		FOR UPDATE OF inc`, id).Scan(&currentState, &currentCode, &currentNotes)
+		FOR UPDATE OF inc`, id).Scan(&currentState, &currentCode, &currentNotes, &number)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return &apierror.NotFoundError{Msg: "incident not found"}
 	}
@@ -906,6 +1306,10 @@ func (r *incidentRepo) updateIncidentLifecycleTx(ctx context.Context, tx pgx.Tx,
 		incArgs...,
 	); err != nil {
 		return err
+	}
+	// After the incident's own write, as ServiceNow's cascade is an after rule.
+	if u.State != nil && *u.State != currentState {
+		return cascadeIncidentTaskClosure(ctx, tx, id, number, *u.State, actorEmail)
 	}
 	return nil
 }

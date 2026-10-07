@@ -35,6 +35,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/middleware"
@@ -78,6 +79,12 @@ func (f *fakeSNIncidentStore) handler() http.Handler {
 	mux.HandleFunc("/oauth2/token", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "test-token", "expires_in": 3600})
+	})
+	// The support-group lookup DATA_SOURCE=servicenow makes before every
+	// create. No services: these incidents are created unassigned.
+	mux.HandleFunc("POST /services/search", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"services":[],"totalRecords":0}`))
 	})
 	mux.HandleFunc("POST /incidents", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
@@ -198,7 +205,7 @@ func newIncidentLifecycleServer(t *testing.T) (http.Handler, *fakeSNIncidentStor
 		TokenURL:     sn.URL + "/oauth2/token",
 		ClientID:     "test-client",
 		ClientSecret: "test-secret",
-	})
+	}, 45*time.Second)
 
 	h := NewIncidentHandler(service.NewServiceNowIncidentService(client, nil))
 	mux := http.NewServeMux()

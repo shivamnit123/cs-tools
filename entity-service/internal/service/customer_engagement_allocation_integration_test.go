@@ -79,8 +79,8 @@ func newAllocationIntegrationPool(t *testing.T) *pgxpool.Pool {
 		`INSERT INTO sf_opportunity_product (id, created_on, updated_on, created_by, updated_by, line_item_sf_id, opportunity_id) VALUES
 			('` + itLineItemRow + `', now(), now(), 't', 't', '` + itLineItemSfID + `', NULL),
 			('` + itNewLineItemRow + `', now(), now(), 't', 't', '` + itNewLineItemSf + `', '` + itOpportunity + `')`,
-		`INSERT INTO customer_engagement (id, created_on, updated_on, name, line_item_id_ref) VALUES
-			('` + itLineEngagement + `', now(), now(), 'Line engagement', replace('` + itLineItemRow + `', '-', ''))`,
+		`INSERT INTO customer_engagement (id, created_on, updated_on, name, line_item_id) VALUES
+			('` + itLineEngagement + `', now(), now(), 'Line engagement', '` + itLineItemRow + `')`,
 	} {
 		if _, err := pool.Exec(ctx, stmt); err != nil {
 			t.Fatalf("seed: %v", err)
@@ -139,9 +139,9 @@ func TestAllocationEventIntegration(t *testing.T) {
 		t.Fatalf("allocation rows = %d", n)
 	}
 	if n := itCount(t, pool, `SELECT count(*) FROM customer_engagement WHERE engagement_id = 'EIT0001'
-		AND account_id = $1 AND delivery_mode = 'OFFSITE' AND state = 'NEW' AND engagement_type_id = $2
+		AND account_id = $1 AND delivery_mode = 'OFFSITE' AND state = 'NEW' AND engagement_type = 'FIREFIGHTING'
 		AND name = 'Acme - Support Related Customer Firefighting' AND created_by = 'allocation-sync'`,
-		itAccountLive, testFirefightingTypeID); n != 1 {
+		itAccountLive); n != 1 {
 		t.Error("engagement columns are not as expected (live account by 15-char sf_id, OFFSITE, NEW)")
 	}
 
@@ -157,7 +157,7 @@ func TestAllocationEventIntegration(t *testing.T) {
 		t.Error("allocation row not updated")
 	}
 
-	// Line-item path through line_item_id_ref -> sf_opportunity_product.
+	// Line-item path through line_item_id -> sf_opportunity_product.
 	li := allocLineItemEvent()
 	li.ID, li.Email, li.Engagement.EngagementID = "AIT0002", "alloc.itest", "EIT0002"
 	li.Engagement.ProductID = allocStr(itLineItemSfID)

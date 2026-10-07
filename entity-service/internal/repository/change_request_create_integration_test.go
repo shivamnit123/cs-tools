@@ -46,6 +46,9 @@ const (
 	crCreateSNNumber = "CRAGTEST001"
 )
 
+// crCreateType returns a pointer to t -- a type is mandatory on every create.
+func crCreateType(t domain.ChangeRequestType) *domain.ChangeRequestType { return &t }
+
 func changeRequestCreatePool(t *testing.T) *repository.Scoped {
 	t.Helper()
 	dsn := os.Getenv("CHANGE_REQUEST_TEST_DSN")
@@ -113,6 +116,7 @@ func TestChangeRequestCreateIntegration_PortalPersistsAssignmentGroup(t *testing
 	groupID := seededGroupID
 	resp, err := repo.CreateChangeRequest(sys, domain.CreateChangeRequestRequest{
 		Subject: crCreateSubject,
+		Type:    crCreateType(domain.ChangeRequestTypeNormal),
 		GroupID: &groupID,
 	}, "cr-create-test@test.local")
 	if err != nil {
@@ -126,7 +130,7 @@ func TestChangeRequestCreateIntegration_PortalWithoutAssignmentGroupLeavesItNull
 	repo := repository.NewChangeRequestRepository(scoped)
 	sys := repository.WithSystemIdentity(context.Background())
 
-	resp, err := repo.CreateChangeRequest(sys, domain.CreateChangeRequestRequest{Subject: crCreateSubject}, "cr-create-test@test.local")
+	resp, err := repo.CreateChangeRequest(sys, domain.CreateChangeRequestRequest{Subject: crCreateSubject, Type: crCreateType(domain.ChangeRequestTypeNormal)}, "cr-create-test@test.local")
 	if err != nil {
 		t.Fatalf("CreateChangeRequest: %v", err)
 	}
@@ -141,6 +145,7 @@ func TestChangeRequestCreateIntegration_PortalUnknownAssignmentGroupIsValidation
 	groupID := unknownGroupID
 	_, err := repo.CreateChangeRequest(sys, domain.CreateChangeRequestRequest{
 		Subject: crCreateSubject,
+		Type:    crCreateType(domain.ChangeRequestTypeNormal),
 		GroupID: &groupID,
 	}, "cr-create-test@test.local")
 	var ve *apierror.ValidationError
@@ -157,6 +162,7 @@ func TestChangeRequestCreateIntegration_FromServiceNowPersistsAssignmentGroup(t 
 	groupID := seededGroupID
 	resp, err := repo.CreateChangeRequestFromServiceNow(sys, domain.CreateChangeRequestRequest{
 		Subject: crCreateSubject,
+		Type:    crCreateType(domain.ChangeRequestTypeNormal),
 		GroupID: &groupID,
 	}, crCreateSNID, crCreateSNNumber, "cr-create-test@test.local")
 	if err != nil {

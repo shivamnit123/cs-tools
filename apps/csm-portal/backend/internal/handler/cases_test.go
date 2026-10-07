@@ -312,6 +312,34 @@ func TestCreateCaseComment(t *testing.T) {
 		}
 	})
 
+	t.Run("worknote_creator-only caller can only ever post type=work_note", func(t *testing.T) {
+		for _, payload := range []string{
+			`{"content":"no type"}`,
+			`{"type":"activity","content":"x"}`,
+			`{"type":"Work_Note","content":"x"}`,
+			`{"type":" work_note","content":"x"}`,
+			`{"type":["work_note"],"content":"x"}`,
+			`{"type":"work_note","type":"comment","content":"x"}`,
+		} {
+			called := false
+			client := &mockEntityCaseClient{
+				createCaseCommentFn: func(_ context.Context, _ string, _ []byte) ([]byte, error) {
+					called = true
+					return []byte(`{}`), nil
+				},
+			}
+			h := NewCaseHandler(client).WithAccessGuard(viewerAccessGuard)
+			r := withWorknoteCreatorUser(httptest.NewRequest(http.MethodPost, "/cases/case-1/comments", strings.NewReader(payload)))
+			r.SetPathValue("id", "case-1")
+			w := httptest.NewRecorder()
+			h.CreateCaseComment(w, r)
+			assertStatus(t, w, http.StatusForbidden)
+			if called {
+				t.Errorf("payload %s: entity CreateCaseComment must not be called for a worknote_creator-only caller", payload)
+			}
+		}
+	})
+
 	t.Run("worknote_creator-only caller with no user row yet is provisioned before the comment is posted", func(t *testing.T) {
 		var createUserCalled, createCommentCalled bool
 		client := &mockEntityCaseClient{

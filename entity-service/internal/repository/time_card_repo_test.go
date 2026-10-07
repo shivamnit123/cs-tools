@@ -142,4 +142,66 @@ func TestTimeCardIntegration_SearchTimeCardsToleratesNullDurationColumns(t *test
 	}
 }
 
+// TestTimeCardIntegration_TotalTimeIsMinutes pins totalTime to whole minutes
+// on both search endpoints -- the unit ServiceNow returns and every portal
+// renders. The project stats endpoint reports the same sums in minutes too,
+// so a different unit here shows the case cards and the stat cards 60x apart.
+func TestTimeCardIntegration_TotalTimeIsMinutes(t *testing.T) {
+	pool := caseStatsPool(t)
+	seedTimeCardWithNullDurations(t, pool)
+
+	ctx := repository.WithSystemIdentity(context.Background())
+	scoped := repository.NewScoped(pool)
+	// created_by matches the seed's cleanup, so these rows are removed with it.
+	for _, row := range []struct {
+		id                   string
+		billable             bool
+		analyzing, settingUp int
+	}{
+		{"46666666-0000-0000-0000-000000000002", true, 45, 15},
+		{"46666666-0000-0000-0000-000000000003", false, 60, 30},
+	} {
+		if _, err := scoped.Exec(ctx, `
+			INSERT INTO time_card (id, created_on, updated_on, created_by, updated_by, case_id, user_id, work_date, is_billable, state,
+			                       analyzing_minutes, setting_up_minutes, reproducing_debugging_minutes, providing_solution_minutes, patching_minutes)
+			VALUES ($1, now(), now(), 'time-card-null-test', 'time-card-null-test', $2, $3, CURRENT_DATE, $4, 'SUBMITTED', $5, $6, 0, 0, 0)`,
+			row.id, timeCardTestCaseID, timeCardTestUserID, row.billable, row.analyzing, row.settingUp); err != nil {
+			t.Fatalf("seed time card %s: %v", row.id, err)
+		}
+	}
+
+	repo := repository.NewTimeCardRepository(scoped)
+	req := domain.SearchTimeCardsRequest{
+		Filters:    &domain.SearchTimeCardsFilters{CaseID: ptrTo(timeCardTestCaseID)},
+		Pagination: domain.Pagination{Limit: 10, Offset: 0},
+	}
+
+	views, _, err := repo.SearchTimeCards(ctx, req, "")
+	if err != nil {
+		t.Fatalf("SearchTimeCards() error = %v", err)
+	}
+	want := map[string]float64{
+		"46666666-0000-0000-0000-000000000002": 60,
+		"46666666-0000-0000-0000-000000000003": 90,
+	}
+	for _, v := range views {
+		if w, ok := want[v.ID]; ok && v.TotalTime != w {
+			t.Errorf("SearchTimeCards() card %s totalTime = %v, want %v minutes", v.ID, v.TotalTime, w)
+		}
+	}
+
+	summaries, _, err := repo.SearchCaseTimeCards(ctx, req, "")
+	if err != nil {
+		t.Fatalf("SearchCaseTimeCards() error = %v", err)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("SearchCaseTimeCards() returned %d cases, want 1", len(summaries))
+	}
+	s := summaries[0]
+	if s.TotalTime != 150 || s.Billable.TotalTime != 60 || s.NonBillable.TotalTime != 90 {
+		t.Errorf("SearchCaseTimeCards() totalTime = %v, billable = %v, nonBillable = %v; want 150, 60, 90 minutes",
+			s.TotalTime, s.Billable.TotalTime, s.NonBillable.TotalTime)
+	}
+}
+
 func ptrTo(s string) *string { return &s }

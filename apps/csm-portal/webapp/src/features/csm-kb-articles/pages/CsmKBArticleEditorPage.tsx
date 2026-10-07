@@ -49,11 +49,6 @@ import { useGetKBArticleHistory } from "@features/csm-kb-articles/api/useGetKBAr
 import { useDeleteKBArticle } from "@features/csm-kb-articles/api/useDeleteKBArticle";
 import KBArticleHistoryPanel from "@features/csm-kb-articles/components/KBArticleHistoryPanel";
 
-// Hardcoded until the KB picker is built (needs a GET /knowledge-bases
-// list endpoint, not yet implemented). Matches the API Manager KB seeded
-// locally for testing.
-const DEFAULT_KNOWLEDGE_BASE_ID = "752eaea7-79e3-4899-9d42-ba37d342779b";
-
 // Read-only status messaging for the author's own view -- never a button,
 // just a plain sentence describing where the article currently stands.
 const STATUS_LABELS: Record<string, string> = {

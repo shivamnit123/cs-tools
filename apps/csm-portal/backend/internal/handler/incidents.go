@@ -38,6 +38,7 @@ type entityIncidentClient interface {
 	SearchComments(ctx context.Context, body []byte) ([]byte, error)
 	SearchIncidentActivities(ctx context.Context, id string, body []byte) ([]byte, error)
 	HandOffIncidentToSpecialist(ctx context.Context, id string, body []byte) ([]byte, error)
+	ListSpecialistHandoffTeams(ctx context.Context, serviceID string) ([]byte, error)
 }
 
 // searchIncidentsRequest mirrors the enum/format-constrained fields of the documented
@@ -89,9 +90,13 @@ var (
 		"NEW": true, "IN_PROGRESS": true, "ON_HOLD": true, "RESOLVED": true, "CLOSED": true, "CANCELLED": true,
 	}
 
-	validHandoffReasonCodes     = map[string]bool{"no-runbook": true, "runbook-not-working": true}
-	validHandoffEscalationTeams = map[string]bool{"choreo-runtime-team": true, "choreo-apim-team": true}
+	validHandoffReasonCodes = map[string]bool{"no-runbook": true, "runbook-not-working": true}
 )
+
+// maxHandoffEscalationTeamLen bounds escalationTeam's shape. Which keys are
+// valid is the entity service's SPECIALIST_HANDOFF_CONFIG, per product, so
+// it -- not a list here -- decides, and answers 400 for an unknown team.
+const maxHandoffEscalationTeamLen = 64
 
 // createIncidentRequest mirrors the enum/format-constrained fields of the documented
 // CreateIncidentPayload schema. It is decoded only to validate those fields at the
@@ -106,7 +111,6 @@ type createIncidentRequest struct {
 	ContactType         string   `json:"contactType"`
 	Impact              string   `json:"impact"`
 	Urgency             string   `json:"urgency"`
-	AssignmentGroupID   string   `json:"assignmentGroupId"`
 	AssignedEngineerID  string   `json:"assignedEngineerId"`
 	Subject             string   `json:"subject"`
 	WatchList           []string `json:"watchList"`
@@ -150,9 +154,6 @@ func validateCreateIncidentBody(body []byte) bool {
 		return false
 	}
 	if !validIncidentUrgencies[req.Urgency] {
-		return false
-	}
-	if req.AssignmentGroupID != "" && !uuidRe.MatchString(req.AssignmentGroupID) {
 		return false
 	}
 	if req.AssignedEngineerID != "" && !uuidRe.MatchString(req.AssignedEngineerID) {
@@ -340,7 +341,7 @@ func validateHandOffIncidentBody(body []byte) bool {
 	if !validHandoffReasonCodes[req.ReasonCode] {
 		return false
 	}
-	if req.EscalationTeam != nil && *req.EscalationTeam != "" && !validHandoffEscalationTeams[*req.EscalationTeam] {
+	if req.EscalationTeam != nil && len(*req.EscalationTeam) > maxHandoffEscalationTeamLen {
 		return false
 	}
 	return true
@@ -790,5 +791,29 @@ func (h *IncidentHandler) HandOffIncidentToSpecialist(w http.ResponseWriter, r *
 			"userID", user.UserID, "incidentID", id, "githubIssueError", *envelope.Handoff.GithubIssueError)
 	}
 
+	writeJSON(w, http.StatusOK, result)
+}
+
+// ListSpecialistHandoffTeams handles GET /specialist-handoff-teams?serviceId=: the Special
+// Ops teams the "Escalate to specialist team" dialog offers for the incident's service,
+// passed through from the entity service. Several teams mean the user must pick one; one
+// team is the handoff's target with nothing to pick.
+func (h *IncidentHandler) ListSpecialistHandoffTeams(w http.ResponseWriter, r *http.Request) {
+	user := middleware.UserInfoFromContext(r.Context())
+	if user == nil {
+		writeError(w, http.StatusUnauthorized, ErrMsgUnauthorized)
+		return
+	}
+	serviceID := r.URL.Query().Get("serviceId")
+	if serviceID != "" && !uuidRe.MatchString(serviceID) {
+		writeError(w, http.StatusBadRequest, ErrMsgInvalidUUID)
+		return
+	}
+	result, err := h.entity.ListSpecialistHandoffTeams(r.Context(), serviceID)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "entity ListSpecialistHandoffTeams failed", "userID", user.UserID, "err", err)
+		mapUpstreamError(w, err, "Failed to load the specialist teams.")
+		return
+	}
 	writeJSON(w, http.StatusOK, result)
 }

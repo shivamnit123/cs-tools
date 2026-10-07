@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -81,6 +83,52 @@ type ReferenceDataRepository interface {
 	// drift" section -- so check the live schema before assuming its shape,
 	// not this file.
 	ListTimeZones(ctx context.Context) ([]TimeZoneRow, error)
+	// ListSLADurationPolicy returns every row of sla_duration_policy
+	// (migration 0192), ordered by severity then clock_type -- backs
+	// GET /sla-duration-policy. Severity is already translated from the raw
+	// case_severity_enum label ("S0") to the uppercase English word every
+	// case.* event's own Priority field carries ("CATASTROPHIC"), via this
+	// same package's caseSeverityFromEnum (case_repo.go) -- the one place
+	// that mapping is defined, so this method stays the only repository
+	// read anywhere that needs to apply it for this table.
+	ListSLADurationPolicy(ctx context.Context) ([]SLADurationPolicyRow, error)
+	// ListFeedbackEmojis returns the five case-feedback emoji choices (the
+	// "<rating> - Reasons" rows of work_item_feedback_metric, migration
+	// 0127), each with its own reason chips -- backs GET /metadata's
+	// feedbackEmojies field. See case_feedback_repo.go's own doc comment
+	// for the shared rating-scale design this and
+	// GetCaseFeedback/CreateCaseFeedback both depend on.
+	ListFeedbackEmojis(ctx context.Context) ([]FeedbackEmojiRow, error)
+}
+
+// FeedbackEmojiChipRow is one selectable reason chip under a feedback emoji
+// (a work_item_feedback_metric_option row).
+type FeedbackEmojiChipRow struct {
+	ID    string
+	Name  string
+	Value string
+}
+
+// FeedbackEmojiRow is one of the five feedback-form emoji choices.
+type FeedbackEmojiRow struct {
+	ID              string
+	Name            string
+	Value           string
+	UnselectedImage string
+	SelectedImage   string
+	Chips           []FeedbackEmojiChipRow
+}
+
+// SLADurationPolicyRow is one row of the sla_duration_policy table, already
+// severity-translated -- see ListSLADurationPolicy's own doc comment.
+// DurationSeconds is duration's whole-second EXTRACT(EPOCH FROM ...) -- an
+// INTERVAL has no direct Go scan target in this connection's type map, same
+// reasoning project_repo.go's own EXTRACT(EPOCH FROM ...) columns already
+// document.
+type SLADurationPolicyRow struct {
+	Severity        string
+	ClockType       string
+	DurationSeconds int64
 }
 
 // TimeZoneRow is one row of the timezone reference table. utc_offset/dst
@@ -139,6 +187,108 @@ func (r *referenceDataRepo) ListTimeZones(ctx context.Context) ([]TimeZoneRow, e
 		out = append(out, tz)
 	}
 	return out, rows.Err()
+}
+
+// ListSLADurationPolicy implements ReferenceDataRepository.
+func (r *referenceDataRepo) ListSLADurationPolicy(ctx context.Context) ([]SLADurationPolicyRow, error) {
+	rows, err := r.db.Query(ctx,
+		`SELECT severity::TEXT, clock_type, EXTRACT(EPOCH FROM duration)::BIGINT
+		 FROM sla_duration_policy ORDER BY severity, clock_type`)
+	if err != nil {
+		return nil, fmt.Errorf("list sla duration policy: %w", err)
+	}
+	defer rows.Close()
+
+	var out []SLADurationPolicyRow
+	for rows.Next() {
+		var rawSeverity, clockType string
+		var durationSeconds int64
+		if err := rows.Scan(&rawSeverity, &clockType, &durationSeconds); err != nil {
+			return nil, fmt.Errorf("scan sla duration policy: %w", err)
+		}
+		severity, ok := caseSeverityFromEnum[rawSeverity]
+		if !ok {
+			return nil, fmt.Errorf("list sla duration policy: unrecognized severity %q", rawSeverity)
+		}
+		out = append(out, SLADurationPolicyRow{
+			Severity:        strings.ToUpper(string(severity)),
+			ClockType:       clockType,
+			DurationSeconds: durationSeconds,
+		})
+	}
+	return out, rows.Err()
+}
+
+// ListFeedbackEmojis implements ReferenceDataRepository.
+func (r *referenceDataRepo) ListFeedbackEmojis(ctx context.Context) ([]FeedbackEmojiRow, error) {
+	rows, err := r.db.Query(ctx, `
+		SELECT id::TEXT, name, selected_image, unselected_image
+		FROM work_item_feedback_metric
+		WHERE selected_image IS NOT NULL AND is_active
+		ORDER BY display_order NULLS LAST, name`)
+	if err != nil {
+		return nil, fmt.Errorf("list feedback emojis: %w", err)
+	}
+
+	var emojis []FeedbackEmojiRow
+	for rows.Next() {
+		var id, name string
+		var selectedImage, unselectedImage *string
+		if err := rows.Scan(&id, &name, &selectedImage, &unselectedImage); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan feedback emoji: %w", err)
+		}
+		rating, label, ok := resolveCaseFeedbackRating(name)
+		if !ok {
+			// Not one of the five known "<rating> - Reasons" rows -- a
+			// malformed or renamed row the fixed scale can't place. Skipped
+			// rather than surfaced with a guessed label.
+			continue
+		}
+		emojis = append(emojis, FeedbackEmojiRow{
+			ID:              id,
+			Name:            label,
+			Value:           strconv.Itoa(rating),
+			UnselectedImage: stringOrEmpty(unselectedImage),
+			SelectedImage:   stringOrEmpty(selectedImage),
+		})
+	}
+	closeErr := rows.Err()
+	rows.Close()
+	if closeErr != nil {
+		return nil, fmt.Errorf("iterate feedback emojis: %w", closeErr)
+	}
+
+	for i := range emojis {
+		chipRows, err := r.db.Query(ctx, `
+			SELECT id::TEXT, label, value
+			FROM work_item_feedback_metric_option
+			WHERE metric_id = $1
+			ORDER BY display_order NULLS LAST, label`,
+			emojis[i].ID,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("list feedback emoji chips: %w", err)
+		}
+		var chips []FeedbackEmojiChipRow
+		for chipRows.Next() {
+			var chipID, label string
+			var value int
+			if err := chipRows.Scan(&chipID, &label, &value); err != nil {
+				chipRows.Close()
+				return nil, fmt.Errorf("scan feedback emoji chip: %w", err)
+			}
+			chips = append(chips, FeedbackEmojiChipRow{ID: chipID, Name: label, Value: strconv.Itoa(value)})
+		}
+		chipErr := chipRows.Err()
+		chipRows.Close()
+		if chipErr != nil {
+			return nil, fmt.Errorf("iterate feedback emoji chips: %w", chipErr)
+		}
+		emojis[i].Chips = chips
+	}
+
+	return emojis, nil
 }
 
 // GetProjectByID implements ReferenceDataRepository.

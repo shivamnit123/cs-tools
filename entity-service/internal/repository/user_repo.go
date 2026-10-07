@@ -339,9 +339,12 @@ func (r *userRepo) SearchUsers(ctx context.Context, req domain.SearchUsersReques
 // this platform's own identifiers, so an id-based lookup is always safe
 // regardless of data source.
 func (r *userRepo) GetUsersByIDs(ctx context.Context, ids []string) ([]domain.User, error) {
+	// userColumns + scanUser rather than a hand-written projection: the
+	// "user" table has no phone/timezone columns, and first_name,
+	// last_name, email and user_type are all nullable -- scanning them
+	// into non-pointer fields fails the whole batch on one NULL.
 	rows, err := r.db.Query(ctx,
-		`SELECT id, user_name, first_name, last_name, email, phone, timezone, user_type, created_on, updated_on
-		 FROM "user" WHERE id = ANY($1::text[]::uuid[])`,
+		fmt.Sprintf(`SELECT %s FROM "user" WHERE id = ANY($1::text[]::uuid[])`, userColumns),
 		ids,
 	)
 	if err != nil {
@@ -351,8 +354,8 @@ func (r *userRepo) GetUsersByIDs(ctx context.Context, ids []string) ([]domain.Us
 
 	users := make([]domain.User, 0, len(ids))
 	for rows.Next() {
-		var u domain.User
-		if err := rows.Scan(&u.ID, &u.UserName, &u.FirstName, &u.LastName, &u.Email, &u.Phone, &u.Timezone, &u.UserType, &u.CreatedOn, &u.UpdatedOn); err != nil {
+		u, err := scanUser(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scan user: %w", err)
 		}
 		users = append(users, u)

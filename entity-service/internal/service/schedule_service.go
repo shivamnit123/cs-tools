@@ -147,8 +147,8 @@ func (s *scheduleService) SearchAssignments(ctx context.Context, req domain.Sear
 	if err := validateUserID(req.UserID); err != nil {
 		return domain.ScheduleAssignmentsResponse{}, err
 	}
-	if req.Family != "" && req.Family != "CRE" && req.Family != "SRE" {
-		return domain.ScheduleAssignmentsResponse{}, &apierror.ValidationError{Msg: "family must be CRE or SRE"}
+	if req.Family != "" && req.Family != "CRE" && req.Family != "SRE" && req.Family != "SME" {
+		return domain.ScheduleAssignmentsResponse{}, &apierror.ValidationError{Msg: "family must be CRE, SRE or SME"}
 	}
 	rows, err := s.repo.SearchAssignments(ctx, req)
 	if err != nil {
@@ -203,9 +203,9 @@ func (s *scheduleService) OnDuty(ctx context.Context, at *time.Time) (domain.Sch
 // rota then cannot be fixed at all while its lead is away -- not by a manager,
 // not by the head of CRE, not by anyone. The answer is a named grant somebody
 // has to be given and can be taken back, rather than widening what a lead
-// already holds: cre_rota_admin and sre_rota_admin (migration 0156), one per
-// family, because the two rotas are run by different people and neither group
-// has any business in the other's cover.
+// already holds: cre_rota_admin and sre_rota_admin (migration 0156), and
+// sme_rota_admin (0200), one per family, because the rotas are run by
+// different people and no group has any business in another's cover.
 //
 // Leading is checked first because it is the common case by a wide margin --
 // eleven leads against a handful of admins -- so the second read usually never

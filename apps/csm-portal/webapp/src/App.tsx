@@ -74,6 +74,7 @@ import CreateServiceRequestPage from "@features/csm-operations/pages/CreateServi
 import CreateChangeRequestPage from "@features/csm-operations/pages/CreateChangeRequestPage";
 import CreateIncidentPage from "@features/csm-operations/pages/CreateIncidentPage";
 import ProblemDetailPage from "@features/csm-operations/pages/ProblemDetailPage";
+import IncidentTaskDetailPage from "@features/csm-operations/pages/IncidentTaskDetailPage";
 import CreateProblemPage from "@features/csm-operations/pages/CreateProblemPage";
 import OutageDetailPage from "@features/csm-operations/pages/OutageDetailPage";
 import CreateOutagePage from "@features/csm-operations/pages/CreateOutagePage";
@@ -115,21 +116,19 @@ import CsmKBArticleEditorPage from "@features/csm-kb-articles/pages/CsmKBArticle
 import CsmKBArticleHistoryDetailPage from "@features/csm-kb-articles/pages/CsmKBArticleHistoryDetailPage";
 import CsmKBReviewQueuePage from "@features/csm-kb-articles/pages/CsmKBReviewQueuePage";
 import CsmKBAdminPage from "@features/csm-kb-articles/pages/CsmKBAdminPage";
-import RouteGuard from "@features/spl/pages/RouteGuard";
-import CasesPage from "@features/spl/cases/pages/CasesPage";
-import CaseDetailPage from "@features/spl/cases/pages/CaseDetailPage";
-import AccountsPage from "@features/spl/accounts/pages/AccountsPage";
-import AccountDetailPage from "@features/spl/accounts/pages/AccountDetailPage";
-import ProjectsPage from "@features/spl/projects/pages/ProjectsPage";
-import ProjectDetailPage from "@features/spl/projects/pages/ProjectDetailPage";
-import SlaReportPage from "@features/spl/reports/pages/SlaReportPage";
-import CsReportPage from "@features/spl/reports/pages/CsReportPage";
-import TimelogsReportPage from "@features/spl/reports/pages/TimelogsReportPage";
-import TeamSchedulePage from "@features/spl/schedule/pages/TeamSchedulePage";
-import UserScanPage from "@features/spl/user-scan/pages/UserScanPage";
-import UsageMetricsPage from "@features/spl/usage-metrics/pages/UsageMetricsPage";
-import CustomerHealthDashboardPage from "@features/spl/customer-health/pages/CustomerHealthDashboardPage";
-import CustomerHealthDetailPage from "@features/spl/customer-health/pages/CustomerHealthDetailPage";
+import RouteGuard from "@features/sales-sa/pages/RouteGuard";
+import AccountsPage from "@features/sales-sa/accounts/pages/AccountsPage";
+import AccountDetailPage from "@features/sales-sa/accounts/pages/AccountDetailPage";
+import ProjectsPage from "@features/sales-sa/projects/pages/ProjectsPage";
+import ProjectDetailPage from "@features/sales-sa/projects/pages/ProjectDetailPage";
+import SlaReportPage from "@features/sales-sa/reports/pages/SlaReportPage";
+import CsReportPage from "@features/sales-sa/reports/pages/CsReportPage";
+import TimelogsReportPage from "@features/sales-sa/reports/pages/TimelogsReportPage";
+import TeamSchedulePage from "@features/sales-sa/schedule/pages/TeamSchedulePage";
+import UserScanPage from "@features/sales-sa/user-scan/pages/UserScanPage";
+import UsageMetricsPage from "@features/sales-sa/usage-metrics/pages/UsageMetricsPage";
+import CustomerHealthDashboardPage from "@features/sales-sa/customer-health/pages/CustomerHealthDashboardPage";
+import CustomerHealthDetailPage from "@features/sales-sa/customer-health/pages/CustomerHealthDetailPage";
 
 /**
  * Landing for `/`. Defers to AuthGuard's post-login deep-link restore when a
@@ -165,7 +164,7 @@ function RootLanding(): JSX.Element | null {
   // page is Cases, same as the standalone app's own index redirect. See
   // usePortalView.ts.
   const view = usePortalView();
-  const landing = view === "sales-sa" ? "/spl/cases" : "/dashboard";
+  const landing = view === "sales-sa" ? "/cases" : "/dashboard";
   return pending || hasDeepLinkSearch ? null : <Navigate to={landing} replace />;
 }
 
@@ -242,6 +241,17 @@ function LegacyDetailRedirect({ to }: { to: string }): JSX.Element {
 function LegacySettingsRedirect({ to }: { to: string }): JSX.Element {
   const { state } = useLocation();
   return <Navigate to={to} state={state} replace />;
+}
+
+/**
+ * Redirects the SPL case routes to the normal CSM case pages: `/spl/cases` to
+ * the cases list at `/cases`, and `/spl/cases/:caseId` to the case view at
+ * `/cases/:caseId`. Preserves query, hash and `location.state`.
+ */
+function SplCaseRedirect(): JSX.Element {
+  const { caseId } = useParams();
+  const { search, hash, state } = useLocation();
+  return <Navigate to={`${caseId ? `/cases/${caseId}` : "/cases"}${search}${hash}`} state={state} replace />;
 }
 
 export default function App(): JSX.Element {
@@ -552,6 +562,7 @@ export default function App(): JSX.Element {
                       path="incidents/:id"
                       element={<CaseDetailRouteSync kind="incident" paramName="id" />}
                     />
+                    <Route path="incident-tasks/:id" element={<IncidentTaskDetailPage />} />
                     <Route
                       path="problems/new"
                       element={
@@ -656,8 +667,19 @@ export default function App(): JSX.Element {
                       a hidden nav entry) and also mounts
                       PermissionProvider for every screen below it. */}
                   <Route path="spl" element={<RouteGuard />}>
-                    <Route path="cases" element={<CasesPage />} />
-                    <Route path="cases/:caseId" element={<CaseDetailPage />} />
+                    {/* SPL no longer has a cases list of its own: its "Cases"
+                        item opens the normal CSM cases list at /cases. This
+                        redirect keeps the nav item's /spl/cases href and old
+                        links working (the nav href stays /spl/cases on
+                        purpose -- pointing it at /cases would make it win the
+                        path match for every user, see csmNavItems.ts). */}
+                    <Route path="cases" element={<SplCaseRedirect />} />
+                    {/* SPL has no case-detail page of its own any more: every
+                        case opens in the normal CSM case view at
+                        /cases/:caseId (write actions there are gated by the
+                        caller's roles). This redirect only keeps old
+                        /spl/cases/:id links and bookmarks working. */}
+                    <Route path="cases/:caseId" element={<SplCaseRedirect />} />
 
                     {/* AccountsPage reads the path leaf itself to decide
                         all-accounts vs my-accounts — same component, two

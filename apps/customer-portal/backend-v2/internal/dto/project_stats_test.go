@@ -90,6 +90,65 @@ func TestMapProjectFilterOptions_NormalizesChangeRequestChoicesAndExcludesIntern
 	}
 }
 
+// GET /projects/{id}/filters' conversationStates fed AllConversationsPage.tsx's
+// State filter dropdown directly. On the Postgres data source these carried
+// the raw enum label as id (e.g. {"id":"ACTIVE"}, {"id":"CLOSE"} -- the real
+// Postgres label for the closed state has no D), never run through the
+// normalizer every sibling choice list on this same response already uses --
+// so filters.stateId ? [Number(filters.stateId)] : undefined converted every
+// selection to NaN, which conversationIDsToEnums then refused as an unmapped
+// state id. The page never recovered: its own loading flag only clears once
+// the search query has a successful response, so every selection left it
+// stuck showing its loader (digiops-cs#3273).
+func TestMapProjectFilterOptions_NormalizesConversationStateChoices(t *testing.T) {
+	resp := entity.ProjectMetadataResponse{
+		ConversationStates: []entity.ChoiceListItem{
+			{ID: "OPEN", Label: "OPEN"},
+			{ID: "ACTIVE", Label: "ACTIVE"},
+			{ID: "RESOLVED", Label: "RESOLVED"},
+			{ID: "CONVERTED", Label: "CONVERTED"},
+			{ID: "ABANDONED", Label: "ABANDONED"},
+			{ID: "CLOSE", Label: "CLOSE"},
+		},
+	}
+
+	got := MapProjectFilterOptions(resp)
+
+	want := []ReferenceItem{
+		{ID: "1", Label: "Open"},
+		{ID: "2", Label: "Active"},
+		{ID: "3", Label: "Resolved"},
+		{ID: "4", Label: "Converted"},
+		{ID: "5", Label: "Abandoned"},
+		{ID: "6", Label: "Closed"},
+	}
+	if len(got.ConversationStates) != len(want) {
+		t.Fatalf("ConversationStates = %+v, want %+v", got.ConversationStates, want)
+	}
+	for i, w := range want {
+		if got.ConversationStates[i].ID != w.ID || got.ConversationStates[i].Label != w.Label {
+			t.Errorf("ConversationStates[%d] = %+v, want %+v", i, got.ConversationStates[i], w)
+		}
+	}
+}
+
+// An id this normalizer does not recognise (ServiceNow's own numeric choice
+// key, already what the frontend wants) must pass through unchanged rather
+// than being dropped or rewritten.
+func TestMapProjectFilterOptions_ConversationStateUnrecognisedIDPassesThrough(t *testing.T) {
+	resp := entity.ProjectMetadataResponse{
+		ConversationStates: []entity.ChoiceListItem{
+			{ID: "7", Label: "Some Future State"},
+		},
+	}
+
+	got := MapProjectFilterOptions(resp)
+
+	if len(got.ConversationStates) != 1 || got.ConversationStates[0].ID != "7" || got.ConversationStates[0].Label != "Some Future State" {
+		t.Errorf("ConversationStates = %+v, want [{ID: \"7\", Label: \"Some Future State\"}] unchanged", got.ConversationStates)
+	}
+}
+
 // The exclusion above must catch an internal state under either data
 // source's own shape: ServiceNow's real numeric id ("-3") with a
 // display-cased label, and Postgres's raw UPPER_SNAKE label with no

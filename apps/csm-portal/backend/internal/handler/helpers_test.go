@@ -733,15 +733,16 @@ func (m *mockEntityProductClient) GetProductRepoMapping(ctx context.Context, nam
 // ----- mock entity incident client -----
 
 type mockEntityIncidentClient struct {
-	searchIncidentsFn          func(ctx context.Context, body []byte) ([]byte, error)
-	aggregateIncidentsFn       func(ctx context.Context, body []byte) ([]byte, error)
-	createIncidentFn           func(ctx context.Context, body []byte) ([]byte, error)
-	getIncidentFn              func(ctx context.Context, id string) ([]byte, error)
-	patchIncidentFn            func(ctx context.Context, id string, body []byte) ([]byte, error)
-	createCommentFn            func(ctx context.Context, body []byte) ([]byte, error)
-	searchCommentsFn           func(ctx context.Context, body []byte) ([]byte, error)
-	searchIncidentActivitiesFn func(ctx context.Context, id string, body []byte) ([]byte, error)
-	handOffIncidentFn          func(ctx context.Context, id string, body []byte) ([]byte, error)
+	listSpecialistHandoffTeamsFn func(ctx context.Context, serviceID string) ([]byte, error)
+	searchIncidentsFn            func(ctx context.Context, body []byte) ([]byte, error)
+	aggregateIncidentsFn         func(ctx context.Context, body []byte) ([]byte, error)
+	createIncidentFn             func(ctx context.Context, body []byte) ([]byte, error)
+	getIncidentFn                func(ctx context.Context, id string) ([]byte, error)
+	patchIncidentFn              func(ctx context.Context, id string, body []byte) ([]byte, error)
+	createCommentFn              func(ctx context.Context, body []byte) ([]byte, error)
+	searchCommentsFn             func(ctx context.Context, body []byte) ([]byte, error)
+	searchIncidentActivitiesFn   func(ctx context.Context, id string, body []byte) ([]byte, error)
+	handOffIncidentFn            func(ctx context.Context, id string, body []byte) ([]byte, error)
 }
 
 func (m *mockEntityIncidentClient) SearchIncidents(ctx context.Context, body []byte) ([]byte, error) {
@@ -798,6 +799,13 @@ func (m *mockEntityIncidentClient) SearchIncidentActivities(ctx context.Context,
 		return m.searchIncidentActivitiesFn(ctx, id, body)
 	}
 	return []byte(`{"activity":[],"total":0,"limit":20,"offset":0,"hasMore":false}`), nil
+}
+
+func (m *mockEntityIncidentClient) ListSpecialistHandoffTeams(ctx context.Context, serviceID string) ([]byte, error) {
+	if m.listSpecialistHandoffTeamsFn != nil {
+		return m.listSpecialistHandoffTeamsFn(ctx, serviceID)
+	}
+	return []byte(`{"teams":[]}`), nil
 }
 
 func (m *mockEntityIncidentClient) HandOffIncidentToSpecialist(ctx context.Context, id string, body []byte) ([]byte, error) {
@@ -879,6 +887,14 @@ type mockEntityIncidentTaskClient struct {
 	searchIncidentTasksFn    func(ctx context.Context, body []byte) ([]byte, error)
 	aggregateIncidentTasksFn func(ctx context.Context, body []byte) ([]byte, error)
 	getIncidentTaskFn        func(ctx context.Context, id string) ([]byte, error)
+	updateIncidentTaskFn     func(ctx context.Context, id string, body []byte) ([]byte, error)
+}
+
+func (m *mockEntityIncidentTaskClient) UpdateIncidentTask(ctx context.Context, id string, body []byte) ([]byte, error) {
+	if m.updateIncidentTaskFn != nil {
+		return m.updateIncidentTaskFn(ctx, id, body)
+	}
+	return []byte(`{}`), nil
 }
 
 func (m *mockEntityIncidentTaskClient) SearchIncidentTasks(ctx context.Context, body []byte) ([]byte, error) {
@@ -911,6 +927,7 @@ type mockEntityChangeRequestClient struct {
 	getChangeRequestFn            func(ctx context.Context, id string) ([]byte, error)
 	patchChangeRequestFn          func(ctx context.Context, id string, body []byte) ([]byte, error)
 	getChangeRequestApprovalsFn   func(ctx context.Context, id string) ([]byte, error)
+	getChangeRequestLinkOptionsFn func(ctx context.Context, body []byte) ([]byte, error)
 	createCommentFn               func(ctx context.Context, body []byte) ([]byte, error)
 	searchCommentsFn              func(ctx context.Context, body []byte) ([]byte, error)
 	decideChangeRequestApprovalFn func(ctx context.Context, id string, body []byte) ([]byte, error)
@@ -956,6 +973,13 @@ func (m *mockEntityChangeRequestClient) GetChangeRequestApprovals(ctx context.Co
 		return m.getChangeRequestApprovalsFn(ctx, id)
 	}
 	return []byte(`{"approvals":[]}`), nil
+}
+
+func (m *mockEntityChangeRequestClient) GetChangeRequestLinkOptions(ctx context.Context, body []byte) ([]byte, error) {
+	if m.getChangeRequestLinkOptionsFn != nil {
+		return m.getChangeRequestLinkOptionsFn(ctx, body)
+	}
+	return []byte(`{"deployments":[],"deploymentProducts":[],"customerContacts":[]}`), nil
 }
 
 func (m *mockEntityChangeRequestClient) CreateComment(ctx context.Context, body []byte) ([]byte, error) {
@@ -1070,6 +1094,14 @@ func (m *mockEntityServiceOfferingClient) SearchServiceOfferings(ctx context.Con
 
 type mockEntityGroupClient struct {
 	searchGroupsFn func(ctx context.Context, body []byte) ([]byte, error)
+	getGroupFn     func(ctx context.Context, id string) ([]byte, error)
+}
+
+func (m *mockEntityGroupClient) GetGroup(ctx context.Context, id string) ([]byte, error) {
+	if m.getGroupFn != nil {
+		return m.getGroupFn(ctx, id)
+	}
+	return []byte(`{"id":"` + id + `","name":"","description":null,"email":null,"manager":null,"members":[],"total":0}`), nil
 }
 
 func (m *mockEntityGroupClient) SearchGroups(ctx context.Context, body []byte) ([]byte, error) {

@@ -16,13 +16,33 @@
  * under the License.
  */
 
-/** An SRE time zone. `weekendZoneCode` names the zone that absorbs this one
- *  at the weekend, when three weekday zones collapse into two. */
+/** The rota families: CRE's ABT rota, SRE, and SME -- the product special
+ *  rotations. Within SRE and SME the work is split further into rotas. */
+export type RotaFamily = "CRE" | "SRE" | "SME";
+
+/** A block of the day a rota is worked in: SaaS SRE's time zones, or a
+ *  rotation's Day and Night. `weekendZoneCode` names the zone that absorbs
+ *  this one at the weekend, when three weekday zones collapse into two.
+ *  `rotaCode` is the rota the zone belongs to, absent for one no rota claims. */
 export interface ScheduleZone {
   id: string;
   code: string;
   label: string;
   weekendZoneCode?: string;
+  sortOrder: number;
+  rotaCode?: string;
+}
+
+/** A named rotation inside a family -- SRE's SaaS and IaaS, one per SME
+ *  product -- with the rules its own sheet states. */
+export interface ScheduleRota {
+  code: string;
+  label: string;
+  family: RotaFamily;
+  rotates: "DAILY" | "WEEKLY" | "IRREGULAR";
+  /** Informational: the escalation ladder keeps its own timing. */
+  escalationMinutes?: number;
+  sourceSheet?: string;
   sortOrder: number;
 }
 
@@ -36,7 +56,7 @@ export interface ScheduleShift {
   code: string;
   shortCode: string;
   label: string;
-  family: "CRE" | "SRE";
+  family: RotaFamily;
   zoneCode?: string;
   tier?: ScheduleTier;
   dayScope: "WEEKDAY" | "WEEKEND" | "ANY";
@@ -67,9 +87,9 @@ export interface ScheduleAbsenceKind {
   /** A tag a lead added from the portal, which a lead may also delete. The
    *  catalogue's own kinds are never custom. */
   custom?: boolean;
-  /** The rota the kind is offered on; absent for a kind both use, which is
-   *  every kind of leave. SRE allocates RnD, CRE allocates Migration. */
-  family?: "CRE" | "SRE";
+  /** The rota the kind is offered on; absent for a kind every rota uses,
+   *  which is every kind of leave. SRE allocates RnD, CRE allocates Migration. */
+  family?: RotaFamily;
   /** No longer offered. Still served so the days already marked with it keep
    *  their label, but a picker must not offer it. */
   retired?: boolean;
@@ -79,9 +99,12 @@ export interface ScheduleAbsenceKind {
 export interface ScheduleTeam {
   key: string;
   name: string;
-  family: "CRE" | "SRE";
+  family: RotaFamily;
   /** Display order, and what gives a team a stable colour. */
   sortOrder: number;
+  /** The rota this team's type belongs to; absent for a team on no named
+   *  rota (CRE's teams, Americas). */
+  rotaCode?: string;
 }
 
 export interface ScheduleCatalogue {
@@ -89,6 +112,8 @@ export interface ScheduleCatalogue {
   shifts: ScheduleShift[];
   absenceKinds: ScheduleAbsenceKind[];
   teams: ScheduleTeam[];
+  /** Absent from a server older than the rotas; read as "no named rotas". */
+  rotas?: ScheduleRota[];
 }
 
 export interface ScheduleEngineer {
@@ -150,7 +175,7 @@ export interface SearchScheduleAssignmentsPayload {
   from: string;
   to: string;
   teamKeys?: string[];
-  family?: "CRE" | "SRE";
+  family?: RotaFamily;
   userId?: string;
   /** Find one engineer's own rota. The portal knows its users by email, so
    *  entity-service resolves that rather than every client doing it. */

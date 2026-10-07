@@ -82,7 +82,6 @@ export default function NewIncidentPage() {
   const [service, setService] = useState<EntityOption | null>(null);
   const [serviceOffering, setServiceOffering] = useState<EntityOption | null>(null);
   const [configurationItem, setConfigurationItem] = useState<EntityOption | null>(null);
-  const [assignmentGroup, setAssignmentGroup] = useState<EntityOption | null>(null);
   const [assignedEngineer, setAssignedEngineer] = useState<EntityOption | null>(null);
   const [watchList, setWatchList] = useState<EntityOption[]>([]);
   const [workNotes, setWorkNotes] = useState("");
@@ -142,7 +141,6 @@ export default function NewIncidentPage() {
     if (description.trim()) payload.additionalComments = description.trim();
     if (serviceOffering) payload.serviceOfferingId = serviceOffering.id;
     if (configurationItem) payload.configurationItemId = configurationItem.id;
-    if (assignmentGroup) payload.assignmentGroupId = assignmentGroup.id;
     if (assignedEngineer) payload.assignedEngineerId = assignedEngineer.id;
     if (watchList.length > 0) payload.watchList = watchList.map((w) => w.id);
     if (workNotes.trim()) payload.workNotes = workNotes.trim();
@@ -289,6 +287,10 @@ export default function NewIncidentPage() {
           }}
           disabled={createIncident.isPending}
           search={changeRequestLookups.itServices}
+          // The backend sets the assignment group from the service's support group; there is no
+          // group to pick here, and a create that sends one is refused. A service with no support
+          // group creates the incident unassigned.
+          helperText="The assignment group is set from this service's support group, if it has one."
         />
 
         {/* Everything below is optional and used less often at creation time — collapsed by
@@ -317,14 +319,6 @@ export default function NewIncidentPage() {
               onChange={setConfigurationItem}
               disabled={createIncident.isPending}
               search={changeRequestLookups.configurationItems}
-            />
-            <AsyncEntitySelect
-              label="Assignment group"
-              placeholder="Search groups…"
-              value={assignmentGroup}
-              onChange={setAssignmentGroup}
-              disabled={createIncident.isPending}
-              search={changeRequestLookups.groups}
             />
             <AsyncEntitySelect
               label="Assigned to"

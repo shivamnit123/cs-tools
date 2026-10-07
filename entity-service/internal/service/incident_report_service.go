@@ -67,11 +67,24 @@ type IncidentReportService interface {
 	HandleChange(ctx context.Context, tx repository.IncidentReportTx, c repository.IncidentReportChange) error
 }
 
-type incidentReportService struct{}
+type incidentReportService struct {
+	// workaroundProblemInRequest: DATA_SOURCE=postgres-servicenow-dual-write,
+	// where the workaround problem is created ServiceNow-first by the resolve
+	// request itself (incidentService.createWorkaroundProblem), so this flow
+	// must not create a second, Postgres-only one.
+	workaroundProblemInRequest bool
+}
 
-// NewIncidentReportService constructs the flow logic.
+// NewIncidentReportService constructs the flow logic for DATA_SOURCE=postgres.
 func NewIncidentReportService() IncidentReportService {
 	return &incidentReportService{}
+}
+
+// NewDualWriteIncidentReportService constructs the flow logic for
+// DATA_SOURCE=postgres-servicenow-dual-write: everything but the workaround
+// problem, which the resolve request creates in both stores.
+func NewDualWriteIncidentReportService() IncidentReportService {
+	return &incidentReportService{workaroundProblemInRequest: true}
 }
 
 // HandleChange implements IncidentReportService. Every recorded change is
@@ -107,6 +120,9 @@ func (s *incidentReportService) HandleChange(ctx context.Context, tx repository.
 			return err
 		}
 		slog.InfoContext(ctx, "incidentreport: wrote incident report", "incidentId", c.IncidentID)
+		if err := postResolutionTasks(ctx, tx, src, !s.workaroundProblemInRequest); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -361,4 +377,179 @@ func (d *IncidentReportDrainer) drainOnce(ctx context.Context) (int, error) {
 		}
 	}
 	return applied, nil
+}
+
+// ---------------------------------------------------------------------------
+// "[WSO2 Cloud Ops] Post resolution tasks"
+//
+// ServiceNow: record_update incident, run as system, condition
+// business_service=Choreo ^OR business_service=Asgardeo ^ stateCHANGESTO6
+// (Resolved). Its blocks, in order, each If independent of the others
+// (discovery script 55, 2026-10-05):
+//
+//	 1 Log "Incident # - <number> - is resolved"
+//	 2 If close_code = False Alarm          -> 3 alert task, P1, WSO2 SRE Team
+//	 4 If close_code = Duplicate            -> 5 alert task, P1, WSO2 SRE Team
+//	 6 If close_code = Not Actionable Alert -> 7 alert task, P2, WSO2 SRE Team
+//	 8 If close_code = Solved (Work Around) and problem_id is empty
+//	      9 create problem; 10 incident.problem_id = it
+//	     11 If Choreo       -> 12 problem group Choreo Special Ops
+//	     13 Else If Asgardeo -> 14 problem group Asgardeo Operations Team
+//	15 If u_runbook_solve_the_issue = 2 and close_code != Solved (Work Around)
+//	     -> 16 runbook task
+//
+// Blocks 15-16 are NOT ported: incident.u_runbook_solve_the_issue has no
+// Postgres column and the portal has no field for it, so the condition can
+// never be true here. See the PR for what porting it needs.
+//
+// Blocks 9 and 12/14 are one insert here (the problem is created with its
+// group) rather than a create and an update; the stored result is the same.
+// ---------------------------------------------------------------------------
+
+// The two services the flow's trigger names, and the groups it sets, as
+// Postgres ids (sysidToUUID of the ServiceNow sys_ids in the flow).
+const (
+	postResolutionServiceChoreo   = "b9c999f8-1b86-a010-00ae-86acdd4bcb61"
+	postResolutionServiceAsgardeo = "97ed1b8b-1ba2-6c10-00ae-86acdd4bcbd3"
+
+	groupWSO2SRETeam            = "f991f369-1b88-b410-cb68-98aebd4bcb13"
+	groupChoreoSpecialOps       = "fe0d8868-1b0b-3010-d64e-64a2604bcb3c"
+	groupAsgardeoOperationsTeam = "e66e38f7-870b-b110-c049-76e4dabb35aa"
+)
+
+// postResolutionTasks runs the flow's blocks 1-14 for an incident that has
+// just changed to Resolved. src is the incident as it is now, which is what
+// the flow's {{Updated_1.current}} pills read.
+//
+// The flow's trigger admits only Choreo and Asgardeo incidents. The alert
+// tasks keep that limit; the workaround problem deliberately does not -- an
+// incident on any service resolved with a workaround gets one (a portal
+// decision, not ServiceNow's behaviour). withProblem is false in dual-write,
+// where the resolve request creates that problem instead.
+func postResolutionTasks(ctx context.Context, tx repository.IncidentReportTx, src repository.IncidentReportSource, withProblem bool) error {
+	service := strOrEmpty(src.ServiceID)
+	code := strOrEmpty(src.ResolutionCode)
+	if service == postResolutionServiceChoreo || service == postResolutionServiceAsgardeo {
+		slog.InfoContext(ctx, "Incident # - "+src.Number+" - is resolved", "incidentId", src.IncidentID)
+		for _, t := range alertTasksFor(src, code) {
+			id, number, err := tx.CreateIncidentTask(ctx, t)
+			if err != nil {
+				return err
+			}
+			slog.InfoContext(ctx, "postresolution: created alert task",
+				"incidentId", src.IncidentID, "taskId", id, "taskNumber", number)
+		}
+	}
+
+	if withProblem && code == "SOLVED_WORK_AROUND" && strOrEmpty(src.ProblemID) == "" {
+		id, number, err := tx.CreateProblem(ctx, problemFor(src))
+		if err != nil {
+			return err
+		}
+		if err := tx.LinkProblem(ctx, src.IncidentID, id, incidentReportActor); err != nil {
+			return err
+		}
+		slog.InfoContext(ctx, "postresolution: created problem",
+			"incidentId", src.IncidentID, "problemId", id, "problemNumber", number)
+	}
+	return nil
+}
+
+// alertTasksFor is blocks 2-7. close_code is a single value, so at most one
+// matches. ServiceNow's "Duplicate" (label "Duplicate Alert") arrives in
+// Postgres as DUPLICATE_ALERT from the sync and as DUPLICATE from the
+// portal's resolve; both are that one choice. Subjects are ServiceNow's,
+// including its "Falser Alarm".
+func alertTasksFor(src repository.IncidentReportSource, code string) []repository.NewIncidentTask {
+	var subject, priority string
+	switch code {
+	case "FALSE_ALARM":
+		subject, priority = "[Alert Task][Falser Alarm] "+src.Number+" alert is a false alarm", "CRITICAL"
+	case "DUPLICATE", "DUPLICATE_ALERT":
+		subject, priority = "[Alert Task][Duplicate Alert] "+src.Number+" alert is a duplicate", "CRITICAL"
+	case "NOT_ACTIONABLE_ALERT":
+		subject, priority = "[Alert Task][Not Actionable Alert] "+src.Number+" is not an actionable alert", "HIGH"
+	default:
+		return nil
+	}
+	group := groupWSO2SRETeam
+	return []repository.NewIncidentTask{{
+		IncidentID:        src.IncidentID,
+		Subject:           subject,
+		Priority:          priority,
+		ServiceID:         src.ServiceID,
+		AssignmentGroupID: &group,
+		CreatedBy:         incidentReportActor,
+	}}
+}
+
+// problemFor is blocks 9 and 11-14 for the Postgres-only flow: the problem
+// workaroundProblemFields describes, linked to the incident.
+func problemFor(src repository.IncidentReportSource) repository.NewIncidentProblem {
+	f := workaroundProblemFields(src.Number, src.ServiceID, src.AssignmentGroupID, src.Impact, src.Urgency)
+	return repository.NewIncidentProblem{
+		IncidentID:        src.IncidentID,
+		Subject:           f.Subject,
+		ServiceID:         src.ServiceID,
+		Priority:          &f.Priority,
+		Impact:            &f.Impact,
+		Urgency:           &f.Urgency,
+		AssignmentGroupID: f.AssignmentGroupID,
+		CreatedBy:         incidentReportActor,
+	}
+}
+
+// workaroundProblem is what the workaround problem takes from its incident,
+// in both modes: the Postgres-only flow (problemFor) and dual-write's resolve
+// request (incidentService.createWorkaroundProblem).
+type workaroundProblem struct {
+	Subject                   string
+	AssignmentGroupID         *string
+	Impact, Urgency, Priority string
+}
+
+// workaroundProblemFields is blocks 9 and 11-14: service, impact and urgency
+// copied from the incident, and the group chosen by service. The flow's If
+// compares a transform of the incident to CHOREO / ASGARDEO: Choreo gets
+// Choreo Special Ops, Asgardeo Asgardeo Operations Team. Any other service
+// (which the flow's trigger never admits) gets the incident's own assignment
+// group, none if it has none.
+//
+// The flow also copies the incident's priority, but ServiceNow's "Priority
+// Problem Lookup" runs on the insert and overwrites it from impact x urgency
+// (always_replace; discovery script 64) -- so the priority is derived here
+// too, which also covers an incident whose own priority is missing. An
+// absent impact or urgency is ServiceNow's problem default, 3 - Low.
+func workaroundProblemFields(number string, serviceID, groupID, impact, urgency *string) workaroundProblem {
+	group := groupID
+	switch strOrEmpty(serviceID) {
+	case postResolutionServiceChoreo:
+		group = strPtr(groupChoreoSpecialOps)
+	case postResolutionServiceAsgardeo:
+		group = strPtr(groupAsgardeoOperationsTeam)
+	}
+	imp, urg := strOrDefault(impact, "LOW"), strOrDefault(urgency, "LOW")
+	return workaroundProblem{
+		Subject:           "Fix the root cause of " + number,
+		AssignmentGroupID: group,
+		Impact:            imp,
+		Urgency:           urg,
+		Priority:          priorityFromImpactUrgency(imp, urg),
+	}
+}
+
+// strOrDefault is *s, or def for nil or "".
+func strOrDefault(s *string, def string) string {
+	if s == nil || *s == "" {
+		return def
+	}
+	return *s
+}
+
+// strOrEmpty is *s, or "" for nil.
+func strOrEmpty(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }

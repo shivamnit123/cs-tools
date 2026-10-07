@@ -16,7 +16,7 @@
  * under the License.
  */
 
-import type { ScheduleAbsenceKind, ScheduleAssignment, ScheduleShift, ScheduleTier } from "../types";
+import type { RotaFamily, ScheduleAbsenceKind, ScheduleAssignment, ScheduleShift, ScheduleTier } from "../types";
 
 
 /**
@@ -327,7 +327,12 @@ export function escalationGrid(shifts: ScheduleShift[], iso: string): Escalation
     const here = esc.filter((s) => s.zoneCode === zoneCode).sort((a, b) => a.sortOrder - b.sortOrder);
     return {
       zoneCode,
-      label: zoneLabelOn(shifts, zoneCode, weekend),
+      // the weekend crew's own name where it has one ("TZ1+2"), else the
+      // zone with its rotation ("Moesif Day"; SRE's zones keep their codes)
+      label: (() => {
+        const crew = zoneLabelOn(shifts, zoneCode, weekend);
+        return crew !== zoneDisplayName(zoneCode) ? crew : rotaZoneName(shifts, zoneCode);
+      })(),
       tiers: ESCALATION_TIERS.map((tier) => ({
         tier,
         shift: here.find((s) => s.tier === tier) ?? here.find((s) => !s.tier),
@@ -386,7 +391,7 @@ export function zoneLabelOn(
   zoneCode: string,
   weekend: boolean,
 ): string {
-  if (!weekend) return zoneCode;
+  if (!weekend) return zoneDisplayName(zoneCode);
   const list = Array.isArray(shifts) ? shifts : [...shifts.values()];
   const own = list.find(
     (s) => s.isEscalation && !s.tier && s.zoneCode === zoneCode && s.dayScope === "WEEKEND",
@@ -395,7 +400,48 @@ export function zoneLabelOn(
   // the crew; anything else ("L1") is the chip, not a zone name.
   return own?.shortCode && own.shortCode !== zoneCode && own.shortCode.startsWith(zoneCode)
     ? own.shortCode
-    : zoneCode;
+    : zoneDisplayName(zoneCode);
+}
+
+/**
+ * What a zone is called on screen. SaaS SRE's zones are their codes (TZ1); a
+ * rotation's Day and Night zones are coded per product (MOE_D, MOE_N) so the
+ * codes stay unique, but within one rota "Day" and "Night" is all there is to
+ * say -- the rota is already named by the picker above the card.
+ */
+export function zoneDisplayName(zoneCode: string): string {
+  if (/_D$/.test(zoneCode)) return "Day";
+  if (/_N$/.test(zoneCode)) return "Night";
+  return zoneCode;
+}
+
+/**
+ * A rotation's zone named with its rotation -- "Asgardeo Day", "IaaS Night" --
+ * read off the zone's own escalation window ("Asgardeo day escalation"), for
+ * a view that can show several rotations' rows at once. SRE's time zones keep
+ * their codes.
+ */
+export function rotaZoneName(
+  shifts: ScheduleShift[] | Map<string, ScheduleShift>,
+  zoneCode: string,
+): string {
+  const short = zoneDisplayName(zoneCode);
+  if (short === zoneCode) return zoneCode;
+  const list = Array.isArray(shifts) ? shifts : [...shifts.values()];
+  const own = list.find((s) => s.isEscalation && s.zoneCode === zoneCode);
+  const product = own?.label.replace(/\s+(day|night)?\s*escalation$/i, "").trim();
+  return product ? `${product} ${short}` : short;
+}
+
+/**
+ * The month roster's sub-column a zone falls in. A rotation's Day and Night
+ * zones share the roster's Day and Night columns, whichever rotation they
+ * belong to -- every SME rotation is a Day and a Night -- so a roster of
+ * several rotations still reads two columns a day; SRE's time zones keep one
+ * column each.
+ */
+export function zoneColumnOf(zoneCode: string): string {
+  return zoneDisplayName(zoneCode);
 }
 
 
@@ -409,7 +455,7 @@ export function zoneLabelOn(
  *  is served only so the days already marked with it keep their label. */
 export function kindsOfferedOn(
   kinds: readonly ScheduleAbsenceKind[],
-  family: "CRE" | "SRE",
+  family: RotaFamily,
 ): ScheduleAbsenceKind[] {
   return kinds.filter(
     (k) =>
@@ -477,14 +523,23 @@ export function readerFamily(
   teamFamily: string | undefined | null,
   roles: readonly string[] | undefined | null,
   editableFamilies: readonly string[] = [],
-): "CRE" | "SRE" | undefined {
+): RotaFamily | undefined {
   const f = teamFamily?.toUpperCase();
-  if (f) return f.startsWith("SRE") ? "SRE" : "CRE";
+  if (f) return familyOfType(f);
   const held = new Set((roles ?? []).map((r) => r.toLowerCase().replace(/^.*\./, "")));
-  const cre = held.has("cre_rota_admin");
-  const sre = held.has("sre_rota_admin");
-  if (cre !== sre) return cre ? "CRE" : "SRE";
-  if (cre && sre) return undefined;
-  const edits = new Set(editableFamilies.map((x) => (x.toUpperCase().startsWith("SRE") ? "SRE" : "CRE")));
-  return edits.size === 1 ? [...edits][0] as "CRE" | "SRE" : undefined;
+  const admin = (["CRE", "SRE", "SME"] as const).filter((x) => held.has(`${x.toLowerCase()}_rota_admin`));
+  if (admin.length === 1) return admin[0];
+  if (admin.length > 1) return undefined;
+  const edits = new Set(editableFamilies.map(familyOfType));
+  return edits.size === 1 ? [...edits][0] : undefined;
+}
+
+/** The family a team type or family string names: "SRE-ABT" is SRE,
+ *  "SME-Moesif" is SME, anything else CRE -- the same rule the server reads
+ *  team.type by. */
+function familyOfType(type: string): RotaFamily {
+  const t = type.toUpperCase();
+  if (t.startsWith("SRE")) return "SRE";
+  if (t.startsWith("SME")) return "SME";
+  return "CRE";
 }

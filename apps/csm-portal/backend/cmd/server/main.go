@@ -81,6 +81,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	reqTimeouts, err := loadTimeouts(os.Getenv)
+	if err != nil {
+		slog.Error("invalid timeout configuration", "err", err)
+		os.Exit(1)
+	}
+
 	// All upstream service clients (entity, updates, SCIM, and future notification
 	// channels) authenticate as the same OAuth2 client-credentials app; only the
 	// base URL and scopes differ per service.
@@ -95,6 +101,8 @@ func main() {
 		ClientSecret: oauth2ClientSecret,
 		// Scopes is optional; set CUSTOMER_ENTITY_SCOPES as a comma-separated list if required.
 		Scopes: splitComma(os.Getenv("CUSTOMER_ENTITY_SCOPES")),
+		// Timeout is ENTITY_SERVICE_TIMEOUT (default 60s).
+		Timeout: reqTimeouts.EntityService,
 	}
 
 	customerEntityClient := entity.NewCustomerEntityClient(customerEntityCfg)
@@ -441,6 +449,10 @@ func main() {
 	route("DELETE /users/me/saved-filter-views", handler.PermAuthenticated, usersHandler.DeleteSavedFilterView)
 	route("POST /users/me/saved-filter-views/reorder", handler.PermAuthenticated, usersHandler.ReorderSavedFilterView)
 	route("POST /users/search", handler.PermView, usersHandler.SearchUsers)
+	// Batch id-to-name lookup for the KB article lists (author and
+	// reviewer columns). Not /users/search with an id filter: that filter
+	// is ServiceNow-only and 400s against Postgres.
+	route("POST /users/by-ids", handler.PermView, usersHandler.GetUsersByIDs)
 	route("GET /users/{id}", handler.PermView, usersHandler.GetUser)
 	route("POST /users", handler.PermAdmin, usersHandler.CreateUser)
 	// Registered unconditionally, even when timecardApproverRoleIDs is empty:
@@ -527,9 +539,14 @@ func main() {
 	route("PATCH /change-requests/{id}", handler.PermWrite, changeRequestHandler.PatchChangeRequest)
 	route("POST /change-requests/search", handler.PermViewOperations, changeRequestHandler.SearchChangeRequests)
 	route("POST /change-requests/aggregate", handler.PermViewOperations, changeRequestHandler.AggregateChangeRequests)
+	route("POST /change-requests/link-options", handler.PermViewOperations, changeRequestHandler.GetChangeRequestLinkOptions)
 	route("POST /services/search", handler.PermView, itServiceHandler.SearchITServices)
 	route("POST /service-offerings/search", handler.PermView, serviceOfferingHandler.SearchServiceOfferings)
 	route("POST /groups/search", handler.PermView, groupHandler.SearchGroups)
+	// One group and its members -- what opens from a change request approval
+	// stage's assignment group. A "group" id (from the approvals response), not a
+	// team id; internal staff only (entity-service refuses anyone else).
+	route("GET /groups/{id}", handler.PermView, groupHandler.GetGroup)
 
 	// Team Schedule. Reads only for now, so everything sits under view: any
 	// role that can see the portal can see who is on the rota. Editing the
@@ -582,6 +599,7 @@ func main() {
 	route("POST /incidents/{id}/comments/search", handler.PermViewOperations, incidentHandler.SearchIncidentComments)
 	route("POST /incidents/{id}/activities/search", handler.PermViewOperations, incidentHandler.SearchIncidentActivities)
 	route("POST /incidents/{id}/specialist-handoffs", handler.PermWrite, incidentHandler.HandOffIncidentToSpecialist)
+	route("GET /specialist-handoff-teams", handler.PermViewOperations, incidentHandler.ListSpecialistHandoffTeams)
 	route("GET /alerts/{id}", handler.PermViewOperations, alertHandler.GetAlert)
 	route("GET /smart-alerts/{id}", handler.PermViewOperations, alertHandler.GetSmartAlert)
 	route("POST /change-requests/{id}/comments", handler.PermWrite, changeRequestHandler.CreateChangeRequestComment)
@@ -592,6 +610,7 @@ func main() {
 	route("POST /problems/search", handler.PermViewOperations, problemHandler.SearchProblems)
 	route("POST /problems/aggregate", handler.PermViewOperations, problemHandler.AggregateProblems)
 	route("GET /incident-tasks/{id}", handler.PermViewOperations, incidentTaskHandler.GetIncidentTask)
+	route("PATCH /incident-tasks/{id}", handler.PermWrite, incidentTaskHandler.PatchIncidentTask)
 	route("POST /incident-tasks/search", handler.PermViewOperations, incidentTaskHandler.SearchIncidentTasks)
 	route("POST /incident-tasks/aggregate", handler.PermViewOperations, incidentTaskHandler.AggregateIncidentTasks)
 	route("POST /outages", handler.PermWrite, outageHandler.CreateOutage)
@@ -748,9 +767,11 @@ func main() {
 			),
 		),
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
+		// REST_READ_TIMEOUT / REST_WRITE_TIMEOUT, default 60s each (raised from
+		// 30s so large inline-attachment uploads are not cut off).
+		ReadTimeout:  reqTimeouts.RESTRead,
+		WriteTimeout: reqTimeouts.RESTWrite,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	go func() {
@@ -868,7 +889,7 @@ func loadDashboards() *dashboard.Registry {
 //	CSM_TEAM_REGISTRY  the team registry as
 //	                   "teamKey|Display Name|FAMILY|creGroupId|sreGroupId" rows
 //	                   separated by commas, where FAMILY is one of cre-abt,
-//	                   cre, sre-abt or sre (case insensitive) and FAMILY,
+//	                   cre, sre-abt, sre or sme (case insensitive) and FAMILY,
 //	                   creGroupId, and sreGroupId are all optional. Unset means
 //	                   no teams are configured; there is deliberately no
 //	                   default, because team names are organisation vocabulary

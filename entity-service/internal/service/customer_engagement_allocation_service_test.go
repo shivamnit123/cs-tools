@@ -157,7 +157,7 @@ func TestAllocationEvent_FirefightingCreatesEngagement(t *testing.T) {
 	}
 	e := f.inserted[0]
 	if e.Name != "Acme - Support Related Customer Firefighting" || e.AccountID != "acct-1" || e.IsPaid ||
-		e.EngagementTypeID != testFirefightingTypeID || e.DeliveryMode == nil || *e.DeliveryMode != "OFFSITE" ||
+		e.EngagementType != "FIREFIGHTING" || e.DeliveryMode == nil || *e.DeliveryMode != "OFFSITE" ||
 		*e.PlannedStartDate != "2026-10-01" || *e.PlannedEndDate != "2026-10-10" || *e.EngagementCode != "EC-FF-1" {
 		t.Errorf("engagement = %+v", e)
 	}

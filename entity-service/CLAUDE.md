@@ -45,8 +45,16 @@ The server loads `.env` automatically on startup (silently ignored if absent). P
 | `DB_NAME`     | yes*     | —       | Database name              |
 | `DB_SSLMODE`  | no       | —       | `disable` or `require`    |
 | `DB_SCHEMA`   | no       | `DB_USER,public` | Pins the connection's `search_path` (`DSN`'s `options=-c search_path=...`), same purpose as `operations/csm-sync-service`'s own `DB_SCHEMA` — see that config's `withSchema`. The fallback makes explicit what Postgres' own default `search_path` (`"$user", public`) would already do implicitly — `public` must survive it, since every deployment's tables live there today (unqualified migrations). An explicit value is used verbatim, with no `public` appended |
+| `DB_POOL_MAX_CONNS` | no | `20` | pgxpool max open connections (see "Connection pool settings" below) |
+| `DB_POOL_MIN_CONNS` | no | `2` | pgxpool connections kept warm when idle; `0` is a valid, accepted value |
+| `DB_POOL_MAX_CONN_LIFETIME` | no | `30m` | pgxpool connection rotation interval |
+| `DB_POOL_MAX_CONN_IDLE_TIME` | no | `5m` | pgxpool idle-connection release interval |
 | `SERVER_PORT` | no       | `8080`  | Main API listen port       |
 | `HEALTH_PORT` | no       | `8081`  | Health probe listen port; `Validate` rejects it being equal to `SERVER_PORT` (see "Health probes" below) |
+| `SERVER_READ_TIMEOUT` | no | `60s` | Main API server read timeout (Go duration, e.g. `60s`); must be > 0 |
+| `SERVER_WRITE_TIMEOUT` | no | `60s` | Main API server write timeout; must be > 0 |
+| `REQUEST_TIMEOUT` | no | `60s` | Per-request context timeout; must be > 0 |
+| `UPSTREAM_CLIENT_TIMEOUT` | no | `60s` | Data-source HTTP client timeout; must be > 0 |
 | `EVENT_HUB_BROKER` | no | — | Kafka-compatible bootstrap address; feature-gates `EventPublisherService` (see "Event Hub publishing" below) |
 | `EVENT_HUB_CONNECTION_STRING` | no* | — | Event Hub namespace Shared Access Policy connection string. *Required once `EVENT_HUB_BROKER` is set |
 | `EVENT_HUB_TOPIC` | no* | — | Event Hub (Kafka topic) name. *Required once `EVENT_HUB_BROKER` is set |
@@ -68,6 +76,9 @@ The server loads `.env` automatically on startup (silently ignored if absent). P
 | `CSM_MIGRATION_PORTAL_WRITES_ENABLED` | no | `false` | Must be `"true"` to register the four portal-driven membership write routes under `/projects/{id}/contacts` (see "Portal-driven membership writes" below). Also needs `DATA_SOURCE=postgres`, a pool, and the full `SALES_ENTITY_*` set (`Config.HasPortalMembershipWrites`). Off means the routes are **not registered at all**, not 403 |
 | `CSM_MIGRATION_CUSTOMER_ENGAGEMENT_INGEST_ENABLED` | no | `false` | Registers `POST /customer-engagements/allocation-events` (Postgres-authoritative only); see "Allocation events" below |
 | `CUSTOMER_ENGAGEMENT_FIREFIGHTING_TYPE_ID` | no | — | ServiceNow sys_id written as `engagement_type_id` on firefighting engagements created by allocation events. Unset skips creating them |
+| `REDIS_URL` | no | — | `rediss://:<key>@<host>:<port>` (TLS, Azure Managed Redis); wins over `REDIS_ADDR`. Turns on the user cache (see "User cache (Redis)" below). `Validate` requires a `redis`/`rediss` scheme and a host, and never echoes the URL |
+| `REDIS_ADDR` / `REDIS_PASSWORD` | no | — | Plain, non-TLS Redis for local runs. Either this or `REDIS_URL` makes `Config.HasRedis` true |
+| `USER_CACHE_TTL` | no | `10m` | Backstop lifetime of a cached user; an unparseable or non-positive value falls back to `10m` |
 
 \* `DB_USER`/`DB_PASSWORD`/`DB_NAME` are required when `DATA_SOURCE=postgres`
 and **optional** when `DATA_SOURCE=servicenow`, where entity reads and writes
@@ -137,6 +148,24 @@ Conventions to preserve when touching these:
   otherwise fill the logs. `Recovery` stays, since a panic there would take down the main API
   with it.
 
+## Cases and incidents are different entities
+
+A **case** is `POST /cases`, `domain.CaseView`, the `case.*` events. An
+**incident** is `POST /incidents`, `domain.IncidentView`, the `incident.*`
+events. Separate endpoints, separate domain types, separate handlers and
+separate service files (`sn_case_service.go` against `sn_incident_service.go`).
+A "comment added" on one is not a "comment added" on the other, which is why
+both `case.comment_added` and `incident.comment_added` exist and carry
+different payloads. Don't collapse the vocabulary: the two event families
+cannot be merged without two different payloads sharing one name.
+
+**"SRE incident" is not a third thing.** `integrations/sre-alert-ingestion-service`
+turns a vendor alert (Azure, Grafana, Site24x7, OpenSearch) into a platform
+incident by calling the same `POST /incidents` through csm-integration-service,
+so an alert-born incident is exactly the entity the `incident.*` events
+describe. csm-notification-service's call-escalation ladder escalates it like
+any other.
+
 ## Event Hub publishing
 
 `internal/eventbus` (a minimal Kafka producer for Azure Event Hub's
@@ -182,6 +211,62 @@ just a bool, either `"true"` or not. `NewRouter` returns the constructed
 `EventPublisherService` (nil if unconfigured) alongside the `http.Handler`,
 threaded through `server.New` to `cmd/api/main.go`, which calls `Close()` on
 it during shutdown, after `srv.Shutdown`.
+
+## User cache (Redis)
+
+`GET /users/{id}` and `GET /users/me` are served cache-aside from Redis when
+`Config.HasRedis()` and there is a pool. `NewRouter` wraps `userSvc` in
+`service.NewCachedUserService(inner, cache)` (`internal/service/cached_user_service.go`),
+a decorator over `UserService` that overrides `GetUser`, `GetMe`, `PatchMe`
+and `CreateUser` and passes everything else straight through. The Redis side
+lives in `internal/cache` (`NewRedisClient`, `UserCache`); the service layer
+depends only on the `service.UserCache`/`service.UserCacheInvalidator`
+interfaces in `interfaces.go`. `rdb.Close()` runs from `closePublishers` at
+shutdown.
+
+Keys (all under `entity:v1:user:`; bump `v1` when a cached shape changes):
+
+| Key | Value |
+|---|---|
+| `detail:{id}` | `domain.UserDetail` for `GET /users/{id}` |
+| `me:{id}` | `domain.GetUserMeResponse` for `GET /users/me` |
+| `id-by-email:{sha256(lower(email))}` | user id, so `GetMe` (keyed by the caller's email) and email-only invalidations can find the id |
+
+Conventions to preserve:
+
+- **Invalidate after commit, by deleting.** Every writer of user, contact or
+  membership rows calls `InvalidateUser(ctx, userID, email)` once its write has
+  succeeded: `PatchMe`/`CreateUser` in the decorator, `writeContact`/
+  `deactivateContact` (Contact writer), `ingestMembership` and the DELETED
+  branch (membership ingest), and `Invite`/`UpdateRoles`/`Deactivate`
+  (`project_membership_write_service.go`, via `MembershipWriteDeps.UserCache`).
+  The `DeactivateBySfID` repos return the affected `[]domain.AffectedUser` for
+  this. A new writer of `user`, `account_contact` or `project_contact` must do
+  the same, or its change is invisible for up to `USER_CACHE_TTL`. Never write
+  the new value into the cache from a writer; the next read repopulates it.
+- **Fail open.** Every Redis call has a short timeout and a failure is a miss,
+  never an error to the caller. Warnings are rate-limited (`warn`, once per
+  30s); a failed invalidation is logged at ERROR with the user id only.
+- **Never cache errors or not-found.** Only a successful inner result is
+  stored. `GetUser` validates the id before touching the cache.
+- **No PII in keys or logs.** Emails are hashed in keys and never logged;
+  `REDIS_URL` holds the access key, so `Validate` and `NewRedisClient` return
+  generic errors that never quote it.
+- **Keep the invalidator a nil interface when the cache is off.**
+  `userCacheInvalidator` in `routes.go` is declared as
+  `service.UserCacheInvalidator` and assigned only when the cache is built;
+  assigning a nil `*cache.UserCache` would make it non-nil (the same pitfall as
+  the health handler's pool). `invalidateUser` treats a nil invalidator as a
+  no-op.
+- **`GetMe` checks the cached email.** A `me:{id}` entry whose `Email` does not
+  match the caller is treated as a miss, which guards against a stale
+  `id-by-email` entry after an email change.
+
+Known limits: a read that races an invalidation can re-cache the old value
+until the TTL; a degraded `GetMe` (e.g. groups unavailable) is cached like any
+other success; `SearchUsers`, `GetUsersByIDs` and `DATA_SOURCE=servicenow` are
+not cached. The client is a plain `redis.NewClient`, so the target must not use
+the "OSS Cluster" clustering policy.
 
 ## Salesforce Account ingest
 
@@ -843,7 +928,7 @@ yet, retry". A 400 (Salesforce rejected the write) stays a `DownstreamError`.
 `SalesEntityMembershipClient` so the ingest cannot accidentally gain write
 access to Salesforce; `*salesentity.Client` satisfies both.
 
-Seven call sites publish today, all ServiceNow-data-source-only (`DATA_SOURCE=servicenow`;
+Ten call sites publish today, all ServiceNow-data-source-only (`DATA_SOURCE=servicenow`;
 there is no Postgres-backed equivalent for any of them). There is also one
 Postgres-only exception, but it is **not** an Event Hub publish at all, and
 it lives entirely in `case_repo.go`, not the service layer:
@@ -957,23 +1042,54 @@ revisited.
   `CaseCreatedPayload.CaseType`) — those types notify by email only, per
   the same explicit request. See that service's own `CLAUDE.md`.
 - **`snIncidentService.CreateIncident`** publishes `incident.created` via
-  `publishIncidentCreated`, called the same way. No enrichment round trip is
-  needed here: `req.Subject`/`req.AdditionalComments` already carry
-  everything the payload needs (`Title`/`ShortDescription`, the latter
-  falling back to `Subject` when `AdditionalComments` is absent).
+  `publishIncidentCreated`, called the same way. `Title`/`ShortDescription`
+  come straight from `req.Subject`/`req.AdditionalComments` (the latter
+  falling back to `Subject` when absent), and `Number`/`ReportedAt` from the
+  create response. The **escalation fields** need one best-effort
+  `GetIncidentByID` read: `csm-notification-service`'s call-escalation ladder
+  (its `internal/paging`) is keyed on the incident's *priority*, which
+  ServiceNow derives from impact and urgency and which neither `req` nor the
+  create response carries, and on the assigned team's display name, where
+  `req` has only a sys_id. That read is deliberately not fatal and not even
+  required: if it fails, the event goes out with exactly the fields it
+  carried before the ladder existed (every escalation field is `omitempty`
+  on both sides), the direct call still happens, and the ladder simply
+  doesn't start — losing the page would be strictly worse than losing the
+  ladder. `Account`/`ABTEligible` are declared on the payload but **never
+  populated** here: incidents have no account field in this domain model,
+  and this service has no product→BU mapping to derive ABT eligibility from.
+  `ABTEligible` is a `*bool` for exactly that reason — an absent value must
+  stay absent rather than decoding as an explicit `false`, which would claim
+  an answer nobody gave — see that service's own `CLAUDE.md` for what the
+  missing flag does to the USA_WEEKEND routing rule.
+  On `DATA_SOURCE=postgres` (`NewIncidentServiceWithPublisher`, with no
+  ServiceNow behind it) later work notes also go through `PATCH /incidents/{id}`
+  -- an alert-born SRE incident's follow-up alerts from `sre-alert-core-service`
+  -- written as comments in one transaction (`CreateIncidentNotes`: a work note
+  and a comment commit together or not at all), with no ServiceNow mirror. That
+  create path publishes the same enriched `incident.created` (the read-back is a
+  Postgres `GetIncidentByID`), so an alert-born incident reaches the ladder with
+  its priority and team. The same update sends `incident.acknowledged`/
+  `incident.assigned` when it moves the incident out of NEW or sets an assignee
+  (`publishIncidentStopSignals`).
   `incident.created` has exactly one reaction on the receiving side now — a
   Twilio voice call — not a Google Chat alert: `csm-notification-service`
   removed that reaction entirely, per explicit product direction (an
   incident pages on-call directly; a separate Chat post was redundant with
-  that) — see that service's own `CLAUDE.md`. `CallTo` (on-call number) is
-  never set from this service either way — per explicit decision, all
-  notification-routing resolution belongs entirely in
-  `csm-notification-service`, which substitutes its own configured
-  `INCIDENT_DEFAULT_CALL_TO` when it's absent from the payload. `Product` is
-  still accepted on the wire (decode compatibility) but no longer read by
-  `csm-notification-service` at all. Consuming events and sending
-  emails/Chat alerts/calls is never this service's job — only publishing
-  the raw fact that something happened is.
+  that). The escalation ladder's own `chat` channel is a different thing and
+  is unaffected: it posts a card per *rung* of a climbing escalation, not one
+  on creation. This service does not build or send an `IncidentLink` at all —
+  it stays strictly a publisher of the fact that an incident was created;
+  `csm-notification-service` builds its own portal link from the event's
+  `EntityID` (`recipientlinks.Resolver.IncidentLink`), the same way it
+  already builds `case.created`'s. `CallTo` (on-call number) is never set
+  from this service either — per explicit decision, all notification-routing
+  resolution belongs entirely in `csm-notification-service`, which
+  substitutes its own configured `INCIDENT_DEFAULT_CALL_TO` when it is absent
+  from the payload. `Product` is still accepted on the wire (decode
+  compatibility) but no longer read by `csm-notification-service` at all.
+  Consuming events and sending emails/Chat alerts/calls is never this
+  service's job — only publishing the raw fact that something happened is.
 - **`incidentService.createIncidentPortal`** (plain `DATA_SOURCE=postgres`)
   publishes the same `incident.created`, through the same
   `publishIncidentCreatedEvent` the dual-write path uses, once the insert
@@ -1011,7 +1127,74 @@ revisited.
   `req.Type == domain.CommentTypeWorkNote` on every publish — `csm-notification-service`
   renders a distinct email layout for it (`RenderInternalNoteEmail`, see
   that service's own `CLAUDE.md`), so it needs to know the comment's type,
-  not just receive an already-filtered recipient list.
+  not just receive an already-filtered recipient list. `CommentAddedPayload`
+  also carries `AuthorEmail` (the same resolved author identity as `Name`,
+  just the address rather than the display name — `author.Email`/`actorEmail`
+  at each of this payload's two call sites), `Product` (`caseProductName(cv)`),
+  and `Team`/`IsEvaluationAccount`/`ProjectOnboardingStatus` — purely for
+  `csm-notification-service`'s own consumption: `AuthorEmail` lets that
+  service classify whether a new comment is customer-authored before running
+  it through its frustration-detection step (see that service's own
+  `CLAUDE.md`, "Frustration detection"), and `Team`/`IsEvaluationAccount`/
+  `ProjectOnboardingStatus` let a resulting Chat alert route through
+  `chataudience.Resolve` the same team-first way an SLA breach alert does,
+  rather than always the fixed `Incident Monitor` audience. The latter two are
+  resolved via the new `CaseRepository.ProjectOnboardingInfo(ctx, projectID)`
+  (a small, on-demand `project`/`project_type` join — the same two facts
+  `sla_status_repo.go`'s own bulk join already resolves for `GET
+  /sla-status`, just read here per-comment instead of in bulk), reached from
+  `snCaseService` via the same `pgFallback`-delegation pattern as
+  `AccountDefaultWatcherEmails` just above (empty/`false` with no error on a
+  pure-ServiceNow deployment with no Postgres pool). A lookup failure here is
+  logged and the fields are simply left at their zero value — the email
+  reaction `publishCommentAddedEvent` exists to drive must never be blocked
+  by this enrichment failing.
+
+- **`snIncidentService.UpdateIncident`** publishes the two signals that
+  start and stop a call escalation, via `publishEscalationSignals`:
+  `incident.acknowledged` when the incident genuinely **leaves NEW** (the
+  specification's acknowledgement gesture for a newly reported incident), and
+  `incident.priority_elevated` when its priority **strictly increases in
+  urgency** (the second trigger, keyed on the new priority). A change to
+  `Impact` or `Urgency` counts as a priority change for both purposes:
+  ServiceNow derives priority from them — `CreateIncident` requires both and
+  accepts no priority at all — so a PATCH raising urgency raises the priority
+  just as surely as one naming it. Both are guarded
+  against a no-op re-PATCH the same way `publishSeverityChanged` is, which
+  needs the incident as it was *before* the PATCH — so `UpdateIncident`
+  fetches a baseline first, but only when the request touches `State` or
+  `Priority`, so every other PATCH pays no extra round trip. A failed
+  baseline fetch publishes nothing rather than guessing at a transition. The
+  elevated payload carries the same optional escalation fields as
+  `incident.created`, from the post-PATCH view, plus `ElevatedAt` (`now`,
+  the instant the ladder's offsets run from). Neither carries an actor:
+  `UpdateIncidentRequest` has none and this service cannot resolve who
+  performed an update. A third signal, **`incident.assigned`**
+  (`publishIncidentAssigned`), goes out when `AssignedEngineerID` genuinely
+  changes the assignee to someone (`incidentAssignment`: not on a re-send of
+  the same assignee, not when it is cleared), carrying the assignee's id and
+  display name from the post-PATCH view. It is the SRE escalation ladder's
+  stop signal ("assignee set on incident"); the CRE ladder ignores it. It
+  shares the pre-PATCH baseline fetch, which an `AssignedEngineerID` PATCH now
+  also triggers.
+- **`snCommentSearchService.CreateComment`** (the reference-generic comment
+  service, ServiceNow branch only) publishes `incident.comment_added` via
+  `publishIncidentCommentAdded` whenever a comment lands on an
+  `incident`-type reference. This is the **only** stop signal an
+  elevation-triggered ladder has: the specification's acknowledgement gesture
+  for a priority elevation is a *public comment*, and an elevated incident
+  has normally already left NEW, so `incident.acknowledged` can never fire
+  for it again. Work notes are published too, with `IsPublic: false` — the
+  consumer decides that only a public comment acknowledges, keeping the event
+  a statement of fact rather than baking a notification policy into the
+  service that owns the data. The payload carries **no author**, a recorded
+  known gap: incidents have no customer-portal surface today, so a public
+  comment on one is written by internal staff in practice; if that ever
+  changes, an author must be added and checked (see
+  `snCaseService.resolveCommentAuthor` for the lookup it would need). The
+  comment service gained an optional `publisher EventPublisherService` for
+  this, wired from `routes.go`'s existing `eventPublisher`; the Postgres
+  comment service publishes nothing, same as every other publisher here.
 
 `publishCaseCreated`, `publishCommentAdded`, `publishStatusChanged`, and
 `publishCaseAssigned` — every `case.*` publisher above, not
@@ -1265,7 +1448,7 @@ is), each bounded by its own 5s `context.WithTimeout`
 (`publishCaseCreatedTimeout`/`publishIncidentCreatedTimeout`/
 `publishCommentAddedTimeout`/`publishStatusChangedTimeout`/
 `publishSeverityChangedTimeout`) so a slow
-ServiceNow or Event Hub round trip can't consume this service's own 30s
+ServiceNow or Event Hub round trip can't consume this service's own
 request timeout — a deliberate simplicity trade-off over the async+
 `WaitGroup`-drain pattern, made because this service (unlike that backend)
 has no existing per-handler struct to hold a drain hook, and adding one
@@ -1735,6 +1918,46 @@ above: a work item with no assignee/group simply reports empty strings. A
 dedicated team table may replace the `"group"` lookup for `TeamEmail`/
 `TeamLeadName` later — noted, not yet needed.
 
+### `GET /sla-duration-policy` — a separate, static duration table for `csm-notification-service`'s own native SLA tracking
+
+`sla_duration_policy` (migration `0192`) is a small, static reference table —
+13 rows, WSO2's own published [Enterprise Support
+Policy](https://wso2.com/licenses/support-policy/6.0) durations, seeded
+directly in the migration, never touched by any sync — deliberately
+independent of both `sla`/`sla_policy` above (ServiceNow-shaped, no plain
+severity column, empty for a case that never went through that sync) and
+the CSM-native SLA clock engine's own `sla_policy_resolver.go` (reads the
+real, synced `sla_policy` table). `ReferenceDataRepository.
+ListSLADurationPolicy`/`GET /sla-duration-policy` (internal-caller-only,
+same `requireInternalCaller` gate as `GET /sla-status`) exposes it —
+`severity` already translated from the raw `case_severity_enum` label
+("S0") to the same uppercase English word a `case.*` event's own `Priority`
+field carries ("CATASTROPHIC"), via this package's own
+`caseSeverityFromEnum` — so a consumer can match this response directly
+against a `case.created` payload's `Priority` with no translation of its
+own. `integrations/csm-notification-service` fetches the full set once at
+startup to compute each case's own SLA due dates itself (see that repo's
+own `CLAUDE.md`, "SLA breach-alerting engine") — entity-service's role here
+is purely to trigger (publish the facts it already publishes, below) and
+to hand over this one piece of static policy data; that service owns all
+the actual duration bookkeeping, due-date arithmetic and alerting.
+
+**`events.CommentAddedPayload.IsSupportEngineerResponse`** is the other
+half of enabling that: true when a comment is a public comment
+(`req.Type == domain.CommentTypeComment`) authored by a user holding
+`CSEngineerRole` — computed once per comment and shared by both the
+CSM-native SLA engine's own response-clock completion and this new payload
+flag, via `case_service.go`'s `isSupportEngineerAuthor` (Postgres,
+`UserRepository.GetUserRoles`) and `sn_case_service.go`'s
+`isSupportEngineerAuthorSN` (ServiceNow, `SNUserService.SearchUsers`) —
+see `CS_ENGINEER_ROLE`'s own `.env.example` doc comment. This lets
+`csm-notification-service` complete a case's own response clock the moment
+a qualifying reply lands, with no role/identity resolution of its own —
+the one signal entity-service is uniquely positioned to compute, since it
+owns the role data. `case.created`/`case.status_changed` already carry
+everything else that service's own tracking needs (`Priority`/`CreatedAt`,
+`NewStatus`), so neither payload needed any change for this.
+
 ## CSM-native SLA clock engine
 
 `internal/service/sla_engine_service.go` (`SLAEngineService`) is what actually
@@ -2119,7 +2342,19 @@ already use — no route path, request, or response shape changed.
   own submitter) AND the card to currently be `submitted` — both checked
   under one `SELECT ... FOR UPDATE` so a concurrent approver-list edit or a
   second transition attempt can't slip through between the check and the
-  write. `CreateTimeCard` validates a supplied `projectId` against the
+  write. That guard only fires at decide-time, though — until now nothing
+  stopped the same submitter/approver pairing from being written in the
+  first place. `validateApproverIDsExcludeSubmitter` (`time_card_service.go`)
+  closes that at create/edit time instead: `CreateTimeCard`/`UpdateTimeCard`
+  both reject a request naming the submitting user among `ApproverIDs`,
+  compared against `submitterID` directly rather than re-reading the card's
+  own stored `user_id` (cheap and correct for both call sites — see that
+  function's own doc comment). The webapp's own approver picker
+  (`LogTimeCardDialog.tsx`) already filters itself out of both the live
+  search and the "Recently selected" list for the same reason, but that was
+  always a UI convenience only, never an enforced rule — a direct API call
+  (or a stale client) could still persist it before this. `CreateTimeCard`
+  validates a supplied `projectId` against the
   case's own `work_item.project_id` (`case.id` and `work_item.id` are the
   same value) rather than trusting an unrelated existing project id;
   omitting it leaves `customer_project_id` `NULL`, unchanged from before
@@ -2226,8 +2461,86 @@ changed.
   `updateCaseWatchList` (update) now persist only what the caller
   explicitly asked for — no merge, no floor, no exemption from
   `validateWatchListProjectMembership` for a submitted id (nothing exempt
-  to submit any more). `domain.WatchListUser.Locked` still exists but is
-  now purely informational, not enforced — see its own doc comment.
+  to submit any more).
+
+  **Superseded below: `fetchCaseWatchers` now also synthesizes the
+  account's named stakeholders directly into every read, not just into the
+  email audience.** The paragraph above (and `AccountDefaultWatcherEmails`)
+  is still exactly how `Recipients` is resolved for a `case.*` email — that
+  hasn't changed, `customer_success_manager_id` included: the CSM still
+  isn't unioned into a case.* email's `Recipients`. What changed, by later
+  explicit product request, is the *display* side: a case's "Watchers" list
+  in both portals previously showed only real `work_item_watcher` rows, so
+  the stakeholders being emailed by default were invisible on that list
+  entirely — a customer or engineer looking at "who's watching this case"
+  had no way to see them. `fetchCaseWatchers` (`case_repo.go`) now builds
+  its result as a `WITH` CTE rather than a single `SELECT` off
+  `work_item_watcher`:
+
+  - `persisted` reads real `work_item_watcher` rows as before, but an
+    `EXTERNAL` (customer) one is only included when they are currently a
+    live (non-`DEACTIVATED`) `project_contact` on the case's own project —
+    a customer who has since left the project stops showing up as a
+    watcher. An `INTERNAL`/`SYSTEM`/`NOT_AVAILABLE` watcher is never
+    subject to that check at all, which is also what keeps an engineer's
+    own Follow/Unfollow self-subscribe working regardless of
+    `project_contact` membership.
+  - `stakeholders` resolves **five** account roles — the same four
+    `AccountDefaultWatcherEmails` resolves, plus
+    `customer_success_manager_id` — and synthesizes one row per resolved
+    stakeholder, every time, with `locked = true`. This is a strictly
+    larger set than the email audience by deliberate product decision: the
+    CSM is a real stakeholder worth *showing* on the case, even though
+    `AccountDefaultWatcherEmails` still deliberately excludes them from the
+    default email audience (see that function's own doc comment — a
+    decision about who gets emailed, not about who the account's
+    stakeholders are). None of these five are auto-persisted into
+    `work_item_watcher` (see above) and still aren't; this is a read-time
+    join, not a write.
+  - A user who is both a real persisted watcher and one of the five
+    stakeholders appears exactly once, as the locked (stakeholder) copy —
+    `DISTINCT ON (id)` ordered `locked DESC` after `UNION ALL`-ing the two
+    CTEs together, then re-sorted by `user_name` for a stable response.
+
+  `domain.WatchListUser.Locked` therefore does carry a real enforcement
+  meaning again, just not the old "mandatory floor" one: `SetCaseWatchList`
+  has no way for a caller to submit one of these five as an explicit
+  watcher (there's no `work_item_watcher` row to add or remove), so a
+  Locked entry can only ever come or go via the account's own stakeholder
+  columns changing, never via an add/remove request. See that field's own
+  doc comment in `entity.go`.
+
+  **A case's watch list now also gains whoever comments on it, scoped to
+  that one case.** `caseService.createCaseCommentAs` (the Postgres comment
+  path — `work_item_watcher` has no ServiceNow equivalent, so this doesn't
+  apply to the pure-ServiceNow data source) calls
+  `subscribeCommenterToWatchList` right after the comment itself is
+  successfully written: it resolves the commenter's own `"user"` row via
+  `userRepo.GetUserByEmail` and, if that resolves, calls the new
+  `CaseRepository.AddCaseWatcherIfAbsent(ctx, caseID, userID)` — a single
+  `INSERT ... WHERE NOT EXISTS`, not `SetCaseWatchList`'s destructive
+  delete-and-replace, so it can run on every comment without disturbing
+  whatever else is already on the list. Best-effort and silent on failure,
+  same posture as every other comment-creation side effect in this file
+  (`completeResponseSLAOnComment`, `publishCommentAddedEvent`) — the
+  comment has already been written by the time this runs, so a lookup or
+  write failure here must never undo that. An `actorEmail` that doesn't
+  resolve to a real user (the M2M `CreateCaseCommentAs` path deliberately
+  has none — see that method's own doc comment) is skipped the same way
+  `isSupportEngineerAuthor` already treats it: can't confirm, not an error.
+  This needed no new eligibility check of its own:
+  `validateWatchListProjectMembership`/`filterActiveWatchListUsers` already
+  apply to whatever ends up in `work_item_watcher` regardless of how it got
+  there, so a commenter who later leaves the project is dropped from future
+  emails by that existing mechanism exactly like any other persisted
+  watcher.
+
+  **Duplicates across all of the above are impossible by construction, not
+  by a separate filter.** `work_item_watcher`'s own `UNIQUE (work_item_id,
+  user_id)` makes `AddCaseWatcherIfAbsent` a no-op for an existing
+  watcher; `fetchCaseWatchers`' `DISTINCT ON (id)` is what collapses a user
+  who is simultaneously a persisted watcher and a synthesized stakeholder
+  into the one locked entry described above.
 
   **A persisted (explicitly-added) watcher is re-checked for live project
   membership immediately before each `case.*` email goes out, for
@@ -2458,6 +2771,674 @@ the same `validChangeRequestSortField`/`validChangeRequestSortOrder` maps
 value is a 400 on both data sources instead of silently falling back to
 `created_on DESC` only on Postgres.
 
+### Approval flow by change type (current behaviour)
+
+> **This section is the current contract and supersedes the Assess/Authorize/
+> "Move to Assess" history further down wherever they differ** (that history
+> is kept for the reasoning behind individual mechanisms). Code:
+> `change_request_approval_flow.go` plus `patchChangeRequestTx` /
+> `DecideChangeRequestApproval` in `change_request_repo.go`; migration
+> `0188_change_request_approval_groups.sql`.
+
+**A change request is created with exactly one of three types** — `standard`,
+`normal`, `emergency` (ServiceNow's own "What type of change is required?":
+Normal "requires one or more approvals", Standard "does not require approval",
+Emergency "must be implemented as soon as possible"). `type` is **required** on
+create: `repository.ValidateCreateChangeRequestType` is applied by both
+Postgres creates, the ServiceNow-first (dual-write) path *before* ServiceNow is
+called, the pure ServiceNow service, and the csm-portal BFF. `azure`/`infra`/…
+still exist on synced legacy rows and read back fine but cannot be chosen at
+create. The type cannot be changed by PATCH once an approval stage exists.
+
+| Type | Flow |
+|---|---|
+| Normal | New →(**Request Approval**)→ Assess `[Peer Approval]` → Authorize `[CAB Approval]` → **Scheduled automatically on CAB approval** → Implement → Review → Closed |
+| Emergency | New →(**Request Approval**)→ Authorize `[ECAB Approval only]` → **Scheduled automatically on ECAB approval** → Implement → Review → Closed |
+| Standard | New →(**Request Approval**)→ **Scheduled** (no approval stages at all) → Implement → Review → Closed |
+
+Two off-ramps/loops sit outside the table: **Roll back** (from Review / Customer
+Review, final) and **Re-schedule** (from Customer Approval back to Authorize,
+below).
+
+The table is the flow with both creation-form checkboxes **unticked**. With
+**Customer Approval** ticked, every "→ Scheduled" above becomes "→ **Customer
+Approval** → (customer's approval recorded) → Scheduled"; with **Customer Review**
+ticked, "Review → Closed" becomes "Review → **Customer Review** → Closed". See
+"Customer Approval / Customer Review checkboxes" below.
+
+* **"Request Approval" is the one human action out of New** and is always sent
+  as `{state: "assess"}` (legalNextStates of New is `["assess","canceled"]` for
+  every type — the webapp contract). The state written is chosen from the type,
+  never by the caller: Assess / Authorize / Scheduled. It is only legal from New
+  (a resend that matches the resulting state is an idempotent no-op; anything
+  else is a 400). It still requires an assigned team.
+* **There is no "Schedule" action.** `scheduled` is never in `legalNextStates`
+  and a manual `{state: "scheduled"}` (or `"authorize"` / `"customer_approval"`)
+  PATCH is rejected (400): Scheduled is reached only by the CAB/ECAB approval
+  cascade or by Request Approval on a Standard change -- **except from
+  `customer_approval`**, where the human action `scheduled` means "record the
+  customer's approval" (and `authorize` means Re-schedule, see below). The ServiceNow data source's own offered states are
+  filtered the same way (`withoutManualScheduled`, which keeps `scheduled` for a
+  change sitting in `customer_approval`). `legalNextStates` per state (the single
+  source of truth the webapp renders): new `[assess, canceled]`, assess
+  `[authorize, canceled]` (`authorize` is the approval path; the webapp never
+  renders it as a button), authorize `[canceled]`, customer_approval
+  `[scheduled, authorize, canceled]` (`authorize` = Re-schedule), scheduled `[implement, canceled]`, implement
+  `[review, canceled]`, review `[closed, rollback, canceled]` -- or
+  `[customer_review, rollback, canceled]` when `customerReviewRequired` --,
+  customer_review `[closed, rollback, canceled]`, terminal states none.
+  **While a live Customer Approval / Customer Review stage exists (the change
+  has registered customer contacts, see "Customer Group" below) `customer_approval` offers
+  `[authorize, canceled]` and `customer_review` only `[canceled]`**: the manual
+  `scheduled` / `closed` / `rollback` is withdrawn and refused (Re-schedule
+  stays: an internal user may re-plan, which supersedes the pending request).
+* **Re-schedule** (the process diagram's "Time Change" loop). In
+  `customer_approval`, `PATCH {state: "authorize", plannedStartOn?,
+  plannedEndOn?}` sends the change back through internal approval because the
+  planned time changed. It is the one manual way into `authorize`; from any
+  other state the PATCH is a 400 `state "authorize" cannot be set manually: it
+  is reached automatically through the approval flow (Request Approval, then
+  peer approval); it can only be set by hand to re-schedule a change from
+  customer_approval`. **"Time Change = Yes" is enforced**: the request must
+  carry a start and/or end that differs from the stored instant, else 400
+  `re-scheduling requires a changed planned start or end: ...` (unparseable
+  dates: 400 `... must be valid date-times (RFC 3339)`; an end before the
+  start: 400 `the planned start must not be after the planned end`). The on-hold
+  gate applies; the whole PATCH is one transaction, so a re-schedule that cannot
+  be satisfied (e.g. the CAB group has nobody eligible) changes nothing.
+  Effects: the new window is applied; the customer's pending stage is cancelled
+  (it stays as a record, `provisionCustomerStage` as for any state exit); the
+  state becomes `authorize` and a **fresh internal stage** is provisioned --
+  Normal: a new "CAB Approval" stage (the peer approval stands), Emergency: a
+  new "ECAB Approval" stage -- from the same group with the creator listed
+  cancelled (`provisionReauthorizationStage`; no ordinal-position test, but
+  `provisionApprovalStage` now counts only the FIRST stage of each label, so
+  the Review checkpoint is still provisioned for a re-scheduled change). Stage
+  order after one loop: Peer, CAB, Customer Approval (cancelled), CAB (new).
+  When the new CAB / ECAB stage is approved the ordinary cascade sends the
+  change to `customer_approval` and provisions a fresh Customer Approval stage
+  for the customer group. Rejecting the new stage behaves as a CAB / ECAB
+  rejection always has (siblings cancelled, state unchanged). **Standard** has
+  no internal approval to repeat: the dates are applied, the change **stays in
+  `customer_approval`** and the customer is asked again (pending stage
+  cancelled, a fresh one provisioned when the group has an eligible member;
+  the manual `scheduled` path stays otherwise). The loop can be repeated.
+  `customerApprovalRequired` remains editable in `authorize` (existing rule),
+  so it can still be unticked there. No new notifications.
+* **Roll back** (`rollback`) is the failed-review off-ramp of the process
+  diagram and is offered from exactly two states, `review` (internal review
+  failed) and `customer_review` (customer review failed), whether or not
+  `customerReviewRequired` is set (`changeRequestRollbackFrom`). A manual
+  `{state: "rollback"}` from any other state is a 400 `state "rollback" can only
+  be set from review or customer_review`; from `customer_review` with a live
+  customer stage it is refused like a manual `closed` (the group's members
+  decide; their rejection already yields `rollback`). The on-hold gate applies.
+  Rolling back stamps no `is_customer_review_required` (`isCustomerReviewed: true`
+  alongside it is a 400), provisions no stage, and **cancels every still-
+  `requested` approver row** of the change (all stages stay as a record; the
+  customer-group rejection cascade does the same). **`rollback` is final**:
+  `legalNextStates` is none and any other state PATCH out of it is a 400
+  (`change request has been rolled back; rollback is final ...`). Cancel and
+  Close do the same since "An approval is only actionable in its stage's state"
+  (below): every `closed` / `canceled` / `rollback` change has no `requested` row
+  left, internal stages included (this supersedes the earlier "Cancel does not
+  cancel the internal stages' pending approvers"). The ServiceNow data source
+  replays `stateKey` 2 like any other state and `withoutManualScheduled` does not
+  strip `rollback`. Project stats "outstanding" counting is unchanged by this.
+* **An approval is only actionable in its stage's state** (bug: an internal
+  reviewer kept Approve / Reject on the *Review* stage of a change that was
+  already `closed`, and while it waited at `customer_review` for the customer).
+  Deciding Review changes no state -- a human moves the change on -- and nothing
+  used to cancel the Review stage's other approvers when it left Review, so their
+  rows stayed `requested` for ever. Now every stage is tied to the one state in
+  which it can be decided (`approvalStageDecidableState`,
+  `change_request_approval_flow.go`; the kind comes from `classifyApprovalStage`:
+  explicit `checkpoint_label` first, the legacy positional fallback second):
+
+  | Stage kind (label) | Decidable only while the change is in |
+  |---|---|
+  | Peer Approval (`Assess`) | `assess` |
+  | CAB Approval (`Authorize`), ECAB Approval | `authorize` |
+  | Review | `review` |
+  | Customer Approval | `customer_approval` |
+  | Customer Review | `customer_review` |
+
+  A stage of unknown kind (`stageKindOther`: a ServiceNow-synced stage past the
+  first two positions, or with an unrecognised label) and a change with a NULL or
+  unknown state are **never guarded** -- ServiceNow-synced data behaves as before.
+  It is enforced four ways:
+  * **Auto-cancel** -- `reconcileStaleApprovers`, run in the same transaction at
+    the end of every path that writes `change_request.state`: `patchChangeRequestTx`
+    (whenever the PATCH carries a state: forward moves, Re-schedule, Roll back,
+    Cancel, Close, the customer outcomes, on-hold-off-and-advance) and
+    `DecideChangeRequestApproval` (after its cascades: Peer -> Authorize, CAB /
+    ECAB -> Scheduled / Customer Approval, the customer stages' outcomes) and the
+    GitHub sync's state writer (`githubMutationRepository.SetState`, a closed issue
+    closing the change). It sets
+    to `cancelled` (stamping `updated_on` / `updated_by`) every still-`requested`
+    row of every stage whose decidable state is not the change's *current* state --
+    and **every** still-`requested` row once the change is `closed`, `canceled` or
+    `rollback`. It runs after the stage the new state needs was provisioned, so
+    that stage (the fresh CAB / ECAB stage of a Re-schedule, the Review stage on
+    entering Review, a customer stage) is kept; the superseded customer stage of a
+    Re-schedule stays as a cancelled record. Examples: Review -> Customer Review /
+    Closed / Rollback / Canceled cancels the Review approvers; leaving Customer
+    Approval cancels the customer's. Request Approval (New -> Assess provisions
+    Peer for `assess`; an Emergency's New -> Authorize provisions ECAB for
+    `authorize`; Standard has no stage) is unaffected.
+  * **Decision guard** -- `DecideChangeRequestApproval` resolves the caller's
+    pending stage (their oldest `requested` row on a stage decidable in the
+    current state, else their oldest one) and, when that stage's kind has a
+    decidable state and the change is in another *known* state, refuses with a
+    **409** `ConflictError` and changes nothing: `this approval is no longer
+    pending: the change request is in <State>, but the <Stage> stage can only be
+    decided while it is in <State>` (e.g. `... is in Closed, but the Review stage
+    can only be decided while it is in Review`). The who-may-decide checks
+    (creator, internal-only) come first. This covers rows the reconcile never saw
+    (written before it existed, or by a path that does not run it -- e.g. a
+    direct database write or the ServiceNow sync). The decision's UPDATE is narrowed to the
+    resolved stage, so a caller holding a stale row and a live one decides only the
+    live one. The BFF passes the 409 message through on the decision endpoint
+    (`mapApprovalDecisionError`), as it does a 403's.
+  * **`canDecide`** is `false` for a `REQUESTED` row whose stage's decidable state
+    is not the change's current state (`markCanDecide`), so the webapp (which
+    renders Approve / Reject from `canDecide`, never from the state) disables them.
+  * **Migration 0193** (`0193_change_request_cancel_stale_approvals.sql`) is the
+    data fix for rows written before this: idempotent, it cancels every `requested`
+    row (a) of any change that is `CLOSED` / `CANCELED` / `ROLLBACK`, and (b) of
+    a stage with an explicit `checkpoint_label` (the map above, in a SQL `CASE`,
+    legacy `Assess` / `Authorize` included) whose state differs from the change's
+    current state. It never touches rows of a stage with a NULL / unrecognised
+    label unless (a), a change with a NULL state, rows that are not `requested`, or
+    the change request itself; `updated_by` is
+    `migration:0193_change_request_cancel_stale_approvals`. It flags the session
+    internal (`set_config('app.is_internal', 'true', false)`, cleared at the end)
+    because `approval_stage_approver` is FORCE row-level secured. Safe to re-run.
+
+  Tests: `change_request_stale_approvals_integration_test.go`
+  (`TestChangeRequestFlowIntegration_StaleApprovals_*`: the Review -> Customer
+  Review -> Closed lifecycle with stages / row statuses / `canDecide` after every
+  step, Review -> Closed, Roll back, Cancel from every state, the Re-schedule loop,
+  Emergency / Standard unaffected, the guard on crafted legacy rows, unguarded
+  ServiceNow-style stages, the GitHub state write, the migration) and the unit tests
+  `TestApprovalStageDecidableState*` / `TestApprovalStageOutOfState` /
+  `TestStaleApprovalRefusal` in `change_request_repo_test.go`.
+* **Approver pools are INTERNAL-only.** Every internal stage (Peer, CAB, ECAB,
+  Review) is decided by WSO2 staff, who see every project; an external
+  (customer) user sees only the projects they are a registered contact of, so an
+  approver row for one could never be found, let alone decided. A pool is
+  therefore filtered, when it is resolved, to **active** (`"user".is_active`,
+  NULL counting as active) users whose **`"user".user_type = 'INTERNAL'`** (the
+  type `recompute_user_type()` derives from the `internal`/`admin` roles;
+  `EXTERNAL`, `SYSTEM` and `NOT_AVAILABLE` users are never eligible) —
+  `internalApproverIDs` / `onlyInternalApprovers` in
+  `change_request_approval_flow.go`, applied to the peer pool (assigned group and
+  the `Devops Approval` fallback), the CAB / ECAB groups and the Review pool. The
+  same test is applied again at decision time (`approverDecisionBlock`, also what
+  drives `canDecide`): a non-internal user holding an internal-stage row is
+  refused with a 403 (`only active internal (WSO2) users can approve or reject
+  the <stage> stage ...`) and gets `canDecide=false`. The customer stages
+  (below) are the exception: their approvers are the project's registered
+  customer contacts, external by nature. An internal stage whose group has
+  members but no eligible internal one is a 400 that says so (`... has no active
+  internal (WSO2) members to provision as <stage> approvers: external/customer
+  users and inactive users cannot approve an internal stage`).
+* **Approver pools.**
+  * *Peer Approval* — Normal only. **Every active internal member of the change's
+    assigned group** (`team_member.group_id`), whatever team type that group is.
+    The creator is still listed, as a `cancelled` row, and never counts towards
+    the pool. Who is experienced enough to peer-approve is decided when people
+    are added to the group (membership management), **not** when the stage is
+    provisioned. The pool is the **`Devops Approval`** group
+    (`domain.PeerApprovalFallbackGroupName`, the ServiceNow flow's peer approval
+    group, same rules) only when there is no assigned group or the assigned group
+    yields nobody eligible (no active internal member other than the creator).
+    Neither → 400 "no eligible peer approvers".
+  * *CAB Approval* — Normal only, **right after** peer approval, its own
+    group (`CAB Approval`). Provisioned inside the peer-approval decision's
+    transaction; if it cannot be (nobody eligible) the peer decision is **rolled
+    back** with a 400 rather than stranding the change in Authorize. Request
+    Approval also pre-validates the CAB pool so the failure is early.
+  * *ECAB Approval* — Emergency only, **its own group** (`ECAB Approval`), the
+    only stage (no peer approval, no CAB).
+  * Standard: no stage.
+  * *Review* — assigned team, provisioned on a `{state: "review"}` PATCH once
+    exactly two stages exist, i.e. Normal only. Its approvers can only decide
+    while the change is in `review`: moving on (Customer Review / Closed /
+    Rollback / Canceled) cancels the rows nobody answered.
+* **Local seed personas** (`scripts/csm-compose/seed-entity-service.sql`) — a
+  separate set of people for exercising the approval and customer-approval flows
+  locally, so the fixtures do not hang on jane.doe / john.smith (whose rows stay:
+  cases, time cards, the customer portal and other seed data use them). All on
+  `example.com`; `user_type` is *derived* from the role by
+  `recompute_user_type()`, not set by hand.
+
+  | Persona | Email | Role → `user_type` | Seats |
+  |---|---|---|---|
+  | Alice Perera | `alice.perera@example.com` | `internal` → INTERNAL | group "Example Corp ABT" (901, the assigned group of every fixture), "CAB Approval", "ECAB Approval", "Devops Approval"; peer approver on CHG-FIXED-003 (requested) / -004 (approved) |
+  | Bob Fernando | `bob.fernando@example.com` | `internal` → INTERNAL | same groups; peer approver on -003 (requested) / -004 (cancelled) |
+  | Carol Silva | `carol.silva@example.com` | `internal` → INTERNAL | same groups; peer approver on -003 (requested) / -004 (cancelled) |
+  | Dave Mendis | `dave.mendis@example.com` | `customer` → EXTERNAL | registered `PORTAL_USER` contact of project 401 "Example Corp Production"; Customer Approval approver on CHG-FIXED-007, Customer Review on -008 (requested) |
+  | Erin Jayawardena | `erin.jayawardena@example.com` | `customer` → EXTERNAL | same as Dave |
+  | Mira Santos | `mira.santos@lumenworks.example` | `customer` → EXTERNAL | registered `PORTAL_USER` contact of the generated project **"Lumen Works Platform"** (found by name — its id is random per database; a no-op where no such project exists, picked up by the next seed run after the seed-generator created it): its Customer Group, the people asked at Customer Approval / Customer Review |
+  | Noel Prasad | `noel.prasad@lumenworks.example` | `customer` → EXTERNAL | same as Mira |
+
+  * jane.doe (internal) is the requester persona: still a *team* member of Example
+    Corp ABT (so `/users/me` and `GET /teams/{id}/members` keep working) but
+    deliberately out of the *group* (`team_member.group_id` NULL), and in no CAB /
+    ECAB / Devops group. john.smith (a customer) is still in the assigned group on
+    purpose — the standing probe of the INTERNAL-only pools: Request Approval on
+    CHG-FIXED-002 provisions alice, bob and carol, never john. Neither is a
+    registered contact of project 401 any more (Other Corp's sam.other is
+    unchanged).
+  * The seed also removes the **old group-based Customer Group** (groups 911 / 912,
+    "Example Corp Customer Approvers", with their memberships) from a database seeded
+    by an earlier version: the Customer Group is now the project's registered contacts
+    and nothing references those groups. Re-run the seed with
+    `docker-compose up -d migrate`.
+  * The **`Devops Approval`** group (the peer fallback) is seeded with the three
+    internal personas — it is created only when no group of that name exists.
+  * **Traps** (both from `seed-team-schedule.sql`): never grant the `internal`
+    role to a customer (`recompute_user_type()` checks internal before external,
+    so that customer becomes INTERNAL and gets unrestricted scope), and the
+    personas' `user_role` rows carry **no** `created_by` — that file deletes every
+    `created_by = 'seed'` internal grant of anyone outside its own roster.
+  * **Self-healing.** Most seed rows are `ON CONFLICT DO NOTHING`, which would
+    leave a database seeded before the personas on jane/john for ever. The
+    personas and the eight `CHG-FIXED-*` fixtures are therefore upserted /
+    deleted-and-reinserted: re-running the seed (`docker-compose -p <project> up
+    -d migrate`, which runs it every time) removes jane/john's contact, CAB/ECAB and
+    approver rows, installs the personas' and **resets the fixtures to their
+    starting state** (state, stamps, stages, approvers), so no volume wipe is
+    needed. The Playwright suite re-runs the seed before it starts.
+  * Tests: `TestChangeRequestSeedIntegration_*` (personas, fixture approvers, the
+    seeded assigned group / CAB / ECAB end to end, the Devops fallback, and the
+    seed's self-healing from the old shape inside a rolled-back transaction),
+    `_SeedCustomerGroupFixtures`.
+* **`CAB Approval` and `ECAB Approval` groups** are created by migration 0188
+  (fixed ids `00000000-0000-4000-8000-00000000ca01` / `…eca1`) only when no group
+  of that name exists, idempotently; membership is NOT seeded (synced from
+  ServiceNow or set by an operator; the local compose seed adds the three internal
+  personas — see "Local seed personas").
+  Groups are resolved **by name**; members are `team_member.group_id` (and
+  `team_member.team_id` of a team with that name, which is how the CR-notice
+  flow addresses them).
+* **The creator may not approve at any stage** (peer, CAB, ECAB) — they may
+  still cancel. The creator is the user whose email is `work_item.created_by`
+  or who is `change_request.requested_by_user_id`. They are provisioned
+  `cancelled` where they are in a pool, and `DecideChangeRequestApproval`
+  refuses them with a 403 even if a `requested` row exists.
+* **Only active internal users may decide an internal stage** — not
+  provisioned, and refused (403) at decision time even if a stale row exists
+  (e.g. a customer who was a member of the team before the pools were
+  INTERNAL-only). There is no endpoint in this repo that edits group membership
+  (it comes from the ServiceNow sync), so provisioning + decision time are the
+  enforcement points.
+* **`canDecide`** on each approver in `GET /change-requests/{id}/approvals` is
+  true only on the calling user's own `REQUESTED` row when they may actually
+  decide it (not creator; an active internal user on an internal stage; and the
+  change is in the state the row's stage belongs to -- see "An approval is only
+  actionable in its stage's state"). Additive, advisory; the
+  decision endpoint re-checks. Postgres data source only.
+* **Rejections** of the internal stages keep the existing behaviour: siblings
+  cancelled, no state change in either direction. (A *customer contact's*
+  rejection does move the change — see "Customer Group" below.)
+* Stage labels (`approval_stage.checkpoint_label`) are now `Peer Approval`,
+  `CAB Approval`, `ECAB Approval`, `Review`, plus the customer group's (project contacts') `Customer
+  Approval` / `Customer Review`; pre-existing `Assess`/`Authorize`
+  labels (and unlabeled positional stages) are still recognised as peer/CAB.
+
+### Opening an approval stage's assignment group (`GET /groups/{id}`)
+
+The Approval tab's *Assignment group* is a link: it opens the group the stage was
+provisioned from and lists who is in it, like ServiceNow's group form and its
+"Group Members" tab. Code: `group_detail_repo.go` (`GetGroupDetail`),
+`service/group_detail_service.go`, `handler/group_detail_handler.go`; route in
+`routes.go`. PostgreSQL data source only (the route is not registered without a
+pool, like `GET /teams/{id}/members`).
+
+* **`GET /change-requests/{id}/approvals` gained `assignmentGroup`** on each stage:
+  `{id, name}` of `approval_stage.assignment_group_id`, **`null` for the Customer
+  Approval / Customer Review stages** (recorded against no group: their approvers are
+  the project's registered contacts) and for any stage with no group. Additive:
+  `approverName` is unchanged, and the ServiceNow data source always returns `null`.
+* **`GET /groups/{id}`** (`id` is a `"group"` id, **not** a `team` id -- `POST
+  /groups/search` lists the `team` registry) returns `{id, name, description, email,
+  manager: {id, name}|null, members: [{id, name, email, userType, role}], total}`;
+  absent parts are `null`, `members` is `[]` for a group nobody is in, `total` =
+  `len(members)`. Unknown id is a 404, a malformed one a 400.
+* **Who is listed is who the approval pools provision from**, so the page and the
+  stage agree (apart from per-change exclusions such as the creator, who is
+  provisioned cancelled but is still *in* the group). There are two shapes of pool and
+  the page follows each: an **assigned group** (the Peer and Review stages) is
+  `team_member.group_id = <the group's id>` and nothing else (`groupMemberIDs`) -- a
+  `team` that merely shares the group's name adds nobody, because its members are not in
+  the peer pool either (the seed's Jane Doe sits in the *team* "Example Corp ABT" and in no
+  approval group); the **CAB Approval / ECAB Approval / Devops Approval** groups
+  (`namedPoolGroups`) are resolved by name (`namedGroup`): any `team_member` whose
+  `group_id` is a `"group"` of that name or whose `team_id` is a `team` of that name. A
+  group row with no name matches on its own `group_id` only. **Only active INTERNAL users
+  are listed** (`"user".user_type = 'INTERNAL'` and `is_active` not false, NULL counting as
+  active) -- the very rule every pool applies (`internalApproverIDs`), so a customer who
+  sits in a staff group, a deactivated user or a user with no derivable type is neither
+  provisioned nor shown. (The group's own membership is untouched; the page just does not
+  promise an approver the stage cannot have.) One row per user (the `lead` role of any of
+  their rows wins), name order (case-insensitive; the name falls back to first + last
+  name, then the email, so nobody is listed blank). If the pools change -- a new named pool,
+  or a different eligibility rule -- change `namedPoolGroups` / `groupDetailMembersSQL`
+  with them: the integration tests hold the page against `namedGroup` / `groupMemberIDs`
+  narrowed by `onlyInternalApprovers`.
+* **Internal callers only** (`RequireInternalCaller`, checked before the id is parsed):
+  an external (customer) caller gets 403, so a customer's contacts are never
+  enumerable here. The route is not RLS-scoped because `group`, `team_member` and
+  `user` carry no row-level security.
+* Tests: `group_detail_repo_integration_test.go` (real Postgres, `CHANGE_REQUEST_TEST_DSN`:
+  members, order, inactive / customer / typeless users left out, duplicates, same-name
+  team/group, unknown id, empty group, and the list held against `namedGroup` /
+  `groupMemberIDs` narrowed by `onlyInternalApprovers`),
+  `change_request_approvals_group_integration_test.go` (approvals carry the group;
+  customer stage `null`; the CAB group page equals the stage's approvers; a customer in
+  the assigned group is neither a peer approver nor on its page),
+  `TestBuildChangeRequestApprovals_AssignmentGroup`, the service and handler tests.
+
+### Customer project, deployments and deployment products
+
+The change request form's **Customer Project**, **Deployments** (multi-select) and
+**Deployment products** (read-only), plus **Category**, the read-only **Customer
+Group** (see the next section), **Additional comments** (customer visible) and
+**Work notes**. Code: `change_request_links.go` (all rules), `change_request_repo.go`
+(create / `patchChangeRequestTx` / `GetChangeRequestByID`); migrations
+`0191_change_request_project_links.sql` and
+`0192_change_request_drop_environments.sql`. PostgreSQL data source only.
+
+**There is no Environments field.** A deployment already *is* an environment
+instance of a project (its role, Primary production / Staging / QA …, is
+`deployment.type`, still returned as `type` by the lookup), so a separate
+Environments selection only repeated the Deployments one. Migration 0191 first
+added an `environment` catalogue and a `change_request_environment` join table
+for it; migration **0192 drops both** (`DROP TABLE IF EXISTS`, idempotent) and
+0191 itself is untouched (it may already be applied somewhere). `environmentIds`
+is refused on every write path (create, PATCH, both services) with the 400
+`environmentIds is no longer supported: deployments carry the environment`, and
+`environments` is gone from the detail response and the lookup.
+
+*Data model.*
+
+| Field | Storage |
+| --- | --- |
+| Customer Project | `work_item.project_id` (already existed; create now writes it) |
+| Deployments | `change_request_deployment (change_request_id, deployment_id)` |
+| Deployment products | `change_request_deployed_product (change_request_id, deployed_product_id)` (the same rows the case form's Product picker lists), stored as a snapshot |
+| Category | `change_request.category`; the enum gained `REGULAR_RELEASE_CLOUD`, `HOTFIX_RELEASE_CLOUD`, `DEVOPS`, `CLOUD_COMPUTING` so all 13 API values persist |
+| Customer Group | **not stored**: derived live from the project's registered contacts (next section). `change_request.customer_group_id` (migration 0075) is kept but no longer written or read |
+| Additional comments / Work notes | `comment` rows of type `COMMENT` / `WORK_NOTE`, `created_by` = the caller's email |
+
+The join tables have FKs with `ON DELETE CASCADE`, a lookup index each and `FORCE ROW
+LEVEL SECURITY` (project membership through `work_item.project_id`, like
+`work_item_tag`; listed in `rlsProtectedTables`). The first deployment (name order)
+and its first deployed product are mirrored into `work_item.deployment_id` /
+`deployed_product_id` so list views keep working; `deploymentId`/`deployedProductId`
+on PATCH cannot be combined with `deploymentIds`.
+
+*Rules (identical on create, PATCH and the lookup).* Violations are 400
+`ValidationError`s naming the field and id:
+
+1. `projectId` must exist. `deploymentIds` require `projectId`; each deployment must
+   exist, be active and belong to the project.
+2. **Deployment products are read-only and derived**: always the active
+   (`active IS NULL OR TRUE`) deployed products of the chosen deployments. A caller
+   may state `deploymentProductIds`, but only as exactly that set (on PATCH also
+   exactly the stored snapshot, so a re-sent value never fails because the
+   deployment gained a product since); anything else is "deploymentProductIds is
+   read-only: …". Without `deploymentIds` they are refused.
+3. Each list holds at most 100 ids; duplicates are collapsed.
+4. `customerGroupId` and `environmentIds` are refused (see above and below).
+
+*PATCH.* Arrays replace. `deploymentIds` changed → deployments and products
+(re-derived) are rewritten; `[]` clears them. Changing `projectId` while deployments
+are stored requires `deploymentIds` in the same request. **Edit window:** project,
+deployments and deployment products can change only while the change has not reached
+`implement` (states new … scheduled); from implement/review/customer_review/rollback/
+closed/canceled a *change* is a 400 ("<field> can no longer be changed: the change
+request is in state …") while re-sending the stored value is accepted (same posture as
+the customer gate flags). Category and the journal entries are not windowed. A refused
+PATCH writes nothing (all in the PATCH transaction). `comment` / `workNote` append a
+row each; blank is refused on PATCH and ignored on create. `durationInput` is still
+unsupported on this data source.
+
+*Create* runs validation, the insert, the two join tables and the two journal rows in
+one transaction (all-or-nothing). The ServiceNow-first path refuses the removed
+fields and validates the selection
+(`ChangeRequestRepository.ValidateChangeRequestLinks`) **before** calling ServiceNow.
+
+*Lookup.* `POST /change-requests/link-options {projectId, deploymentIds?}` →
+`{deployments:[{id,name,type}], deploymentProducts:[{id,name,deployment}], customerContacts:[{id,name,email?}]}`
+(`GetChangeRequestLinkOptions`): the project's active deployments, for the chosen ones
+the products that follow — computed by the same derivation the writes validate against,
+so what it offers is exactly what create accepts — and the project's registered
+contacts (the read-only Customer Group, name order, `[]` when none). The route is **internal callers only**
+(`internalOnly`, pinned by `TestChangeRequestLinkOptionsIsInternalOnly`): it takes a
+project id and returns that project's deployments and customer contacts, so an
+external caller must not be able to enumerate other projects through it.
+
+*ServiceNow mirror (dual-write).* `customerGroupId` and `environmentIds` are **no
+longer forwarded** (they are no longer accepted, so there is nothing to forward; the
+ServiceNow-only service refuses them with the same 400 instead of sending them, and
+no longer maps `customerGroup` / `environments` from a ServiceNow read). The ServiceNow
+client types still carry `categoryKey`, `comment`, `workNote` (create) and `projectId`,
+`comment`, `workNote` (PATCH), which keep being forwarded. They do **not** carry a
+project or a deployment *list* (create has neither; PATCH has the single
+`deploymentId`/`deployedProductId`), and the product ids PostgreSQL derives are not
+ServiceNow records, whose field names and reference tables are not discoverable from
+this repository. So `projectId` (create), `deploymentIds` and `deploymentProductIds`
+are **stripped from the mirror** like the customer gate flags
+(`changeRequestService.createChangeRequestSNFirst` / `PatchChangeRequest`); the
+ServiceNow-only service refuses `projectId`/`deploymentIds` instead of dropping them.
+Wire them once the ServiceNow field names are known. A change request created in
+dual-write mode also gets its comment rows in PostgreSQL; if csm-sync-service syncs
+the ServiceNow journal back it may add its own copies.
+
+### Customer Approval / Customer Review checkboxes
+
+Real ServiceNow's change request form has two checkboxes on creation, **Customer
+Approval** and **Customer Review**. They are implemented as
+`change_request.customer_approval_required` / `customer_review_required`
+(migration `0189_change_request_customer_gates.sql`, `BOOLEAN NOT NULL DEFAULT
+false`, idempotent) and the API fields **`customerApprovalRequired`** /
+**`customerReviewRequired`** — accepted on `POST /change-requests` and
+`PATCH /change-requests/{id}`, returned on the detail response (and the PATCH
+receipt). Postgres data source only.
+
+* **They are NOT `is_customer_approval_required` / `is_customer_review_required`.** Those two
+  record the customer's *outcome* ("the customer has confirmed"): authorized
+  (internal user or registered `PORTAL_USER` contact) and one-way-locked by
+  `authorizeChangeRequestCustomerFlagWrite`, and in the ServiceNow scripted API
+  only writable while the change is in the matching state (`isCustomerApproved:
+  false` there moves it to Cancelled, `isCustomerReviewed: false` to Rollback —
+  see `EditChangeRequestDialog.tsx`'s doc comment). The new columns are the
+  *requirement*. No code or comment in this repo ties the form's checkboxes to
+  the existing columns (the older note that two records with both booleans
+  `false` offered different branches points the other way), so they got columns
+  of their own. The ServiceNow field names of the two checkboxes are **not
+  discoverable from this repo** (the SN client talks to a Choreo API whose
+  source is not here), so they are not mirrored: the dual-write mirror strips
+  them from the PATCH it replays (and skips the mirror entirely when nothing
+  else is in the PATCH); the pure ServiceNow data source ignores them.
+* **Approval gate.** Wherever the flow moves a change to Scheduled — CAB / ECAB
+  approval in `DecideChangeRequestApproval` (`approvalGateTarget`), or Request
+  Approval on a Standard change (`requestApprovalDestination`; Standard has no
+  internal approval to put the gate after, so the gate sits right after Request
+  Approval — an assumption) — a change with `customerApprovalRequired` goes to
+  **`customer_approval`** instead. There `legalNextStates` is `[scheduled,
+  canceled]`; the human PATCH `{state: "scheduled"}` records the customer's
+  approval: it stamps `is_customer_approval_required = true` through the same
+  `authorizeChangeRequestCustomerFlagWrite` (authorization + lock) a direct
+  `isCustomerApproved` write uses and schedules the change. A manual `scheduled`
+  from any other state is refused; so is `{state: "scheduled",
+  isCustomerApproved: false}`. Cancel is the customer declining. The
+  `isCustomerApproved: false → Cancelled` behaviour belongs to the ServiceNow
+  scripted API; the Postgres path never had it and still does not.
+* **Review gate.** `review` offers `[customer_review, rollback, canceled]` when
+  `customerReviewRequired`, else `[closed, rollback, canceled]` (**a behaviour change for
+  rows that predate the checkbox: they default to false and Review now offers
+  Closed directly instead of both**). A manual `{state: "customer_review"}` is
+  refused when not required ("customer review is not required …"), and
+  `{state: "closed"}` from `review` is refused when required ("customer review
+  is required …; move it to customer_review first"). `customer_review` offers
+  `[closed, rollback, canceled]`; closing from it stamps `is_customer_review_required = true`
+  (same authorization/lock). No other transition is graph-checked — as before,
+  the PATCH does not enforce a full transition graph.
+* **Editable only until the gate is passed** (`validateCustomerGateEdits`,
+  checked under the `change_request` row lock): `customerApprovalRequired`
+  while the state is New / Assess / Authorize; `customerReviewRequired` up to
+  and including Review. A *change of value* after that is a 400 (`customerApprovalRequired
+  can no longer be changed: the change request has already passed the approval
+  stage (current state: X)` / `customerReviewRequired can no longer be changed:
+  the change request has already left the review stage (current state: X)`);
+  resending the stored value is accepted. The flag in the same PATCH wins over
+  the stored one for the state routing (`{state: "closed", customerReviewRequired:
+  false}` from a required Review closes it; `{state: "assess",
+  customerApprovalRequired: true}` on a Standard change lands in
+  `customer_approval`).
+* **Customer Group: who gives the customer's answer.** See the next section.
+* Tests: `TestChangeRequestFlowIntegration_*CustomerGate*` /
+  `*CustomerApproval*` / `*CustomerReview*` / `ManualScheduledOnlyFromCustomerApproval`
+  (real Postgres, `CHANGE_REQUEST_TEST_DSN`), `TestLegalChangeRequestNextStates`,
+  `TestCustomerGateHelpers`, the service tests
+  `TestChangeRequestService_*CustomerGate*`, and the csm-portal BFF handler tests.
+
+### Customer Group: approving / rejecting Customer Approval and Customer Review
+
+A change request's **Customer Group** is **not a group you pick**: it is
+derived, live and read-only, from the change request's **Customer Project** — the
+project's **registered contacts** (`customerContacts` on the detail response and on
+`POST /change-requests/link-options`; the UI label stays "Customer Group"). It is
+never stored, so it can never point at another customer's people: a contact belongs
+to exactly the project it was registered on. When the change reaches
+`customer_approval` / `customer_review`, **those contacts get an Approve / Reject
+action in the Approvals tab**, like any other stage. Code: `change_request_links.go`
+(`customerContactsSQL`, `loadProjectCustomerContacts`, `customerContactRefs`),
+`change_request_approval_flow.go` (`provisionCustomerStage`,
+`applyCustomerStageOutcome`, `customerStageSpec*`).
+
+* **Who is a customer contact.** A `project_contact` of the change request's
+  `work_item.project_id` in state **`REGISTERED`** holding the **`PORTAL_USER`**
+  project role (through `project_contact_group` → `project_group_role` →
+  `project_role` — the very chain `callerMayGrantChangeRequestCustomerFlag` uses
+  for "a registered contact with role X on project Y"), whose `"user"` is active.
+  The name/email/user come from `account_contact.user_name` matched
+  case-insensitively to `"user".user_name`, as in `ProjectContactRepository`
+  (a contact with no `"user"` row is listed with its contact email but cannot
+  hold an approval). `INVITED` / `RE-INVITED` / `DEACTIVATED` contacts, contacts
+  holding only `SECURITY_CONTACT`, and deactivated users are not in the group.
+  Empty (`[]`, never null) when the change request has no project or the project
+  has no such contact. `change_request.customer_group_id` (migration 0075) is no
+  longer written or read; a stored legacy value is ignored (also for approvals).
+* **API.** `customerGroupId` is **no longer accepted** on create or PATCH (any
+  value, `null` included): 400 `customerGroupId is no longer accepted: the customer
+  group is derived from the customer project's registered contacts`
+  (`RejectRemovedCreateFields` / `RejectRemovedPatchFields`: in the service before
+  anything else — so before ServiceNow is called — and again in the repository).
+  The detail response drops `customerGroup` for `customerContacts:
+  [{id (project_contact.id), name, email?}]` (name order).
+* **Eligible approvers** = the contacts' active users minus the CR's creator (listed
+  `cancelled` like on every other stage; they can never decide). The
+  INTERNAL-only rule does **not** apply to customer stages (the contacts are
+  external).
+* **Stages.** Entering `customer_approval` writes an `approval_stage`
+  `checkpoint_label = "Customer Approval"`, **`assignment_group_id` NULL** (the
+  group is not a `"group"` row), one `requested` `approval_stage_approver` per
+  eligible contact; entering `customer_review` the same with `"Customer Review"`.
+  Entry points (all call `provisionCustomerStage`): CAB / ECAB approval cascade,
+  Request Approval on a Standard change, the `{state: "customer_review"}` PATCH,
+  and any PATCH that carries `state` **or `projectId`**. The stage kind rides on
+  `checkpoint_label` (`stageKindCustomerApproval` / `stageKindCustomerReview` in
+  `classifyApprovalStage`) — **no migration**. The approvals read response shows
+  them under those labels, `approverName` = `"Customer Group"` (the fixed
+  `customerGroupDisplayName`), `approverType` `STATIC_GROUP`. The Customer stages
+  are excluded from the internal checkpoint ordinal count in
+  `provisionApprovalStage`, so the Review stage of a Normal change is still
+  created after a Customer Approval stage exists.
+* **Decisions** go through `DecideChangeRequestApproval` (first responder wins,
+  siblings cancelled, `canDecide` true only on a member's own `REQUESTED` row).
+  Outcomes, applied in the same transaction:
+
+  | Stage | Approved | Rejected |
+  |---|---|---|
+  | Customer Approval | `scheduled`, `is_customer_approval_required = true` | `canceled` |
+  | Customer Review | `closed`, `is_customer_review_required = true` | `rollback` |
+
+  Rejected review -> `rollback` (which also cancels the change's still-requested
+  approver rows): the same state a human reaches with the manual Roll back
+  action from `review` / `customer_review` (see "Roll back" above), and
+  `canceled` for a declined approval matches the ServiceNow `isCustomerApproved:
+  false` semantics. **`rollback` is terminal** (`legalNextStates` none). The decision comes from the approval, so the flag stamp bypasses
+  `authorizeChangeRequestCustomerFlagWrite` (the decider is a project contact).
+* **A non-contact** (or anyone without a `requested` row) deciding on a change
+  waiting on its live customer stage gets a **403** `only members of the
+  customer group (the registered contacts of this change request's project) can
+  approve or reject the customer's approval|review of this change request` (the
+  creator keeps "the creator of a change request cannot approve it"); elsewhere
+  the old 404 "no pending approval found" stays. **Customer A's contacts can
+  neither be asked about, nor decide, customer B's change request.**
+* **Who can reach the decision endpoint — read this.** `DecideChangeRequestApproval`
+  decides as the caller's own `"user"` (resolved from the `x-user-id-token` email) and
+  only on their own `requested` row, so a registered contact's token would be
+  accepted *by the entity service*. But in this repository the only route to it is
+  the **CSM portal BFF** (`POST /change-requests/{id}/approvals/decision`,
+  `PermWrite` = the `cs_engineer` / `admin` roles): registered *customer* contacts
+  have no access to the CSM portal, and no customer-facing app here calls it. So a
+  live customer stage is, today, answerable only by a person who is both a
+  registered project contact **and** a CSM user with `PermWrite` — in the local seed
+  dave.mendis / erin.jayawardena are exactly that (the local mock-oidc login gives
+  any email the `cs_engineer` group, and the BFF takes `PermWrite` from the JWT
+  group, so a customer persona can answer from the portal locally). In production, until a customer-facing
+  client for this endpoint exists (not built here), a live stage cannot be answered
+  by the real customer, and with a live stage `legalNextStates` offers only
+  `canceled` (the manual `scheduled` / `closed` is refused). The ServiceNow
+  workflow is the same shape (customer-side approvers answer in ServiceNow).
+* **Fallback so nothing strands.** No project, or a project with no eligible
+  contact: **no stage**, and the manual paths work as before
+  (`customer_approval` `[scheduled, canceled]`, `customer_review` `[closed,
+  canceled]`). With a live stage, `legalNextStates` is `[canceled]` for both
+  states and a manual `{state: "scheduled"}` / `{state: "closed"}` is a **400**
+  `state "scheduled" cannot be set manually: the customer's approval has been
+  requested from the customer group (the registered contacts of the change
+  request's project) and is given by one of them approving or rejecting it in the
+  change request's approvals (POST /change-requests/{id}/approvals/decision)`. Cancel stays available and cancels
+  the pending rows.
+* **Project (and contacts) changed later** (`provisionCustomerStage`, idempotent,
+  under the `change_request` row lock; the stage is compared with the project's
+  *current* eligible contact set): project set while already in the state -> the
+  stage is provisioned; resent/unrelated PATCH -> nothing; project changed (or a
+  contact registered / deregistered since) while a stage is live -> the old stage's
+  `requested` rows are `cancelled` and a new stage is provisioned for the new
+  project's contacts (never two live stages; the old stage stays as a record);
+  project without contacts -> pending rows cancelled, manual path back. A stage
+  already approved/rejected is never re-provisioned. Project edits follow the
+  existing edit window (up to `scheduled`); contacts are re-read only when a write
+  touches the state or the project.
+* **ServiceNow.** Not mirrored beyond the existing decision replay
+  (`approval_decision` writeback); no ServiceNow field names for customer-group
+  approvals are guessed. The pure ServiceNow data source is unchanged
+  (`withoutManualScheduled` still offers `scheduled` from customer approval).
+* **ServiceNow impact.** The dual-write mirror used to forward `customerGroupId`;
+  it no longer does (nothing to send). Pure-ServiceNow reads no longer map
+  `customerGroup`.
+* Seed: `scripts/csm-compose/seed-entity-service.sql` seeds two customers — Example
+  Corp (project 401, registered contacts dave.mendis and erin.jayawardena) and Other Corp
+  (project 402, registered contact sam.other) with the `PORTAL_USER` role /
+  "General Access" project group they hold — and CHG-FIXED-007
+  (`customer_approval`) / CHG-FIXED-008 (`customer_review`) on project 401 with
+  their stages (no assignment group). See "Local seed personas" below.
+* Tests: `TestChangeRequestFlowIntegration_CustomerGroup*`,
+  `_StoredCustomerGroupIsNoLongerUsedForApprovals`, `_SeedCustomerGroupFixtures`,
+  `TestChangeRequestScopeIntegration_CustomerContactsAreDerivedFromTheProject`,
+  `_CreateRefusesRemovedFields`, `_PatchRefusesRemovedFields`,
+  `_LinkOptions` (real Postgres), `TestRejectRemovedChangeRequestFields`,
+  `TestCustomerStageSpecs`, `TestWithoutManualCustomerOutcome`,
+  `TestCustomerStageManualRefusal`, `TestClassifyApprovalStage`.
+
 **`scanChangeRequestView`/`scanChangeRequestViewAndDetail` had a
 scan-destination bug** found in production logs: `wi.created_on`/
 `wi.updated_on` (`TIMESTAMPTZ`) were scanned directly into
@@ -2634,8 +3615,8 @@ everywhere else, and is presumably populated in real synced environments by
 `csm-sync-service` mirroring ServiceNow's own `sys_user_grmember`, the same
 way `assignment_group_id` itself is populated from `sys_user_group`.
 
-**The second approval checkpoint, Authorize ("Risk approvals" in real
-ServiceNow), now gets the identical auto-provisioning treatment as Assess**
+**(Superseded — see "Approval flow by change type" above: the second stage is now the separate `CAB Approval` group, not the assigned team, and is only provisioned by the peer-approval cascade, never by a direct `{state: "authorize"}` PATCH.) The second approval checkpoint, Authorize ("Risk approvals" in real
+ServiceNow), got the identical auto-provisioning treatment as Assess**
 — the same gap, one lifecycle step later: a change request that reaches
 Authorize with nothing in `approval_stage`/`approval_stage_approver` for it
 is just as stuck as the original Assess-empty-Approvals-tab bug this whole
@@ -2871,6 +3852,11 @@ the Cancel Change action was observed available on every reachable state.
 return `nil` (terminal, no legal forward move), matching ServiceNow's own
 answer for a record with none.
 
+> **Historical — superseded by "Approval flow by change type" and "Customer
+> Approval / Customer Review checkboxes" above.** Authorize no longer offers
+> Scheduled / Customer Approval to a human, and Review's branch is now decided by
+> `customerReviewRequired` instead of offering both. Kept for the reasoning.
+
 **Authorize and Review each have two confirmed forward moves, not one —
 found the hard way.** A first revision of this map picked a single "common
 case" edge for each (Authorize→Scheduled, Review→Closed), reasoning that
@@ -3071,17 +4057,13 @@ fields are always null on the ServiceNow-backed data source: the Choreo
 `GET /change-requests/{id}/approvals` response has no equivalent fields to
 populate them from.
 
-**Linking happens entirely through `PATCH`, never at creation** —
-`CreateChangeRequestRequest` has no project/case field at all;
-`PatchChangeRequestRequest.ProjectID`/`DeploymentID`/`DeployedProductID`/
-`AssignedEngineerID` map directly to their `work_item` columns, and
-`CaseID` maps to `work_item.parent_id` (`domain.LinkedChangeRequestRef`'s
-own doc comment already describes this as "the reverse of
-`PatchChangeRequestRequest.CaseID`" — confirmed here as the generic
-`work_item.parent_id` self-reference, migration 0039, not case-specific).
-Because of this, `SearchChangeRequestView.Project`/`Case` can be empty
-(`EntityRef{}`)/`nil` for a change request that exists but hasn't been
-linked yet — a real, valid state for this schema, not a bug.
+**Linking** — `CaseID` (`work_item.parent_id`, the generic self-reference, migration
+0039, not case-specific) and `AssignedEngineerID` are still PATCH-only. The
+Customer Project / Deployments / Deployment products fields can now be set at
+creation too (migration 0191, see "Customer project, deployments and deployment
+products" below); `SearchChangeRequestView.Project`/`Case`
+can still be empty (`EntityRef{}`)/`nil` for a change request that was created
+without them and never linked — a real, valid state for this schema, not a bug.
 
 **"On hold" is now a real, enforced concept — it had no representation
 anywhere in this schema at all before.** A live investigation of the real
@@ -3098,9 +4080,10 @@ regardless of any ServiceNow-side hold, a confirmed, real gap between this
 mirror and the system it models.
 
 - **Schema** (migration 0178): `change_request.is_on_hold BOOLEAN`,
-  `on_hold_reason TEXT`, `on_hold_started_on TIMESTAMPTZ`. Shape follows two
+  `on_hold_reason TEXT`. (`on_hold_started_on` was added here originally and dropped
+  again in migration 0190 — ServiceNow has no equivalent field and nothing consumed it.) Shape follows two
   existing precedents in this same table rather than inventing a third: the
-  boolean naming matches `is_customer_approved`/`is_customer_reviewed`/
+  boolean naming matches `is_customer_approval_required`/`is_customer_review_required`/
   `is_planning_visible_to_customers` (migration 0043), and the
   flag-plus-"since" pairing mirrors `work_item.workaround_provided_on`/
   `workaround_provided_by_user_id` (migration 0021) — a nullable TIMESTAMPTZ
@@ -3114,8 +4097,7 @@ mirror and the system it models.
   file already documents for e.g. `account.deleted_on`.
 - **Domain** (`internal/domain/entity.go`): `SearchChangeRequestView` (and
   therefore `ChangeRequest`, which embeds it) gained `OnHold *bool`/
-  `OnHoldReason *string`/`OnHoldSince *string` (RFC3339, same convention as
-  `PlannedStartOn`/`PlannedEndOn`) on the read side.
+  `OnHoldReason *string` on the read side.
   `PatchChangeRequestRequest` gained `OnHold *bool`/`OnHoldReason *string` on
   the write side — plain optional pointers, not the tri-state
   pointer-to-pointer convention the Group C1/C2 "field-parity additions"
@@ -3174,19 +4156,16 @@ mirror and the system it models.
   deliberately: being on hold only ever blocks *advancing the lifecycle*,
   never any other field.
 - **The write semantics** (same function, in the `change_request` `UPDATE`'s
-  own field-by-field block): `OnHold: true` sets `is_on_hold = true` and
-  always refreshes `on_hold_started_on = NOW()` — even on a change request
-  already on hold, a resent `{onHold: true}` is treated as a fresh hold
-  event — and sets `on_hold_reason` to `OnHoldReason` if provided in the same
+  own field-by-field block): `OnHold: true` sets `is_on_hold = true`
+  and sets `on_hold_reason` to `OnHoldReason` if provided in the same
   request, else clears it to `NULL` (a fresh hold event does not inherit a
   stale reason text from whatever hold period preceded it). `OnHold: false`
-  always clears both `on_hold_reason` and `on_hold_started_on` to `NULL`
-  regardless of whether `OnHoldReason` also accompanies the same request —
+  always clears `on_hold_reason` to `NULL` regardless of whether `OnHoldReason` also accompanies the same request —
   taking a record off hold wins over setting a reason in the same call.
   `OnHoldReason` sent alone (`OnHold` omitted) only updates the reason text,
   letting a caller correct or add a reason on an existing hold without
-  resending `OnHold` itself; it has no effect on `is_on_hold`/
-  `on_hold_started_on` and is not validated against the record's current
+  resending `OnHold` itself; it has no effect on `is_on_hold`
+  and is not validated against the record's current
   on-hold status (a reason sent while not on hold is written but harmless —
   not cross-validated, matching this PATCH's existing "don't over-engineer a
   rarely-meaningful combination" posture elsewhere in this same field set).
@@ -3197,7 +4176,7 @@ mirror and the system it models.
   and a blocked-reason display on the action bar are a deliberate follow-up
   cycle once this API contract exists, not part of this change.
 
-**`is_customer_approved`/`is_customer_reviewed` are now authorized and
+**`is_customer_approval_required`/`is_customer_review_required` are now authorized and
 one-way-locked — the last gap in this schema's four internal approval
 checkpoints plus these two customer-facing fields had no authorization of
 its own at all before this.** `PatchChangeRequestRequest.IsCustomerApproved`/
@@ -3213,7 +4192,13 @@ decision:
 
 - **No schema change, no `approval_stage` involvement at all.** These stay
   the plain booleans they already were (migration 0043); this adds
-  authorization on top of the existing columns, not a new mechanism.
+  authorization on top of the existing columns, not a new mechanism. (They
+  record the customer's *outcome*. The creation form's "Customer Approval" /
+  "Customer Review" checkboxes — whether the customer step is *required* — are
+  separate columns, `customer_approval_required` / `customer_review_required`;
+  recording the outcome is what `{state: "scheduled"}` out of `customer_approval`
+  and `{state: "closed"}` out of `customer_review` do through this very
+  authorization — see "Customer Approval / Customer Review checkboxes".)
 - **Who may flip a flag `false` → `true`**: either (a) an internal/staff
   caller — `repository.CallerIdentityFromContext`'s own `Unrestricted`, the
   exact `INTERNAL` resolution `AccessService.ResolveScope`/
@@ -3640,7 +4625,12 @@ every work_item type comes from `next_portal_work_item_number()`
 (`'CS-PORTAL-' || a zero-padded sequence value`, `portal_work_item_number_seq`)
 -- a visually distinct prefix rules out any collision with ServiceNow's own
 still-running `CS` + 7-digit sync, the same reasoning migrations `0113`/`0115`
-already used for GitHub-sourced records (`CHG-GH-...`/`SR-GH-...`). `wso2_id`
+already used for GitHub-sourced records (`CHG-GH-...`/`SR-GH-...`).
+**Exception: `INCIDENT_TASK`** (migration `0201`) takes ServiceNow's format
+from 0180's TASK series, `next_work_item_number('INCIDENT_TASK')`, started at
+`TASK1000000` -- far above ServiceNow's range (TASK0084630 on staging,
+2026-10-07), as outages did with `OUT0010000`. The cutover seed script only
+moves sequences forward, so it is unaffected. `wso2_id`
 (required, by `work_item_wso2_id_required_by_type`, only for the five
 case-like types -- CASE/SERVICE_REQUEST/ENGAGEMENT/SECURITY_REPORT_ANALYSIS/
 ANNOUNCEMENT) comes from `next_portal_wso2_id(project_id)`
@@ -4073,11 +5063,21 @@ by the generic `work_item_id`. Unlike `SearchCaseActivities`, there is no
 `case_attachment`-equivalent table for incidents, so this feed can never
 have an `"attachment"` kind entry.
 
-**`UpdateConversation` is implemented** (a plain `conversation.state` enum
-write, no `work_item.number` generation needed for an update) but
-**`CreateConversation` is not**: it needs `work_item.number`, which has no
-DB default or backing sequence anywhere in `migrations/` -- the same blocker
-`CaseRepository.CreateCase` used to have.
+**`UpdateConversation` and `CreateConversation` are both implemented.**
+`CreateConversation` takes its number from `next_portal_work_item_number()`
+(migration 0140), starts the conversation `ACTIVE`, and stores the first
+message the way csm-sync-service lands ServiceNow's `u_initial_message`:
+`work_item.subject` (first 100 runes) and `work_item.description` (in full).
+`InitialMessage` on reads is that description, falling back to the earliest
+comment. Under dual-write it is ServiceNow-first and synchronous, like
+`createProblemSNFirst`, so the row carries ServiceNow's id and later comment
+mirrors target a conversation ServiceNow knows. Migration 0190 replaced
+0146's internal-only INSERT policy on `conversation` with `conversation_write`
+(internal or project member, same as `case_write`); the work_item and
+conversation rows are inserted as two statements in one transaction because
+that policy's work_item lookup cannot see a sibling CTE's insert. Without
+this, every Novera chat on Postgres failed at create and nothing was
+persisted.
 
 **`CreateProblem`/`CreateIncident` are now implemented on the plain-Postgres
 data source too**, via `next_portal_work_item_number()` (migration 0140 --
@@ -4093,11 +5093,36 @@ all). Neither needs `wso2_id`: both are excluded from
 `work_item_wso2_id_required_by_type`. `problem.state` has no column default
 of its own (unlike `incident.state`, which defaults to `'NEW'`), so
 `CreateProblem`'s portal path hardcodes it to `'NEW'::problem_state_enum`
-explicitly. `CreateConversation` was not attempted alongside these -- no
-reported need for it yet, and extending the same fix to it is a similarly
-small, mechanical follow-up should one come up.
+explicitly. `CreateConversation` followed later -- see above.
 
-**`UpdateProblem`/`UpdateIncident`/`HandOffIncidentToSpecialist` are also not
+**`HandOffIncidentToSpecialist` is implemented on Postgres** and writes
+Postgres only -- no ServiceNow call, in dual-write mode too.
+`incident_handoff_service.go` ports `IncidentHandoffUtils.handOff` (the
+"Escalate to Special Ops" UI action): eligibility as 409s, and one
+transaction that moves `work_item.assignment_group_id`, clears the assignee,
+opens a TASK-numbered `[Runbook Task]` (in the same Special Ops group --
+WSO2 SRE Team no longer exists) and writes the reason JSON as a work note.
+Routing is configuration, not code or tables: `SPECIALIST_HANDOFF_CONFIG`
+(one line of JSON, `specialist_handoff_config.go`, validated at startup --
+a bad value refuses to start) lists products, each with its service ids,
+its Special Ops teams (`key` = the handoff's `escalationTeam`, `label`,
+`groupId`) and an optional GitHub repo. A product with several teams
+(Choreo) requires `escalationTeam`; one with a single team (Asgardeo) takes
+it and records no team, as SN does. `GET /specialist-handoff-teams?serviceId=`
+feeds the dialog, and `IncidentView.CanHandOffToSpecialist` (SN's
+`canEscalateToSpecialOps`; false when the incident is already with any of
+its product's groups) is computed in the service from the config.
+The GitHub issue and the "Escalated to Special Ops team." note follow,
+best effort. Each product's repo picks a token by `github.credential`
+(default: its owner) from the secret `SPECIALIST_HANDOFF_GITHUB_TOKENS`
+(`{"<credential>":"<token>"}`, falling back to `GITHUB_TOKEN`), one client
+per credential (`WithHandoffIssueCreators`), independent of the
+change-request GitHub sync. No token: the handoff still succeeds and reports
+`githubIssueError`. No webhook -- SN never reads anything back from the
+issue. `IncidentView.SpecialistHandoff` is derived at
+read time from those notes and the task, as SN's `getHandoffSummary` does.
+
+**`UpdateProblem`/`UpdateIncident` are also not
 implemented**: `UpdateProblem.Transition` is validated
 server-side by ServiceNow's own workflow engine with no fixed, confirmed
 transition rule set to reimplement (see that field's own doc comment --
@@ -4107,13 +5132,7 @@ deliberately not a closed enum for exactly this reason);
 that do, and would need `comment`-table side effects for
 `AdditionalComments`/`WorkNotes` mirroring `caseService.UpdateCase`'s own
 comment-on-update behavior -- deferred as a unit rather than
-half-implemented; `HandOffIncidentToSpecialist` is an inherently
-ServiceNow-workflow-specific feature (moves the incident to a specialist
-group, opens a runbook-gap task, files a GitHub issue) with no
-assignment-group or handoff-tracking concept anywhere in this schema to
-derive an equivalent from. `IncidentView.SpecialistHandoff` is always `nil`
-on this data source for the same reason -- the correct "never handed off"
-representation per that field's own doc comment, not a gap.
+half-implemented.
 
 `IncidentView.WatchList`/`LinkedServiceRequests` are always empty slices on
 this data source (never populated) -- `work_item_watcher` could back the
@@ -4917,6 +5936,23 @@ precondition changed underneath the caller, a real race) or the propagated
 `NotFoundError` if it doesn't (checked via one extra `Get`, only on this rare
 path, so the common case stays a single round trip).
 
+**`POST /announcement-requests/search` filters by state two ways, and they are
+mutually exclusive.** `state` (one value) is the original field; `states` (a
+list) matches a request in *any* of the listed states and returns them as one
+merged list — ordered newest-first and paginated as a whole, so `total`/`hasMore`
+describe the merged result rather than one state. The repository query is
+`state = ANY($4::text[])` against a nil-when-empty `text[]`, so an omitted or
+empty `states` means "no state filter," never "match nothing." `Search` rejects
+`state` + `states` together (judged by the field being *sent*, so an explicit
+`"states": []` alongside `state` is rejected too), any state outside the four
+lifecycle values, and `readyForScheduledPublish` combined with either (that flag is the
+`csm-scheduled-tasks` cron's own "approved and due" query and ignores state
+filters by design). `state` is deliberately kept rather than folded into
+`states`: the registry's published-requests lookup and the cron both send it,
+and the handler's `decodeRequest` rejects unknown JSON fields, so a client that
+sends only `state` (as the CSM portal's Requests tab does for a one-state
+selection) keeps working against a build that predates `states`.
+
 This service never creates the real per-project cases itself — `MarkPublished`
 only records that publishing happened, by whom, and when. The actual fan-out
 (`POST /cases` per project) is, and remains, the caller's own job, unchanged
@@ -5005,6 +6041,39 @@ lookups (`GetUserByEmail`) leave it nil. Two things worth knowing:
   together (`csmUsers.ts`'s `isSnUser` no longer looks at `roles`).
 - `GET /users/{id}` (the profile page) is registered only for the ServiceNow data
   source; it is not available on Postgres at all.
+
+## POST /users/by-ids failed the whole batch on one non-UUID id
+
+Reported live: the staff portal's Knowledge page called `POST /users/by-ids` to
+resolve author names and got a 500 ("Failed to look up users."), so no row showed
+an author. The page builds the id list from each article's `authorId` **and**
+`updatedBy`, and `knowledge_article.updated_by` (migration 0044) is a free-text
+`VARCHAR(255)`, not a user reference: on one page of 20 articles, 6 values were sent,
+4 shaped like UUIDs, 1 like an email address and 1 a short plain string. `"user".id`
+is a UUID column, so `WHERE id = ANY($1)` makes Postgres reject the whole statement
+(`invalid input syntax for type uuid`, SQLSTATE 22P02) on the first value that is not
+a UUID, which also drops the lookup for the valid ids in the same batch.
+
+Fixed in `userService.GetUsersByIDs`: values that are not well-formed UUIDs
+(`validate.IsUUID`, case-insensitive) are skipped before the repository is called,
+and a batch with none left answers `{"users": []}` without querying. Skipping
+rather than rejecting is deliberate: a value that is not a UUID can never match a
+row, so the answer is the one a query would have given for an unknown id, and a 400
+(what `validateUUIDs` returns for a single path or body id) would fail the page just
+as the 500 did. The wire contract is unchanged (`openapi.yaml` only gained a
+description), the repository is untouched, and no webapp change is needed: the
+lookup tolerates whatever a caller builds its list from, and every caller of
+`useUsersByIds` (the KB All, List, Admin and Review Queue pages and the article
+timeline) benefits at once.
+
+Because ids are filtered here, a free-text `updated_by` never resolves to a name; a
+caller that wants to show one has to fall back to the raw value itself.
+
+`user_service_by_ids_test.go` pins what reaches the repository (valid ids only, in
+order; no query when none are valid; errors still propagate).
+`user_by_ids_integration_test.go` (skipped without `CASE_STATS_TEST_DSN`) runs the
+service over the real repository on a real `"user"` table; against the unfiltered
+code it fails with Postgres's own `invalid input syntax for type uuid`.
 
 ## GET /users/{id} on the Postgres data source
 
@@ -5157,6 +6226,48 @@ other reader of it. `GetProjectDetails`'s own `sf_id` scan (a separate query,
 a separate endpoint) was not touched -- not reported broken, so left alone
 rather than fixed speculatively.
 
+## SearchKBArticles failed on any page containing a row with a NULL body/state/author_id
+
+Reported live: `POST /kb-articles/search` returning 500 (`cannot scan NULL into
+*string`), which the staff portal's Knowledge page surfaced as "Failed to search
+KB articles". `knowledge_article` (migration 0044) allows NULL in `body`, `state`,
+`knowledge_base_id`, `author_id` and `latest`, and on staging 2,386 of the 7,794
+`latest = true` rows have a NULL `body`, 2,403 a NULL `author_id` and 1 a NULL
+`state` (`knowledge_base_id` had none). `domain.KBArticle` declares all five as
+required, non-pointer fields, and `scanKBArticle` scanned the columns straight
+into them, so a single such row failed the whole page.
+
+Fixed the same way as `CaseView.InternalID` and `DeploymentView.Type` (see those
+sections above): the wire contract is unchanged (`KnowledgeBaseID`/`Body`/`State`/
+`AuthorID` stay required strings, `Latest` a plain bool, `""`/`false` when the
+column is NULL, so `openapi.yaml` and the portal clients are unaffected), and only
+the scan side changes. `scanKBArticle` scans those five columns into pointer
+locals and converts them with `stringOrEmpty(...)` (`latest != nil && *latest`
+for the bool). It is the only place that scans `knowledge_article` columns, and
+`CreateKBArticle`, `GetKBArticleByID`, `SearchKBArticles`, `UpdateKBArticleState`
+and `UpdateKBArticleContent` all go through it, so every read path and every
+`RETURNING` scan is covered by the one change.
+
+`kb_article_repo_test.go` scans rows with NULL columns through a fake row that,
+like pgx, rejects a NULL into a non-pointer destination, so it fails if the scan
+reverts to plain destinations. `kb_article_repo_integration_test.go` runs search,
+get-by-id and edit against a real `knowledge_article` table (skipped without
+`CASE_STATS_TEST_DSN`).
+
+An article whose `state` is NULL reads as `state: ""`. The service's
+`isLegalKBArticleTransition` has no transition out of an unrecognised state, so
+`PATCH` on such an article returns a 400 ("invalid state transition") rather than
+a 500 — it is listed and viewable, but needs its state set before it can move
+through review.
+
+Not covered here: `knowledge_article_history` (legacy migration
+`000030_knowledge_article_history.up.sql`) is absent from the staging database.
+Two paths use it — `ListKBArticleHistory`, and the history insert inside
+`UpdateKBArticleState`'s transaction (so a state transition rolls back entirely
+there) — and both still fail until the table exists. `UpdateKBArticleContent` does
+not touch it. That is a schema gap, separate from the NULL scan above, and does not
+affect search.
+
 ## Case feedback silently 404'd on the Postgres data source instead of a documented 503
 
 Reported live: a case's Activity timeline always showed "Could not load Case
@@ -5184,11 +6295,212 @@ added `work_item_feedback`, and `pgFeedbackService`
 /cases/feedback/search` and `/aggregate` for both the `postgres` and
 `postgres-servicenow-dual-write` data sources (dual write reads Postgres, never
 the backing system). `unavailableFeedbackService` is now only the fallback for
-a data source with no feedback store. Known gaps: the table stores no
-per-rating reason chips, so every `reasons_*` bucket returns an empty result;
-`GET`/`POST /cases/{id}/feedback` (the emoji submission contract) is still a
-503 on Postgres because `work_item_feedback` has no emoji id, chip ids or
-assessment id to serve it from.
+a data source with no feedback store. Known gap: the table stores no
+per-rating reason chips, so every `reasons_*` bucket returns an empty result.
+`GET`/`POST /cases/{id}/feedback` (the emoji submission contract) now has a
+real Postgres implementation too — see the dedicated section below.
+
+## GET/POST /cases/{id}/feedback and GET /metadata's feedbackEmojies on Postgres
+
+`GET`/`POST /cases/{id}/feedback` used to be a hardcoded 503 on this data
+source ("case feedback is only supported for the [synced data source]").
+Migration `0127`/`0128` (`work_item_feedback_metric`/
+`work_item_feedback_metric_option`/`work_item_feedback_reason`, mirrored
+from the same upstream sync that already populates `work_item_feedback`
+itself) give this a real implementation:
+`internal/repository/case_feedback_repo.go` (`CaseRepository.GetCaseFeedback`/
+`CreateCaseFeedback`), wired into `case_service.go`'s own `GetCaseFeedback`/
+`SubmitCaseFeedback`.
+
+**The emoji catalog is five rows, resolved by name, not by a stored FK.**
+`work_item_feedback` (migration `0102`) has no column saying which emoji/
+metric a submission picked — only a plain `rating` (1-5) and `rating_label`
+(e.g. `"Very Satisfied"`), the exact shape the upstream sync already writes.
+Every `"<rating> - Reasons"` row of `work_item_feedback_metric` is, by
+construction, its clean rating label plus the fixed `" - Reasons"` suffix,
+so `rating_label || ' - Reasons'` always resolves back to the one metric row
+a submission's `emojiId` pointed at — `caseFeedbackRatingByLabel`/
+`resolveCaseFeedbackRating` hold this fixed, closed 5-value correspondence,
+reused by both the per-case endpoints and
+`ReferenceDataRepository.ListFeedbackEmojis` (`GET /metadata`'s
+`feedbackEmojies` field) so the two can never disagree on what a "rating"
+means. A reason's own `option_value`/`reason` are kept as recorded with no
+FK to `work_item_feedback_metric_option` (migration `0128`'s own design), so
+a since-renamed-or-removed option has no current id to report — that chip
+is left out of `GetCaseFeedback`'s result entirely rather than guessed at.
+
+**Two guards, both enforced inside `CreateCaseFeedback`'s own transaction,
+in this order:**
+
+1. **The case must already be closed.** This form is a post-closure
+   satisfaction survey — the portal only ever offers it once a case has
+   closed — so a submission against a case that's still open is rejected
+   with a `409 ConflictError` ("feedback can only be submitted once the
+   case is closed"), checked via the same `caseLikeStateColumn`/
+   `caseLikeJoins` resolution `GetCaseByID`/`SearchCases` already use for
+   every case-like type, so "closed" can never drift between this check and
+   what the case detail page itself shows.
+2. **One submission per case, ever.** `work_item_feedback.work_item_id` is
+   `UNIQUE`; the insert is `ON CONFLICT (work_item_id) DO NOTHING`, and zero
+   rows returned is a second `409 ConflictError` ("feedback has already
+   been submitted for this case").
+
+Every chip submitted must belong to the submitted `emojiId`'s own option
+set — a chip from a different emoji's question is rejected with a
+`ValidationError`, not silently accepted. `CreateCaseFeedback` validates
+`emojiId` against both `work_item_feedback_metric.is_active` and
+`selected_image IS NOT NULL` — the exact same definition `ListFeedbackEmojis`
+uses for "a real catalog emoji", so a submission can never be accepted for
+an id `GET /metadata` would never have offered as a choice in the first
+place.
+
+**`GetCaseFeedback` (the read side) is internal-caller-only — an
+external/customer caller gets `403 Forbidden` before the repository is even
+reached, by explicit product decision.** A case's submitted feedback (the
+customer's own satisfaction rating/comment) is a one-way signal meant for
+WSO2 staff, never shown back to the customer who submitted it — not even
+for a case they are themselves a registered contact on. `caseService.
+requireInternalCaller` delegates to the shared `RequireInternalCaller`
+(`require_internal.go`), the identical "no scope short of internal is safe
+to hand this out under" gate `slaStatusService`'s own `requireInternalCaller`
+already uses for the same reasoning.
+
+**`CreateCaseFeedback` (the write side) needs no equivalent explicit
+check** — a caller may only submit feedback for a case they actually have
+access to, but this is enforced entirely by RLS on the existence/state query
+above, not by a second access check in the service layer. Every request's
+identity is already stamped onto its context once, by
+`callerIdentityMiddleware` (`internal/server/identity_middleware.go`),
+before any handler runs; `CreateCaseFeedback` runs inside a transaction that
+reads that same identity and sets it as session GUCs, so `work_item`'s own
+`FORCE ROW LEVEL SECURITY` already makes a case outside the caller's scope
+return zero rows on that one query — the same "exists, just not yours ->
+NotFoundError" posture every by-id case read already has. An earlier
+revision added an explicit `GetCaseByID` call here (mirroring
+`EscalationService.CreateEscalation`'s own check-then-mutate shape) before
+realizing it was pure duplication: `GetCaseByID` is the single most
+expensive read in this file (~15 joins plus two extra round trips for
+tags/watchers), re-proving something the one lightweight query
+`CreateCaseFeedback` already runs provides for free. Removed; see
+`TestCaseFeedbackIntegration_RejectsSubmissionForAnOutOfScopeCase`
+(`case_feedback_repo_integration_test.go`) for the real, RLS-level
+regression guard — a service-layer test with a stub repository cannot
+exercise this at all, since RLS only exists in real Postgres.
+
+**Identity, not invention.** `AssessmentID` (`CaseEmojiFeedback`/
+`CaseFeedbackResult`'s own wire field) is left at its Go zero value on this
+data source — there is no assessment-instance concept anywhere in this
+schema to populate it from, unlike the synced path's own real id for it.
+`SubmittedByUserID` comes from `resolveActor`, the same
+`x-user-id-token`-derived lookup every other Postgres-native write in this
+file already uses.
+
+## closed_by_user_id was never written or read on the Postgres data source
+
+Reported live: an externally-closed case showed "Case closed by system"
+regardless of who actually closed it. `closed_by_user_id` is a real column
+on all five case-like extension tables (migrations `0023`/`0024`), and the
+field it backs (`CaseView.ClosedBy`) was already wired up on the synced
+read path — but `case_repo.go` never selected it in `GetCaseByID`, and
+`UpdateCase`'s own state-transition write never set it either. Confirmed
+directly against a real case: `work_item_activity` already had the correct
+closer's email recorded for its `state` field-change entry (the identity
+was available at close time, it just never reached this column).
+
+Fixed on both sides:
+
+- **Write**: `CaseRepository.UpdateCase` gained an `actorID *string`
+  parameter — the resolved caller's own `"user"` id, threaded through
+  `updateCaseQuery` and the four `caseLikeExtensionUpdate` queries. It is
+  stamped onto `closed_by_user_id` only on a transition **to** closed, and
+  cleared back to `NULL` on a transition **away** from closed — the
+  identical transition-gated shape `closed_on` itself already has.
+  `caseService.UpdateCase` resolves `actorID` via the same `resolveActor`
+  call its `recordFieldChangeActivity` already uses, from the caller's
+  `x-user-id-token` **only** — never from the request body, and never
+  guessed at for a pure machine-to-machine caller with no end-user token
+  (that caller's close simply leaves `closed_by_user_id` unset, the same
+  best-effort posture `actorEmail` already has there).
+- **Read**: `GetCaseByID` now joins `"user" closer ON closer.id =` the new
+  `caseLikeClosedByUserIDColumn` (a `COALESCE` across all five extension
+  tables' own `closed_by_user_id`, mirroring `caseLikeClosedOnColumn`'s
+  existing shape) and populates `CaseView.ClosedBy`.
+
+**Forward-only, deliberately.** A case closed before this change keeps
+`closed_by_user_id = NULL` forever unless backfilled separately — nothing
+here retroactively derives it (e.g. from `work_item_activity`'s own
+recorded email), since that would be a data migration decision, not a code
+fix.
+
+## CreateCase enforces a project type's product-category allow-list for case/SR
+
+`project_type.default_case_product_categories`/`sr_product_categories`
+(`deployed_product_category_enum[]`, migration
+`0130_project_type_feature_entitlement.sql`, transcribed from ServiceNow's
+own `ProjectTypeFeatureManager.FEATURE_MATRIX`) were, until now, purely
+advisory: `ReferenceDataRepository.GetProjectByID` already surfaced them as
+`ProjectFeatures.DefaultCaseProductCategories`/`SrProductCategories` via
+`GET /projects/{id}/features`, read-only, for the frontend's own product
+dropdown to filter against (and `SearchDeployedProducts`' fail-open
+NULL-category handling — see that query's own doc comment — exists
+specifically so an uncategorized product isn't hidden from that dropdown).
+Nothing ever stopped a caller from creating a `case`/`service_request`
+against a deployed product whose category didn't match the project type's
+own configured requirement at all — the matrix was real configuration with
+no enforcement behind it.
+
+`caseService.validateDeployedProductCategoryForType` (`case_service.go`)
+closes this at `CreateCase` time, for `type: "case"` (checked against
+`DefaultCaseProductCategories`) and `type: "service_request"` (checked
+against `SrProductCategories`) only — the two types the matrix actually
+names; every other type is unaffected, and a project type with no entry for
+the request's own type ("N/A" in the matrix, an empty/nil slice) stays
+unrestricted exactly as before this check existed.
+
+**Fail-closed on an uncategorized deployed product, by deliberate product
+decision — the opposite of `SearchDeployedProducts`' own read-side
+posture.** A deployed product with no `product_category` set (the majority
+of real rows today) now FAILS this check once a project type restricts the
+request's type, rather than being treated as a wildcard match. The whole
+point of this gate is to make categorizing a deployed product matter; the
+CSM Portal's own Create/Edit Deployed Product dialogs are what let staff set
+one (`apps/csm-portal/webapp`'s `CreateDeployedProductDialog.tsx`/
+`EditDeployedProductDialog.tsx`), closing the loop this check opens.
+
+**One call site, nil-safe, covers both the plain-Postgres and dual-write
+data sources.** `validateDeployedProductCategoryForType` is called from
+`CreateCase` right after the existing `deploymentId`/`deployedProductId`
+UUID validation and before the `s.snMirror != nil` branch — so it runs
+identically whether `s.snMirror` is set (`DATA_SOURCE=postgres-servicenow-dual-write`,
+`createCaseSNFirst`) or nil (plain `DATA_SOURCE=postgres`), with no
+duplicated logic. It depends on two new, optional `caseService` fields
+(`referenceDataRepo`/`deployedProductRepo`), wired via
+`WithProductCategoryEnforcement(svc, referenceDataRepo, deployedProductRepo)`
+— a post-construction step, not a new constructor parameter, specifically so
+every existing `NewCaseService`/`NewCaseServiceWithSNWriteback` call site
+(every test, and `DataSourceServiceNow`'s own `pgCaseFallbackSvc` in
+`routes.go`) keeps compiling and behaving unchanged; the two constructors'
+own doc comments already established this precedent for exactly this
+reason. Both fields nil (the default) skips the check entirely, the same
+posture as every other optional `caseService` dependency
+(`publisher`/`snMirror`/...).
+
+**`DATA_SOURCE=servicenow` does not get this check, by explicit product
+decision** — `routes.go` only calls `WithProductCategoryEnforcement` for the
+`DataSourcePostgresServiceNowDualWrite` and default (plain-Postgres)
+branches. `snCaseService.CreateCase` never reaches `caseService`'s code at
+all (it validates and builds its own ServiceNow payload directly), and its
+`pgFallback` field — already used for three other Postgres-only reads — is
+not wired to either new repository. Staging/production both run dual-write,
+where this data is already available; a plain-ServiceNow deployment is left
+as a documented, known gap, same posture as every other Postgres-only
+feature in this file.
+
+`DeployedProductRepository.GetDeployedProductCategory(ctx, id)` is the one
+new repository method this needed — a single-row lookup
+(`SELECT product_category::TEXT FROM deployed_product WHERE id = $1`,
+lower-cased before returning), deliberately not reusing
+`SearchDeployedProducts`' list/filter machinery for a one-row check.
 
 ## Adding a new entity
 
@@ -5283,6 +6595,7 @@ Migrations live in `migrations/` as plain SQL files, numbered `NNNN_<description
 - **Each file is a complete, forward-only migration** — there is no scripted rollback. A change that needs undoing is a new forward migration, not a `.down.sql`. `IF NOT EXISTS`/`IF EXISTS` guards (already this repo's convention) make every file safe to re-run.
 - **A migration file itself carries no tracking statement.** `make migrate` (Makefile) creates `csm_migration_applied_migration` (`filename TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now()`) if absent, then for each `migrations/*.sql` file, in ascending order: skips it if its name is already in that table, otherwise applies it (`psql -f`) and only then records it with a separate `INSERT INTO csm_migration_applied_migration (filename) VALUES (...)` — this exactly mirrors `operations/csm-sync-service`'s own `make migrate` loop, since both services must track migrations against the same shared database the same way. `scripts/generate_schema_bootstrap.sh` (a combined-file generator for a from-scratch DB, also ported from that service, supporting `--since`/`--from`/`--to` for a delta) is the one thing that *does* append the tracking insert per migration — necessary there because a single concatenated file has no per-statement loop to do it externally.
 - **Numbers `0001`–`0102` are a byte-for-byte, contiguous mirror of `operations/csm-sync-service`'s own `migrations/0001`–`0102`**, including its control-plane tables (`migration_job`/`migration_run`/`sync_checkpoint`/`schema_version`, renamed to the `csm_migration_` prefix at `0091`) — entity-service's own Go code never queries those tables, but the file is kept here anyway so `make migrate` produces the *identical* resulting schema whichever repo it's run from, not just an overlapping subset. A handful of these (e.g. `0025`/`0033`/`0098`) are no-ops against this repo's own already-correct `CREATE TABLE` statements (guarded by `IF EXISTS`/`IF NOT EXISTS`/an already-true condition) — kept anyway, for the same reason. Beyond `0102`, this repo has its own entity-specific migrations that only exist on this side (`0103`+ covers GitHub integration, announcement requests, onboarding steps, the Team Schedule tables, and more — none of it sync-service's concern) — **but a shared-table migration from sync-service is still pulled in verbatim under its own real filename whenever one lands, even at a number this repo has already used for something else of its own.** `0090_outage_affected_ci_table.sql` and `0103`–`0108` (`product_name_unit_unique`, `project_add_onboarding_owner`, `product_version_deployment_profile_unique`, `incident_category_add_missing_values`, `incident_resolution_code_add_resolved_by_caller`, `case_cause_add_user_mistake`) are exactly this: sync-service migrations mirrored in unchanged, coexisting at the same leading number as this repo's own unrelated files there — normal per "Duplicate migration numbers are normal here" in the top-level `cs-tools/CLAUDE.md`, since the tracking key is the full basename. **Never rename a mirrored file to avoid the collision or to fit this repo's own sequence** — the filename is what `csm_migration_applied_migration` tracks it by, so a rename makes `make migrate` treat an already-applied sync-service migration as brand new and re-run it from scratch against a database where the real, differently-named version already ran.
+- **Mirroring a file means copying its SQL, never its license header.** `operations/csm-sync-service` is a proprietary repo and every file there opens with WSO2's proprietary "All Rights Reserved" copyright block; this repo is the open-source mirror (`fork-repos/OpenSource/cs-tools`) and every file here — no exception, migrations included — opens with the Apache 2.0 header instead (see any existing migration for the exact text). A plain `cp` of a new file from sync-service carries the wrong header over; this was missed across ~30 files in one pass before being caught and fixed in bulk (`592fcb844`). When adding a migration that's missing here entirely, replace the copyright block (everything up to the first blank line) with this repo's own Apache header before saving it — never copy the file as-is. A sync-service file with no header at all (some genuinely have none) still gets the Apache header added, matching every other file in this directory.
 - **Whenever a new migration touches a shared table (not something entity-service-only), check `operations/csm-sync-service/migrations/` directly for the next real number before picking one here** — its migrations are the authoritative record of what actually runs against the shared database, and it has continued past whatever this file's own highest number was at any given time. Picking a number here that sync-service has already used for something else creates two same-numbered-but-different migrations across the two repos; `make migrate` from either repo would then apply both under different filenames with no conflict *detected*, silently leaving whichever repo didn't get involved missing the other's columns/tables. When sync-service adds a migration for a table entity-service also cares about (or its own control-plane numbering advances), mirror the file here at the same number, the same way `0101`/`0102` (`account_support_fields`/`work_item_feedback_table`) were pulled in.
 - **The identical collision can happen entirely within this repo, with no other service involved.** Two branches cut from the same base each see the same "current highest number," each add their own next-numbered file, and both PRs merge cleanly — git sees two different filenames, so there's no merge conflict to catch it. The result is the same silent, undetected collision as the cross-repo case above: two unrelated migrations sharing one number, `make migrate` applies both under their own filenames without complaint, and the numbering no longer identifies one unambiguous point in the sequence. Rebase onto the target branch's actual latest `migrations/` state before opening a migration PR, and check for a same-number collision as part of reviewing one — this repo has no CI check enforcing unique leading numbers today.
 - **`ALTER TYPE ... ADD VALUE` migrations stay the only statement in their file** — it cannot run in the same transaction as a later statement that uses the new value, and every file here is expected to be applied with plain autocommit (never wrapped in `BEGIN`/`COMMIT`, never run with `psql -1`/`--single-transaction`).
@@ -5308,14 +6621,16 @@ Key conventions enforced at the DB level:
 
 ## Connection pool settings
 
-Configured in `internal/db/postgres.go`:
+Tuned via `config.Config`, applied by `internal/db.NewPool`. Each is env-configurable (`internal/config/config.go`); the values below are what an unset deployment gets — identical to what this file used to hardcode before these existed:
 
-| Setting             | Value   |
-|---------------------|---------|
-| Max connections     | 20      |
-| Min connections     | 2       |
-| Max conn lifetime   | 30 min  |
-| Max idle time       | 5 min   |
+| Setting             | Env var                       | Default |
+|---------------------|--------------------------------|---------|
+| Max connections     | `DB_POOL_MAX_CONNS`            | 20      |
+| Min connections     | `DB_POOL_MIN_CONNS`            | 2       |
+| Max conn lifetime   | `DB_POOL_MAX_CONN_LIFETIME`    | 30 min  |
+| Max idle time       | `DB_POOL_MAX_CONN_IDLE_TIME`   | 5 min   |
+
+`DB_POOL_MAX_CONNS` falls back to its default on an unset, non-numeric, or non-positive value (a pool that may open no connections at all can never serve a single query). `DB_POOL_MIN_CONNS` falls back the same way **except zero is accepted** — pgxpool genuinely permits a minimum of 0 (a deployment that doesn't want to retain any idle connections) — same fail-safe-to-default posture `getDurationOrDefault` already uses for every duration-shaped env var here, now shared by `getInt32OrDefault`. An invalid value for any of the four surfaces through `Config.Validate()` at startup (`loadErr`), the same mechanism `SERVER_READ_TIMEOUT`/etc. already use.
 
 ## Pagination response conventions
 
@@ -5436,3 +6751,44 @@ is no start cutoff and no age limit: a change is applied however late, and an ou
 
 Tests: `incident_report_service_test.go` (unit), `incident_report_integration_test.go`
 (`INCIDENT_REPORT_TEST_DSN`, real DB with all migrations: both flows, rollback, backoff, retry).
+
+### [WSO2 Cloud Ops] Post resolution tasks (migration 0188)
+
+Runs in the same Resolved handler, after the report, in the same transaction. SN condition:
+service Choreo or Asgardeo, state changes to Resolved. **Deliberate divergence:** the alert tasks
+keep that service limit, but the workaround problem is created for an incident on **any** service
+(product decision, 2026-10-06). Every block is an independent If on the incident as it is now:
+
+| Condition (`resolution_code`) | Effect |
+|---|---|
+| `FALSE_ALARM` | incident_task `[Alert Task][Falser Alarm] <number> alert is a false alarm` (SN's spelling), `CRITICAL`, group WSO2 SRE Team |
+| `DUPLICATE` or `DUPLICATE_ALERT` | `[Alert Task][Duplicate Alert] <number> alert is a duplicate`, `CRITICAL`, WSO2 SRE Team. Both spellings are SN's one "Duplicate" choice: the sync writes `DUPLICATE_ALERT`, the portal `DUPLICATE` |
+| `NOT_ACTIONABLE_ALERT` | `[Alert Task][Not Actionable Alert] <number> is not an actionable alert`, `HIGH`, WSO2 SRE Team |
+| `SOLVED_WORK_AROUND` and no `problem_id` | problem `Fix the root cause of <number>` with the incident's service, impact, urgency and priority (0188 adds `problem.service_id/impact/urgency`), `incident_id` = the incident, group Choreo Special Ops (Choreo), Asgardeo Operations Team (Asgardeo), otherwise the incident's own assignment group (none if it has none); then `incident.problem_id` = it |
+
+**Dual-write (`postgres-servicenow-dual-write`): the workaround problem is written to both
+stores, by the resolve request, not this flow.** A problem that exists only in Postgres gets a
+CS-PORTAL number and cannot be moved through its states (every problem transition is
+ServiceNow-first, by id: the PATCH 404s). The flow has no user, and the CSM API needs the caller's
+`x-user-id-token`, so `UpdateIncident` creates it (`workaround_problem.go`): when the request moves
+the incident to Resolved as Solved (Workaround) and it has no problem, `createProblemSNFirst`
+(subject + primary incident → ServiceNow's id, PRB number and priority, stored as-is), then
+`ProblemRepository.LinkWorkaroundProblem` sets the group and `incident.problem_id` in Postgres; the
+stored group is mirrored to the problem and `problemId` rides the incident's own mirror (ServiceNow's
+`createProblem` sets `u_incident` but never `incident.problem_id`). **Both stores hold the same
+values**: the CSM API takes no service, impact or urgency (discovery script 72; `ProblemUtils`
+reads only subject/description/category/subcategory/priority/originCaseId/primaryIncidentId, and the
+Priority Problem Lookup overwrites priority), so neither store gets the incident's -- that needs a
+`ProblemUtils` change first. A failure is logged and never undoes the resolve.
+`NewDualWriteIncidentReportService` (main.go) runs this flow without the problem block. Sending
+`problemId` with the Resolved state in one ServiceNow update also keeps ServiceNow's own active
+copy of this flow from creating a second problem (its block 8 needs an empty `problem_id`). Reads
+stay on Postgres.
+
+The services and groups are SN sys_ids as Postgres UUIDs, constants in
+`incident_report_service.go`. A group missing from the database leaves the record unassigned
+rather than failing the change (the insert looks the id up). **Not ported:** the runbook block
+(`u_runbook_solve_the_issue = 2` and not a workaround → `[Runbook Task] Modify the runbook`):
+the field has no column and no portal input. `MissingSchema` also checks 0188's columns.
+
+Tests: `post_resolution_tasks_test.go` (unit), `post_resolution_tasks_integration_test.go`.

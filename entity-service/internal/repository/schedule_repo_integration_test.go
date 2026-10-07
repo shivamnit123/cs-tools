@@ -289,6 +289,81 @@ func TestScheduleIntegration_CatalogueServesAllThreeParts(t *testing.T) {
 	}
 }
 
+// Rotas (migrations 0199-0200): the catalogue names SRE's SaaS and IaaS and
+// the SME product rotations, ties each zone to its rota, and reads a team's
+// rota -- and the SME family -- from its type, the way family has always been
+// read. SaaS SRE's own zones and teams must come out on the SaaS rota, so the
+// rota a live team is on is exactly the one it was on before.
+func TestScheduleIntegration_CatalogueServesRotas(t *testing.T) {
+	repo, pool := newScheduleIntegrationRepo(t)
+	ctx := context.Background()
+
+	const smeTeamID, smeTeamKey = "8c1f6d3e-5b7a-4e2c-9a0d-3f4e5d6c7b8a", "fixture-sme-moesif"
+	mustExec(t, pool, `DELETE FROM team WHERE id = $1`, smeTeamID)
+	mustExec(t, pool, `
+		INSERT INTO team (id, created_on, updated_on, created_by, updated_by, name, key, type)
+		VALUES ($1, NOW(), NOW(), 'fixture', 'fixture', $2, $2, 'SME-Moesif')`, smeTeamID, smeTeamKey)
+	t.Cleanup(func() { mustExec(t, pool, `DELETE FROM team WHERE id = $1`, smeTeamID) })
+
+	cat, err := repo.Catalogue(ctx)
+	if err != nil {
+		t.Fatalf("Catalogue: %v", err)
+	}
+
+	rotas := map[string]domain.ScheduleRota{}
+	for _, ro := range cat.Rotas {
+		rotas[ro.Code] = ro
+	}
+	for code, family := range map[string]string{"SRE_SAAS": "SRE", "SRE_IAAS": "SRE", "SME_ASGARDEO": "SME", "SME_MOESIF": "SME"} {
+		if rotas[code].Family != family {
+			t.Fatalf("rota %s: family %q, want %q (served rotas: %v)", code, rotas[code].Family, family, cat.Rotas)
+		}
+	}
+	if m := rotas["SME_MOESIF"].EscalationMinutes; m == nil || *m != 30 {
+		t.Fatalf("Moesif escalates after %v minutes, want 30", m)
+	}
+	if rotas["SME_ASGARDEO"].Rotates != "DAILY" || rotas["SME_MOESIF"].Rotates != "WEEKLY" {
+		t.Fatalf("rotation frequency: Asgardeo %q, Moesif %q", rotas["SME_ASGARDEO"].Rotates, rotas["SME_MOESIF"].Rotates)
+	}
+
+	zoneRota := map[string]string{}
+	for _, z := range cat.Zones {
+		if z.RotaCode != nil {
+			zoneRota[z.Code] = *z.RotaCode
+		}
+	}
+	for zone, rota := range map[string]string{"TZ1": "SRE_SAAS", "TZ3": "SRE_SAAS", "IAAS_D": "SRE_IAAS", "MOE_N": "SME_MOESIF"} {
+		if zoneRota[zone] != rota {
+			t.Fatalf("zone %s is on rota %q, want %q", zone, zoneRota[zone], rota)
+		}
+	}
+
+	var night *domain.ScheduleShift
+	for i := range cat.Shifts {
+		if cat.Shifts[i].Code == "SME_MOE_NIGHT" {
+			night = &cat.Shifts[i]
+		}
+	}
+	if night == nil || night.Family != "SME" || night.ZoneCode == nil || *night.ZoneCode != "MOE_N" ||
+		night.StartMinute != 1320 || night.EndMinute != 2040 || !night.IsEscalation || night.DayScope != "ANY" {
+		t.Fatalf("Moesif night window = %+v, want SME, zone MOE_N, 22:00-10:00 every day, escalation", night)
+	}
+
+	teams := map[string]domain.ScheduleTeam{}
+	for _, tm := range cat.Teams {
+		teams[tm.Key] = tm
+	}
+	if tm := teams[smeTeamKey]; tm.Family != "SME" || tm.RotaCode == nil || *tm.RotaCode != "SME_MOESIF" {
+		t.Fatalf("an SME-Moesif team reads as family %q, rota %v; want SME on SME_MOESIF", tm.Family, tm.RotaCode)
+	}
+	if tm := teams[schedSreTeamKey]; tm.Family != "SRE" || tm.RotaCode == nil || *tm.RotaCode != "SRE_SAAS" {
+		t.Fatalf("an sre-abt team reads as family %q, rota %v; want SRE on SRE_SAAS", tm.Family, tm.RotaCode)
+	}
+	if tm := teams[schedTeamKey]; tm.Family != "CRE" || tm.RotaCode != nil {
+		t.Fatalf("a cre-abt team reads as family %q, rota %v; want CRE on no named rota", tm.Family, tm.RotaCode)
+	}
+}
+
 // ── who may edit ──────────────────────────────────────────────────────────
 
 func TestScheduleIntegration_LeadsTeamIsTrueOnlyForTheLead(t *testing.T) {

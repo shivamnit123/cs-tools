@@ -242,9 +242,15 @@ func main() {
 	incidentReportCtx, stopIncidentReport := context.WithCancel(repository.WithSystemIdentity(context.Background()))
 	defer stopIncidentReport()
 	if pool != nil {
+		// Dual-write creates the workaround problem in the resolve request,
+		// in ServiceNow and Postgres (workaround_problem.go), not here.
+		incidentReportFlows := service.NewIncidentReportService()
+		if cfg.DataSource == config.DataSourcePostgresServiceNowDualWrite {
+			incidentReportFlows = service.NewDualWriteIncidentReportService()
+		}
 		incidentReportDrainer := service.NewIncidentReportDrainer(
 			repository.NewIncidentReportRepository(repository.NewScoped(pool)),
-			service.NewIncidentReportService(),
+			incidentReportFlows,
 			cfg.IncidentReportPollInterval,
 			service.IncidentReportMaxAttempts,
 		)

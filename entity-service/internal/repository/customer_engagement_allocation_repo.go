@@ -92,14 +92,16 @@ func (s *allocationEventStore) FindEngagementByEngagementID(ctx context.Context,
 		"find engagement by engagement_id")
 }
 
-// line_item_id holds the Salesforce id; line_item_id_ref is the ServiceNow sys_id of
-// the sf_opportunity_product row, whose id is that sys_id as a UUID.
+// sf_id holds the Salesforce id (renamed from line_item_id); line_item_id is now the
+// UUID FK onto the sf_opportunity_product row it resolves to (renamed from
+// line_item_id_ref and retyped from a raw sys_id string -- see
+// 0134_customer_engagement_line_item_fk.sql).
 const findEngagementByLineItemQuery = `
 	SELECT ce.id::text
 	FROM customer_engagement ce
-	WHERE left(ce.line_item_id, 15) = left($1, 15)
+	WHERE left(ce.sf_id, 15) = left($1, 15)
 	   OR EXISTS (SELECT 1 FROM sf_opportunity_product sop
-	              WHERE replace(sop.id::text, '-', '') = ce.line_item_id_ref
+	              WHERE sop.id = ce.line_item_id
 	                AND left(sop.line_item_sf_id, 15) = left($1, 15))
 	ORDER BY ce.created_on, ce.id
 	LIMIT 1`
@@ -157,15 +159,15 @@ func (s *allocationEventStore) FindUserByEmailOrUserName(ctx context.Context, em
 const insertEngagementQuery = `
 	INSERT INTO customer_engagement (
 		id, created_on, updated_on, created_by, updated_by, name, engagement_id, engagement_code,
-		state, delivery_mode, is_paid, account_id, engagement_type_id, planned_start_date, planned_end_date)
+		state, delivery_mode, is_paid, account_id, engagement_type, planned_start_date, planned_end_date)
 	VALUES (gen_random_uuid(), now(), now(), $1, $1, $2, $3, $4,
-		'NEW', $5::customer_engagement_delivery_mode_enum, $6, $7::uuid, $8, $9::date, $10::date)
+		'NEW', $5::customer_engagement_delivery_mode_enum, $6, $7::uuid, $8::customer_engagement_type_enum, $9::date, $10::date)
 	ON CONFLICT (engagement_id) WHERE engagement_id IS NOT NULL DO NOTHING
 	RETURNING id::text`
 
 func (s *allocationEventStore) InsertEngagement(ctx context.Context, e domain.NewCustomerEngagement) (string, bool, error) {
 	id, err := optionalID(s.q.QueryRow(ctx, insertEngagementQuery, allocationSyncActor, e.Name, e.EngagementID,
-		e.EngagementCode, e.DeliveryMode, e.IsPaid, e.AccountID, e.EngagementTypeID,
+		e.EngagementCode, e.DeliveryMode, e.IsPaid, e.AccountID, e.EngagementType,
 		e.PlannedStartDate, e.PlannedEndDate), "insert engagement")
 	if err != nil {
 		return "", false, err

@@ -95,12 +95,19 @@ run_webapp_tests() {
     # block the push on a false negative instead of skipping cleanly.
     if curl -sf -o /dev/null http://localhost:3001 && curl -sf -o /dev/null http://localhost:9100/healthz && curl -sf -o /dev/null http://localhost:8081/health; then
         echo "[pre-push] local webapp + mock-oidc detected — running Change Request E2E lifecycle spec..."
-        (cd "$REPO_ROOT/$WEBAPP_DIR" && \
-            E2E_NO_WEBSERVER=1 E2E_AUTH_EMAIL=jane.doe@example.com E2E_AUTH_GROUPS=cs_engineer E2E_AUTH_ROLE=crApprover \
-            pnpm run test:e2e:auth) || {
-            echo "[pre-push] minting the Change Request E2E session FAILED. Push aborted. Fix the failures and try again."
-            exit 1
-        }
+        # One session per seed persona (see tests/e2e/auth/README.md): jane.doe
+        # (the requester), alice.perera (an internal approver) and the two
+        # customer contacts of project 401, dave.mendis and erin.jayawardena.
+        for persona in "crApprover jane.doe" "crInternalApprover alice.perera" \
+                       "crCustomerContact dave.mendis" "crCustomerContact2 erin.jayawardena"; do
+            set -- $persona
+            (cd "$REPO_ROOT/$WEBAPP_DIR" && \
+                E2E_NO_WEBSERVER=1 E2E_AUTH_EMAIL="$2@example.com" E2E_AUTH_GROUPS=cs_engineer E2E_AUTH_ROLE="$1" \
+                pnpm run test:e2e:auth) || {
+                echo "[pre-push] minting the Change Request E2E session '$1' FAILED. Push aborted. Fix the failures and try again."
+                exit 1
+            }
+        done
         (cd "$REPO_ROOT/$WEBAPP_DIR" && \
             E2E_NO_WEBSERVER=1 npx playwright test tests/e2e/specs/operations/change-request-lifecycle.spec.ts) || {
             echo "[pre-push] Change Request E2E lifecycle spec FAILED. Push aborted. Fix the failures and try again."

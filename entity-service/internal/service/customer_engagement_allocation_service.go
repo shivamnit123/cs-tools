@@ -69,7 +69,10 @@ type customerEngagementAllocationService struct {
 }
 
 // NewCustomerEngagementAllocationService constructs the service; firefightingTypeID is the
-// ServiceNow sys_id written on created firefighting engagements ("" skips creating them).
+// Firefighting type's ServiceNow sys_id, used only to gate whether firefighting engagements
+// are created at all ("" skips creating them) -- the engagement_type column this service
+// writes is a Postgres enum (customer_engagement_type_enum) whose label this path always
+// sets to "FIREFIGHTING", never this sys_id.
 func NewCustomerEngagementAllocationService(repo repository.CustomerEngagementAllocationRepository, firefightingTypeID string) CustomerEngagementAllocationService {
 	return &customerEngagementAllocationService{repo: repo, firefightingTypeID: firefightingTypeID}
 }
@@ -212,7 +215,10 @@ func (s *customerEngagementAllocationService) findOrCreateEngagement(ctx context
 		AccountID:        accountID,
 		IsPaid:           strings.TrimSpace(in.engagement.EngagementTypeName) == "Paid",
 		DeliveryMode:     deliveryModeFromNature(in.engagement.EngagementNature),
-		EngagementTypeID: s.firefightingTypeID,
+		// This path only ever creates a Firefighting engagement (gated above on
+		// s.firefightingTypeID, the feature's on/off switch -- a configured
+		// ServiceNow sys_id, never the value written here); the label is fixed.
+		EngagementType:   "FIREFIGHTING",
 		PlannedStartDate: in.startDate,
 		PlannedEndDate:   in.endDate,
 	})

@@ -28,12 +28,14 @@ import (
 // KBAdminHandler handles Knowledge-Admin operations: creating, renaming, and
 // deactivating knowledge bases, and assigning/removing their approvers.
 //
-// NOTE (per the Sep 10 call): these endpoints are not yet role-gated to an
-// actual "Knowledge Admin" role. Sajith needs to confirm whether the
-// roles table has been migrated from ServiceNow before that check can be
-// added -- any authenticated user can currently call these. This is a known,
-// deliberate, and temporary gap, not an oversight: do not treat this as
-// production-ready access control until that role check is added.
+// Every route reaching this handler is gated behind handler.PermAdmin in
+// cmd/server/main.go, so only platform admins can call these.
+//
+// Known gap, not an oversight: PermAdmin is the generic platform-admin
+// permission, not a KB-specific "Knowledge Admin" role. There is currently
+// no way to grant someone authority over one knowledge base's approvers
+// without giving them full platform admin. A finer-grained role needs the
+// roles table migrated from ServiceNow first.
 type KBAdminHandler struct {
 	entity entityKBArticleClient
 }

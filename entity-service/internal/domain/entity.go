@@ -787,6 +787,14 @@ type SalesforceContactUpsertResult struct {
 	IsAccountAdmin bool
 }
 
+// AffectedUser names a user a write changed, so the caller can drop that
+// user's cached profile once the write has committed. Either field may be
+// empty when the write could not resolve it.
+type AffectedUser struct {
+	ID    string
+	Email string
+}
+
 // MembershipWriteTarget is the project (and its account) a portal membership
 // write lands on, read inside the write's own transaction before the
 // Salesforce half runs. The Salesforce ids are what the Salesforce calls need;
@@ -1867,12 +1875,18 @@ type DeploymentView struct {
 // SearchDeploymentsRequest is the input for a deployment search operation.
 // All filter fields are optional. ProjectIDs scopes results to specific projects;
 // DeploymentTypes filters by deployment type; SearchQuery is matched
-// case-insensitively against name.
+// case-insensitively against name. IDs matches the deployment's own id
+// directly -- added so a caller holding only a deployment id (no project
+// context) can still resolve it, e.g. backend-v2's attachment authorization
+// check for a deployment-referenced attachment. Only applied on the
+// Postgres data source today (deploymentRepo.SearchDeployments); the
+// ServiceNow-backed search (snDeploymentService) does not support it.
 type SearchDeploymentsRequest struct {
 	Pagination      Pagination       `json:"pagination"`
 	SearchQuery     string           `json:"searchQuery"`
 	ProjectIDs      []string         `json:"projectIds"`
 	DeploymentTypes []DeploymentType `json:"deploymentTypes"`
+	IDs             []string         `json:"ids"`
 }
 
 // SearchDeploymentsResponse is the paginated result of a deployment search.
@@ -2076,6 +2090,17 @@ type CreateDeployedProductRequest struct {
 	Cores        *int     `json:"cores"`
 	TPS          *float64 `json:"tps"`
 	Description  *string  `json:"description"`
+	// Category is one of the lower-case deployed_product_category_enum codes
+	// ("pdp", "ms", "ps", "cl", "pc" -- same vocabulary as
+	// SearchDeployedProductsRequest.ProductCategories), optional. Postgres-only:
+	// ServiceNow's own deployed-product create/update payloads (see
+	// snCreateDeployedProductPayload/snUpdateDeployedProductPayload,
+	// sn_deployed_product_service.go) have no classification field at all, so
+	// this is never forwarded to the SN mirror under dual-write -- the same
+	// "write it where the data actually has a column, skip the mirror call
+	// entirely rather than send a field it would ignore or reject" precedent
+	// documented on patchCaseFieldsBundle's own four-of-nine mirrored fields.
+	Category *string `json:"category,omitempty"`
 }
 
 // CreateDeployedProductResponse is the response for POST /deployed-products.
@@ -2108,6 +2133,10 @@ type UpdateDeployedProductRequest struct {
 	Description  json.RawMessage      `json:"description,omitempty"`
 	Updates      []ProductUpdateEntry `json:"updates,omitempty"`
 	Active       *bool                `json:"active"`
+	// Category -- see CreateDeployedProductRequest.Category's own doc comment
+	// for the vocabulary and why it is Postgres-only (never forwarded to the
+	// SN mirror).
+	Category *string `json:"category,omitempty"`
 }
 
 // UpdateDeployedProductResponse is the response for PATCH /deployed-products/{id}.
@@ -3190,20 +3219,26 @@ type WatchListUser struct {
 	UserName string `json:"userName"`
 	Name     string `json:"name,omitempty"`
 	Email    string `json:"email,omitempty"`
-	// Locked is true when this persisted watcher also happens to currently
-	// hold one of the case's project's account's four named stakeholder
-	// roles (technical owner, secondary technical owner, account manager,
-	// renewal account manager -- CaseRepository.AccountDefaultWatcherIDs).
-	// These four are no longer auto-added to the watch list at all (see
-	// addRequestedWatchers' own doc comment) -- they're resolved fresh from
-	// the account row and emailed directly, independent of work_item_watcher
-	// -- so Locked now only ever fires for someone who was ALSO explicitly
-	// added as a watcher for an unrelated reason and happens to hold one of
-	// these roles too; it carries no "cannot be removed" guarantee any more
-	// (updateCaseWatchList applies no floor at all). Kept purely as display
-	// information, not as an enforcement signal. Postgres-data-source only --
-	// this concept has no ServiceNow-side equivalent, so a ServiceNow-backed
-	// watcher is always Locked: false.
+	// Locked is true for an entry fetchCaseWatchers synthesized rather than
+	// read from a real work_item_watcher row: one of the case's project's
+	// account's five named stakeholders (technical owner, secondary
+	// technical owner, account manager, renewal account manager, and
+	// customer success manager -- a strictly larger set than
+	// AccountDefaultWatcherEmails' own four, which deliberately excludes the
+	// CSM from the default email audience; that is a decision about who
+	// gets emailed, not about who the account's stakeholders are). These
+	// five are never auto-persisted into work_item_watcher (see
+	// addRequestedWatchers' own doc comment) -- fetchCaseWatchers now adds
+	// them to every read, always, specifically so a caller can see every
+	// stakeholder associated with the case -- and this IS an enforcement
+	// signal: CaseRepository.SetCaseWatchList has no way to submit one of
+	// these five as an explicit watcher, so a Locked entry can never be
+	// removed by an add/remove request, only by the account's own
+	// stakeholder reassignment changing who resolves into this slot. A user
+	// who is both a real persisted watcher and one of the five stakeholders
+	// appears once, as the Locked copy. Postgres-data-source only -- this concept has no
+	// ServiceNow-side equivalent, so a ServiceNow-backed watcher is always
+	// Locked: false.
 	Locked bool `json:"locked"`
 	// User is the canonical user reference for this watcher, a sibling of the
 	// flat id/userName/name/email fields. Its id is always null: a watch-list
@@ -3331,8 +3366,8 @@ type CreateCaseCommentRequest struct {
 	Content   string      `json:"content"`
 	// ActorEmail is set only by an M2M caller that has no x-user-id-token to
 	// resolve an acting user from (e.g. UMT via csm-integration-service).
-	// The handler checks it against a configured allowlist of trusted
-	// service-account emails (config.Config.M2MTrustedActorEmails) before
+	// The handler checks the caller's own x-jwt-assertion client id against
+	// the trusted M2M client set (config.Config.M2MClientIDs) before
 	// honoring it -- an arbitrary caller-supplied value is never trusted
 	// as-is, since that would let any caller claim to be any user. Mutually
 	// exclusive with a real x-user-id-token on the same request.
@@ -3347,8 +3382,8 @@ type AddCaseTagRequest struct {
 	Label  string `json:"label"`
 	// ActorEmail is set only by an M2M caller that has no x-user-id-token to
 	// resolve an acting user from (e.g. UMT via csm-integration-service).
-	// The handler checks it against a configured allowlist of trusted
-	// service-account emails (config.Config.M2MTrustedActorEmails) before
+	// The handler checks the caller's own x-jwt-assertion client id against
+	// the trusted M2M client set (config.Config.M2MClientIDs) before
 	// honoring it -- an arbitrary caller-supplied value is never trusted
 	// as-is, since that would let any caller claim to be any user. Mutually
 	// exclusive with a real x-user-id-token on the same request.
@@ -3835,6 +3870,52 @@ const (
 	ChangeRequestTypeUnauthorizedChange  ChangeRequestType = "unauthorized_change"
 )
 
+// ChangeRequestCreatableTypes lists the only change types a change request may be
+// created with: Standard, Normal and Emergency (ServiceNow's own three
+// "What type of change is required?" choices). The wider ChangeRequestType
+// enum still carries values (azure, infra, ...) that exist on synced legacy
+// records and may be read back, but none of them can be chosen at create time.
+var ChangeRequestCreatableTypes = []ChangeRequestType{
+	ChangeRequestTypeStandard,
+	ChangeRequestTypeNormal,
+	ChangeRequestTypeEmergency,
+}
+
+// IsCreatableChangeRequestType reports whether t is one of the three types a
+// change request may be created with.
+func IsCreatableChangeRequestType(t ChangeRequestType) bool {
+	for _, c := range ChangeRequestCreatableTypes {
+		if c == t {
+			return true
+		}
+	}
+	return false
+}
+
+// Names of the approver groups the change request approval flow resolves by
+// name (the "group" table has no stable key of its own; membership is mirrored
+// from ServiceNow, so these names are the contract with that data).
+//
+//   - CABApprovalGroupName: the Change Advisory Board, the approver pool of a
+//     Normal change's second (CAB) approval stage.
+//   - ECABApprovalGroupName: the Emergency CAB, the approver pool of an
+//     Emergency change's only approval stage. A group of its own, not CAB.
+//   - PeerApprovalFallbackGroupName: the peer approval fallback group
+//     ("Devops Approval" in the ServiceNow flow). A Normal change's peer stage
+//     draws its approvers from the active internal members of the change's
+//     assigned group; when there is no assigned group, or it yields nobody
+//     eligible (no active internal member other than the creator), this group
+//     is used. Who is experienced enough to peer-approve is decided when
+//     people are added to the group, not when the stage is provisioned.
+//
+// CAB Approval and ECAB Approval are created by migration
+// 0188_change_request_approval_groups.sql when absent.
+const (
+	CABApprovalGroupName          = "CAB Approval"
+	ECABApprovalGroupName         = "ECAB Approval"
+	PeerApprovalFallbackGroupName = "Devops Approval"
+)
+
 // ChangeRequestState represents the current workflow state of a change request.
 type ChangeRequestState string
 
@@ -3923,19 +4004,40 @@ type CreateChangeRequestRequest struct {
 	TestPlan            *string                `json:"testPlan,omitempty"`
 	PlannedStartDate    *string                `json:"plannedStartDate,omitempty"`
 	PlannedEndDate      *string                `json:"plannedEndDate,omitempty"`
-	Comment             *string                `json:"comment,omitempty"`
-	WorkNote            *string                `json:"workNote,omitempty"`
+	// Comment is the customer-visible "Additional comments" entry and WorkNote
+	// the internal "Work notes" entry. On the PostgreSQL data source each
+	// becomes a row in comment (type COMMENT / WORK_NOTE) written with the
+	// change request; a blank value is ignored. See ChangeRequestLinks for
+	// the customer-scope fields below.
+	Comment  *string `json:"comment,omitempty"`
+	WorkNote *string `json:"workNote,omitempty"`
+	// ProjectID is the change request's Customer Project (work_item.project_id).
+	// DeploymentIDs are the project's deployments the change touches: each must
+	// belong to ProjectID (and be active), so DeploymentIDs requires ProjectID.
+	// DeploymentProductIDs follow from the chosen deployments: Deployment
+	// products are READ-ONLY -- always the deployed products of the chosen
+	// deployments -- so DeploymentProductIDs, when given, must be exactly that
+	// set. A deployment already carries its environment role (deployment.type),
+	// so there is no separate environments field. See entity-service's
+	// CLAUDE.md "Change requests" -> "Customer project and deployments".
+	ProjectID     *string  `json:"projectId,omitempty"`
+	DeploymentIDs []string `json:"deploymentIds,omitempty"`
 	// AffectedServicesText, AffectedComponentsText, RollbackDurationText,
-	// CustomerGroupID, EnvironmentIDs, DeploymentProductIDs, and DurationInput
-	// are field-parity additions -- see PatchChangeRequestRequest for the
-	// shared documentation of each. On create there is no prior value to
-	// clear, so none of them need tri-state handling here.
+	// DeploymentProductIDs and DurationInput are field-parity additions -- see
+	// PatchChangeRequestRequest for the shared documentation of each. On create
+	// there is no prior value to clear, so none of them need tri-state handling
+	// here.
 	AffectedServicesText   *string  `json:"affectedServicesText,omitempty"`
 	AffectedComponentsText *string  `json:"affectedComponentsText,omitempty"`
 	RollbackDurationText   *string  `json:"rollbackDurationText,omitempty"`
-	CustomerGroupID        *string  `json:"customerGroupId,omitempty"`
-	EnvironmentIDs         []string `json:"environmentIds,omitempty"`
 	DeploymentProductIDs   []string `json:"deploymentProductIds,omitempty"`
+	// CustomerGroupID and EnvironmentIDs are NO LONGER ACCEPTED. They exist
+	// only so a client that still sends one is refused with a clear 400 rather
+	// than having it silently dropped: the Customer Group is derived from the
+	// Customer Project's registered contacts (ChangeRequest.CustomerContacts)
+	// and a deployment already carries its environment (deployment.type).
+	CustomerGroupID *string  `json:"customerGroupId,omitempty"`
+	EnvironmentIDs  []string `json:"environmentIds,omitempty"`
 	// DurationInput is the calendar duration in whole seconds. It is accepted
 	// only when it exactly matches the effective planned window (PlannedStartDate
 	// to PlannedEndDate, in this same request): the backing data source derives
@@ -3948,6 +4050,14 @@ type CreateChangeRequestRequest struct {
 	// the customer-facing portal. Optional; when omitted, the backing data
 	// source's own default applies.
 	IsPlanningVisibleToCustomers *bool `json:"isPlanningVisibleToCustomers,omitempty"`
+	// CustomerApprovalRequired / CustomerReviewRequired are the creation
+	// form's "Customer Approval" and "Customer Review" checkboxes: this change
+	// needs the customer's approval before it is scheduled / the customer's
+	// review before it is closed. Optional; omitted means false. They are the
+	// REQUIREMENT, not the customer's outcome (that is PatchChangeRequestRequest.
+	// IsCustomerApproved / IsCustomerReviewed). Postgres data source only.
+	CustomerApprovalRequired *bool `json:"customerApprovalRequired,omitempty"`
+	CustomerReviewRequired   *bool `json:"customerReviewRequired,omitempty"`
 }
 
 // CreateChangeRequestResponse is the output for POST /change-requests.
@@ -4066,19 +4176,18 @@ type SearchChangeRequestView struct {
 	Impact           *string    `json:"impact"`
 	State            *string    `json:"state"`
 	Type             *string    `json:"type"`
-	// OnHold/OnHoldReason/OnHoldSince back change_request.is_on_hold/
-	// on_hold_reason/on_hold_started_on (migration 0178) -- see
+	// OnHold/OnHoldReason back change_request.is_on_hold/
+	// on_hold_reason (migration 0178) -- see
 	// PatchChangeRequestRequest.OnHold's own doc comment for the gating
 	// behavior this flag drives, and entity-service's own CLAUDE.md "Change
 	// requests" -> "On hold" for the ServiceNow provenance. OnHold is nil
 	// only when the record predates this column ever being set at all (the
 	// column has no DEFAULT); a record never placed on hold otherwise reads
 	// as OnHold pointing at false, not nil, once anything has written to it.
-	// OnHoldReason/OnHoldSince are display-only (no gating effect of their
-	// own) and are always nil while OnHold is not true.
+	// OnHoldReason is display-only (no gating effect of its own) and is always
+	// nil while OnHold is not true.
 	OnHold       *bool   `json:"onHold"`
 	OnHoldReason *string `json:"onHoldReason"`
-	OnHoldSince  *string `json:"onHoldSince"`
 	CreatedOn    string  `json:"createdOn"`
 	UpdatedOn    string  `json:"updatedOn"`
 }
@@ -4299,8 +4408,8 @@ type PatchChangeRequestRequest struct {
 	IsCustomerApproved *bool                `json:"isCustomerApproved,omitempty"`
 	IsCustomerReviewed *bool                `json:"isCustomerReviewed,omitempty"`
 	RequestApproval    *bool                `json:"requestApproval,omitempty"`
-	// OnHold/OnHoldReason gate change_request.is_on_hold/on_hold_reason/
-	// on_hold_started_on (migration 0178). Combinable with every other field
+	// OnHold/OnHoldReason gate change_request.is_on_hold/on_hold_reason
+	// (migration 0178). Combinable with every other field
 	// on this PATCH, including State -- this endpoint has no exclusive/
 	// combinable grouping at all (unlike UpdateCaseRequest's state/watchList/
 	// assigneeEmail/... exclusive group; see entity-service's own CLAUDE.md
@@ -4319,11 +4428,10 @@ type PatchChangeRequestRequest struct {
 	// record's on-hold status -- editing, say, Description while on hold
 	// still succeeds.
 	//
-	// Setting OnHold to true stamps on_hold_started_on to the current time
-	// and sets on_hold_reason to OnHoldReason if provided in the same
-	// request, else NULL (a fresh hold event does not inherit a stale reason
+	// Setting OnHold to true sets on_hold_reason to OnHoldReason if
+	// provided in the same request, else NULL (a fresh hold event does not inherit a stale reason
 	// from a previous hold period). Setting OnHold to false always clears
-	// both on_hold_reason and on_hold_started_on, regardless of whether
+	// on_hold_reason, regardless of whether
 	// OnHoldReason also accompanies this same request. OnHoldReason may also
 	// be sent alone (OnHold omitted) to edit the reason text of an existing
 	// hold without touching OnHold itself.
@@ -4337,13 +4445,24 @@ type PatchChangeRequestRequest struct {
 	// as-is, so an explicit false is never confused with "not provided".
 	IsPlanningVisibleToCustomers *bool `json:"isPlanningVisibleToCustomers,omitempty"`
 
+	// CustomerApprovalRequired / CustomerReviewRequired: see
+	// CreateChangeRequestRequest. Editable only until the gate they control
+	// has been passed -- CustomerApprovalRequired while the change is New,
+	// Assess or Authorize; CustomerReviewRequired until it leaves Review --
+	// after which a change is refused with a ValidationError (a write that
+	// does not change the stored value is always accepted). Distinct from
+	// IsCustomerApproved / IsCustomerReviewed above, which record the
+	// customer's outcome. Postgres data source only.
+	CustomerApprovalRequired *bool `json:"customerApprovalRequired,omitempty"`
+	CustomerReviewRequired   *bool `json:"customerReviewRequired,omitempty"`
+
 	// The fields below are the change-request field-parity additions. Except
 	// Comment and WorkNote (journal entries, append-only, cannot be cleared),
 	// every one of them uses a pointer-to-pointer to distinguish three states:
 	//   - nil outer pointer: field omitted -- leave the value unchanged
 	//   - non-nil outer, nil inner: explicit null -- clear the value
 	//   - non-nil outer, non-nil inner: set the value
-	// EnvironmentIDs/DeploymentProductIDs use a single pointer instead: nil
+	// DeploymentProductIDs uses a single pointer instead: nil
 	// means omitted, and any non-nil slice (including an explicitly empty one)
 	// replaces the whole list -- the same convention CreateIncidentRequest's
 	// WatchList already uses, since an array field has no separate "null" state
@@ -4357,11 +4476,26 @@ type PatchChangeRequestRequest struct {
 	// RollbackDurationText is a raw, unvalidated string (e.g. "2 hours");
 	// parsing or normalizing it is a decision for the layer above, not this one.
 	RollbackDurationText **string  `json:"rollbackDurationText"`
-	CustomerGroupID      **string  `json:"customerGroupId"`
-	EnvironmentIDs       *[]string `json:"environmentIds"`
 	DeploymentProductIDs *[]string `json:"deploymentProductIds"`
-	// Comment and WorkNote append a new journal entry; they reject an empty or
-	// whitespace-only value, and neither can be used to clear anything.
+	// CustomerGroupID and EnvironmentIDs are NO LONGER ACCEPTED (any value,
+	// null included, is a 400); see CreateChangeRequestRequest.
+	CustomerGroupID **string  `json:"customerGroupId"`
+	EnvironmentIDs  *[]string `json:"environmentIds"`
+	// DeploymentIDs replaces the whole list of the project's deployments the
+	// change touches (an explicitly empty array clears it, and with it the
+	// deployment products that follow from it). Together
+	// with ProjectID and DeploymentProductIDs it is editable
+	// only before implementation starts: once the change request has reached
+	// implement (or any later state) a change is refused with a
+	// ValidationError, while resending the stored value is accepted. The
+	// relationship rules are those of CreateChangeRequestRequest.ProjectID.
+	// Changing ProjectID while deployments are stored requires DeploymentIDs
+	// in the same request. Cannot be combined with the single DeploymentID /
+	// DeployedProductID fields. PostgreSQL data source only.
+	DeploymentIDs *[]string `json:"deploymentIds"`
+	// Comment and WorkNote append a new journal entry (the customer-visible
+	// "Additional comments" and the internal "Work notes"); they reject an
+	// empty or whitespace-only value, and neither can be used to clear anything.
 	Comment  *string `json:"comment,omitempty"`
 	WorkNote *string `json:"workNote,omitempty"`
 	// DurationInput is the calendar duration in whole seconds. It is accepted
@@ -4375,6 +4509,82 @@ type PatchChangeRequestRequest struct {
 type PatchChangeRequestResponse struct {
 	Message       string        `json:"message"`
 	ChangeRequest ChangeRequest `json:"changeRequest"`
+}
+
+// ChangeRequestLinkSelection is a change request's customer-scope selection as
+// a caller states it: the project and, within it, the deployments the change
+// touches, plus the deployment products that follow from those deployments.
+// It is what the repository validates and derives from.
+type ChangeRequestLinkSelection struct {
+	ProjectID *string
+	// DeploymentIDs are the chosen deployments, in the order given.
+	DeploymentIDs []string
+	// DeploymentProductIDs is nil when the caller did not state them. Deployment
+	// products are read-only: when stated they must equal the derived set.
+	DeploymentProductIDs []string
+}
+
+// ChangeRequestLinkSet is a validated, derived ChangeRequestLinkSelection --
+// exactly what is stored and returned on the change request detail.
+type ChangeRequestLinkSet struct {
+	ProjectID          string
+	Deployments        []EntityRef
+	DeploymentProducts []EntityRef
+}
+
+// ChangeRequestLinkOptionsRequest is the input for POST /change-requests/link-options:
+// the lookup behind the change request form's Customer Project -> Deployments ->
+// Deployment products cascade (and the read-only Customer Group).
+type ChangeRequestLinkOptionsRequest struct {
+	// ProjectID is the selected Customer Project (required).
+	ProjectID string `json:"projectId"`
+	// DeploymentIDs are the deployments chosen so far (optional). When present
+	// they must belong to ProjectID and the response lists the deployment
+	// products that follow from them.
+	DeploymentIDs []string `json:"deploymentIds,omitempty"`
+}
+
+// ChangeRequestDeploymentOption is one selectable deployment of the project.
+type ChangeRequestDeploymentOption struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// Type is the deployment type, i.e. its environment role
+	// (primary_production, staging, qa, ...).
+	Type string `json:"type"`
+}
+
+// ChangeRequestCustomerContact is one member of a change request's Customer
+// Group: a REGISTERED portal-user contact of the change request's Customer
+// Project. The group is derived (never stored): see
+// repository.loadProjectCustomerContacts.
+type ChangeRequestCustomerContact struct {
+	// ID is the project contact's id (project_contact.id).
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Email string `json:"email,omitempty"`
+}
+
+// ChangeRequestDeploymentProductOption is one deployment product (a deployed
+// product) that follows from the chosen deployments.
+type ChangeRequestDeploymentProductOption struct {
+	ID string `json:"id"`
+	// Name is "<product> <version>".
+	Name string `json:"name"`
+	// Deployment is the chosen deployment this product is deployed in.
+	Deployment EntityRef `json:"deployment"`
+}
+
+// ChangeRequestLinkOptionsResponse is the response for POST /change-requests/link-options.
+type ChangeRequestLinkOptionsResponse struct {
+	// Deployments are the project's active deployments, name order.
+	Deployments []ChangeRequestDeploymentOption `json:"deployments"`
+	// DeploymentProducts follow from the chosen deployments; read-only on the
+	// form. Empty when none were chosen.
+	DeploymentProducts []ChangeRequestDeploymentProductOption `json:"deploymentProducts"`
+	// CustomerContacts are the project's registered contacts -- the read-only
+	// Customer Group of a change request on it, name order; empty when it has
+	// none.
+	CustomerContacts []ChangeRequestCustomerContact `json:"customerContacts"`
 }
 
 // TimeCardState represents the workflow state of a time card.
@@ -4535,18 +4745,25 @@ type DeleteTimeCardResponse struct {
 // It extends SearchChangeRequestView with additional fields.
 type ChangeRequest struct {
 	SearchChangeRequestView
-	CreatedBy           string     `json:"createdBy"`
-	Justification       *string    `json:"justification"`
-	ImpactDescription   *string    `json:"impactDescription"`
-	ServiceOutage       *string    `json:"serviceOutage"`
-	CommunicationPlan   *string    `json:"communicationPlan"`
-	RollbackPlan        *string    `json:"rollbackPlan"`
-	TestPlan            *string    `json:"testPlan"`
-	HasCustomerApproved bool       `json:"hasCustomerApproved"`
-	HasCustomerReviewed bool       `json:"hasCustomerReviewed"`
-	ApprovedBy          *EntityRef `json:"approvedBy"`
-	ApprovedOn          *string    `json:"approvedOn"`
-	LegalNextStates     []string   `json:"legalNextStates"`
+	CreatedBy           string  `json:"createdBy"`
+	Justification       *string `json:"justification"`
+	ImpactDescription   *string `json:"impactDescription"`
+	ServiceOutage       *string `json:"serviceOutage"`
+	CommunicationPlan   *string `json:"communicationPlan"`
+	RollbackPlan        *string `json:"rollbackPlan"`
+	TestPlan            *string `json:"testPlan"`
+	HasCustomerApproved bool    `json:"hasCustomerApproved"`
+	HasCustomerReviewed bool    `json:"hasCustomerReviewed"`
+	// CustomerApprovalRequired / CustomerReviewRequired are the creation
+	// form's two checkboxes: the change needs the customer's approval before
+	// it is scheduled / the customer's review before it is closed. They drive
+	// LegalNextStates. Distinct from HasCustomerApproved / HasCustomerReviewed,
+	// which record the customer's outcome.
+	CustomerApprovalRequired bool       `json:"customerApprovalRequired"`
+	CustomerReviewRequired   bool       `json:"customerReviewRequired"`
+	ApprovedBy               *EntityRef `json:"approvedBy"`
+	ApprovedOn               *string    `json:"approvedOn"`
+	LegalNextStates          []string   `json:"legalNextStates"`
 
 	// The fields below are change-request field-parity additions. All 20 are
 	// present on GET /change-requests/{id} and the PATCH receipt (both share
@@ -4561,12 +4778,21 @@ type ChangeRequest struct {
 	RequestedBy        *EntityRef `json:"requestedBy"`
 
 	// Group C1 -- real content the shared API did not surface before.
-	AffectedServicesText   *string     `json:"affectedServicesText"`
-	AffectedComponentsText *string     `json:"affectedComponentsText"`
-	RollbackDurationText   *string     `json:"rollbackDurationText"`
-	Environments           []EntityRef `json:"environments"`
-	DeploymentProducts     []EntityRef `json:"deploymentProducts"`
-	CustomerGroup          *EntityRef  `json:"customerGroup"`
+	AffectedServicesText   *string `json:"affectedServicesText"`
+	AffectedComponentsText *string `json:"affectedComponentsText"`
+	RollbackDurationText   *string `json:"rollbackDurationText"`
+	// DeploymentProducts follow from Deployments (see
+	// CreateChangeRequestRequest.ProjectID). Always a JSON array on the
+	// PostgreSQL data source (empty when none). DeploymentProducts names read
+	// "<product> <version>".
+	DeploymentProducts []EntityRef `json:"deploymentProducts"`
+	// CustomerContacts is the change request's Customer Group: the REGISTERED
+	// portal-user contacts of its Customer Project, computed live on every read
+	// (nothing is stored), name order. Always a JSON array on the PostgreSQL
+	// data source: empty without a project or without registered contacts.
+	// Read-only -- they are the customer's approvers at Customer Approval /
+	// Customer Review.
+	CustomerContacts []ChangeRequestCustomerContact `json:"customerContacts"`
 
 	// Group C2 -- carried for parity, read-through only; no write path is
 	// exposed for any of these seven.
@@ -4615,6 +4841,17 @@ type ChangeRequestApprover struct {
 	CreatedOn   *string `json:"createdOn"`
 	RespondedOn *string `json:"respondedOn"`
 	Comments    *string `json:"comments"`
+	// CanDecide is true only on the CALLING user's own approver row, and only
+	// when that row is still REQUESTED and the caller may actually decide it
+	// right now: they are not the change request's creator/requester, and (for
+	// an internal stage: peer, CAB, ECAB, review) are an active internal user,
+	// and the change request is in the state the row's stage belongs to (a
+	// REQUESTED row on a stage the change has moved past is false). The webapp
+	// should render
+	// Approve/Reject exactly when this is true. Populated by the Postgres data
+	// source only; always false on every other row and under the ServiceNow
+	// data source (where ServiceNow itself enforces who may decide).
+	CanDecide bool `json:"canDecide"`
 }
 
 // ChangeRequestApproval represents a single approval stage (e.g. Assess, Authorize,
@@ -4626,7 +4863,22 @@ type ChangeRequestApproval struct {
 	ApproverType ChangeRequestApproverType   `json:"approverType"`
 	ApproverName string                      `json:"approverName"`
 	Status       ChangeRequestApprovalStatus `json:"status"`
-	Approvers    []ChangeRequestApprover     `json:"approvers"`
+	// AssignmentGroup is the "group" row this stage was provisioned against
+	// (approval_stage.assignment_group_id), so a client can open it
+	// (GET /groups/{id}) and list who sits in it. null for the Customer
+	// Approval / Customer Review stages (their approvers are the project's
+	// registered contacts, not a group) and for any stage recorded against no
+	// group, and always null under the ServiceNow data source. ApproverName is
+	// unchanged and still carries the display name.
+	AssignmentGroup *ChangeRequestApprovalGroup `json:"assignmentGroup"`
+	Approvers       []ChangeRequestApprover     `json:"approvers"`
+}
+
+// ChangeRequestApprovalGroup is the id and name of the group an approval stage
+// is assigned to.
+type ChangeRequestApprovalGroup struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
 // ChangeRequestApprovals is the response for GET /change-requests/{id}/approvals.
@@ -4832,6 +5084,39 @@ type Group struct {
 	Name   string          `json:"name"`
 	Active bool            `json:"active"`
 	Parent *GroupParentRef `json:"parent"`
+}
+
+// GroupManagerRef is the manager of a group, as shown on its detail.
+type GroupManagerRef struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// GroupMember is one active INTERNAL member of a group, as shown on its detail.
+type GroupMember struct {
+	// ID is the member's "user".id.
+	ID    string  `json:"id"`
+	Name  string  `json:"name"`
+	Email *string `json:"email"`
+	// UserType is "user".user_type; always INTERNAL, as only internal users are
+	// listed (the approver pools' own rule).
+	UserType *string `json:"userType"`
+	// Role is "lead" when the user leads the group (team_member.role) on any
+	// of the membership rows that make them a member, else "member".
+	Role *string `json:"role"`
+}
+
+// GroupDetail is the response for GET /groups/{id}: the "group" row and its
+// active internal members (the people the approval pools can provision from),
+// in name order. Total is len(Members).
+type GroupDetail struct {
+	ID          string           `json:"id"`
+	Name        string           `json:"name"`
+	Description *string          `json:"description"`
+	Email       *string          `json:"email"`
+	Manager     *GroupManagerRef `json:"manager"`
+	Members     []GroupMember    `json:"members"`
+	Total       int              `json:"total"`
 }
 
 // SearchGroupsFilters holds optional filter criteria for group searches.
@@ -5565,17 +5850,21 @@ type CreateIncidentRequest struct {
 	ContactType         *IncidentContactType `json:"contactType,omitempty"`
 	Impact              IncidentImpact       `json:"impact"`
 	Urgency             IncidentUrgency      `json:"urgency"`
-	AssignmentGroupID   *string              `json:"assignmentGroupId,omitempty"`
-	AssignedEngineerID  *string              `json:"assignedEngineerId,omitempty"`
-	Subject             string               `json:"subject"`
-	WatchList           []string             `json:"watchList,omitempty"`
-	AdditionalComments  *string              `json:"additionalComments,omitempty"`
-	WorkNotes           *string              `json:"workNotes,omitempty"`
-	ParentID            *string              `json:"parentId,omitempty"`
-	ParentIncidentID    *string              `json:"parentIncidentId,omitempty"`
-	ChangeRequestID     *string              `json:"changeRequestId,omitempty"`
-	ProblemID           *string              `json:"problemId,omitempty"`
-	CausedByID          *string              `json:"causedById,omitempty"`
+	// AssignmentGroupID is never read from the request body: an incident's
+	// assignment group is its service's support group, set by the incident
+	// service before either create path runs. One rule, one place -- a
+	// caller that sends assignmentGroupId gets a 400 for an unknown field.
+	AssignmentGroupID  *string  `json:"-"`
+	AssignedEngineerID *string  `json:"assignedEngineerId,omitempty"`
+	Subject            string   `json:"subject"`
+	WatchList          []string `json:"watchList,omitempty"`
+	AdditionalComments *string  `json:"additionalComments,omitempty"`
+	WorkNotes          *string  `json:"workNotes,omitempty"`
+	ParentID           *string  `json:"parentId,omitempty"`
+	ParentIncidentID   *string  `json:"parentIncidentId,omitempty"`
+	ChangeRequestID    *string  `json:"changeRequestId,omitempty"`
+	ProblemID          *string  `json:"problemId,omitempty"`
+	CausedByID         *string  `json:"causedById,omitempty"`
 	// CorrelationID is an optional caller-supplied external-system key, stored
 	// on ServiceNow's stock `correlation_id` field. Lets a monitoring
 	// integration find an incident it already created (SearchIncidentsFilters.
@@ -5702,6 +5991,13 @@ type IncidentView struct {
 	// source recomputes it at read time, so a handoff performed through its own native UI
 	// reads identically to one performed through HandOffIncidentToSpecialist.
 	SpecialistHandoff *IncidentSpecialistHandoffSummary `json:"specialistHandoff"`
+	// CanHandOffToSpecialist is whether the "Escalate to specialist team"
+	// action applies right now -- ServiceNow's canEscalateToSpecialOps, which
+	// decides when the form loads whether to show the button: the incident
+	// is In Progress, its service has a default specialist route, and it is
+	// not already with that route's group. Nil when the data source does not
+	// say (ServiceNow), so a caller keeps offering the action.
+	CanHandOffToSpecialist *bool `json:"canHandOffToSpecialist,omitempty"`
 }
 
 // IncidentSpecialistHandoffReasonCode is why an incident could not be resolved through the
@@ -5736,6 +6032,18 @@ type HandOffIncidentToSpecialistRequest struct {
 	// CreateGithubIssue defaults to true upstream when omitted; set false to suppress the
 	// internal issue, e.g. on a re-handoff or when one already exists.
 	CreateGithubIssue *bool `json:"createGithubIssue,omitempty"`
+}
+
+// SpecialistHandoffTeam is a sub-team a specialist handoff can name: Key is
+// sent as HandOffIncidentToSpecialistRequest.EscalationTeam, Label is shown.
+type SpecialistHandoffTeam struct {
+	Key   string `json:"key"`
+	Label string `json:"label"`
+}
+
+// SpecialistHandoffTeamsResponse is the response for GET /specialist-handoff-teams.
+type SpecialistHandoffTeamsResponse struct {
+	Teams []SpecialistHandoffTeam `json:"teams"`
 }
 
 // IncidentSpecialistHandoffTask is the runbook-gap task opened for the specialist team as
@@ -5888,6 +6196,7 @@ type ProblemDetail struct {
 	LinkedIncidents     []CaseNumberRef `json:"linkedIncidents"`
 	LinkedChangeRequest *CaseNumberRef  `json:"linkedChangeRequest"`
 	AssignedTo          *EntityRef      `json:"assignedTo"`
+	AssignmentGroup     *EntityRef      `json:"assignmentGroup"`
 	ResolutionCode      *string         `json:"resolutionCode"`
 	CauseNotes          *string         `json:"causeNotes"`
 	FixNotes            *string         `json:"fixNotes"`
@@ -6030,6 +6339,24 @@ type SearchIncidentTasksResponse struct {
 	Limit         int            `json:"limit"`
 }
 
+// IncidentTaskClosedStates are incident_task_state_enum's closed labels
+// (ServiceNow's SYSTEM_INACTIVE_STATES 3, 4, 7). A task in any other state
+// (PENDING, OPEN, WORK_IN_PROGRESS) is still open, and is closed for it when
+// its incident is closed or canceled.
+var IncidentTaskClosedStates = map[string]bool{
+	"CLOSED_COMPLETE":   true,
+	"CLOSED_INCOMPLETE": true,
+	"CLOSED_SKIPPED":    true,
+}
+
+// UpdateIncidentTaskRequest is the input for PATCH /incident-tasks/{id}.
+// At least one field must be set. State is an incident_task_state_enum label.
+type UpdateIncidentTaskRequest struct {
+	ID         string  `json:"-"`
+	State      *string `json:"state,omitempty"`
+	CloseNotes *string `json:"closeNotes,omitempty"`
+}
+
 // IncidentTaskDetail is the full detail representation returned by
 // GET /incident-tasks/{id}.
 //
@@ -6049,6 +6376,9 @@ type IncidentTaskDetail struct {
 	Priority        *string        `json:"priority"`
 	OpenedOn        *string        `json:"openedOn"`
 	ClosedOn        *string        `json:"closedOn"`
+	// CloseNotes is incident_task.close_notes; always nil on the ServiceNow
+	// data source.
+	CloseNotes *string `json:"closeNotes"`
 }
 
 // ConversationState represents the state of a conversation. All six values are
@@ -7396,6 +7726,44 @@ type SearchSLAStatusResponse struct {
 	Offset   int         `json:"offset"`
 }
 
+// SLADurationPolicyItem is one (severity, clockType) duration row from the
+// sla_duration_policy table (migration 0192) — a small, static reference
+// table seeded directly from WSO2's own published Enterprise Support Policy,
+// independent of the ServiceNow-synced "sla"/"sla_policy" tables SLAStatus
+// above reads. csm-notification-service fetches the full set once at
+// startup (GET /sla-duration-policy) to compute each case's own due dates
+// itself, rather than depending on a sync that has no plain severity column
+// to key a lookup on.
+//
+// Severity is the same uppercase English word every case.* event's own
+// Priority field already carries (e.g. "CATASTROPHIC") — not the raw
+// case_severity_enum label ("S0") the table stores it as — so a consumer
+// can match this response directly against a case.created payload's
+// Priority with no translation of its own. See
+// ReferenceDataRepository.ListSLADurationPolicy's own doc comment for the
+// S0..S4 mapping.
+type SLADurationPolicyItem struct {
+	Severity string `json:"severity"`
+	// ClockType is "response" / "workaround" / "resolution" — matches
+	// sla_policy.target's own lower-cased vocabulary (see SLAStatus.ClockType
+	// above), so a consumer already matching on that string needs no second
+	// vocabulary for this endpoint.
+	ClockType string `json:"clockType"`
+	// DurationSeconds is the policy's duration in whole seconds — not a
+	// formatted string (contrast TaskSlaDefinitionDetail.Duration above) and
+	// not an ISO-8601 duration, since the one real consumer
+	// (csm-notification-service) only ever needs to feed this straight into
+	// a time.Duration, and a plain integer needs no parsing to get there.
+	DurationSeconds int64 `json:"durationSeconds"`
+}
+
+// SLADurationPolicyResponse is the response for GET /sla-duration-policy —
+// every row in sla_duration_policy, unpaginated (at most 15 rows today: 5
+// severities × up to 3 clock types each).
+type SLADurationPolicyResponse struct {
+	Policies []SLADurationPolicyItem `json:"policies"`
+}
+
 // AnnouncementRequestState is the lifecycle state of an announcement_requests
 // row. Like SLAClock and EventPublishFailure, this entity has no ServiceNow
 // equivalent and is always backed by Postgres regardless of DATA_SOURCE.
@@ -7669,20 +8037,28 @@ type SearchAnnouncementRequestUpdatesResponse struct {
 	Updates []AnnouncementRequestUpdate `json:"updates"`
 }
 
-// SearchAnnouncementRequestsRequest filters announcement_requests. State and
-// CreatedBy are both optional; omitting both returns every row (subject to
-// pagination) — there is no default filter, unlike some other search
-// endpoints in this service, since every caller of this endpoint so far
-// (the registry page's "Pending" tab) needs to choose its own filter
-// explicitly rather than inherit an implicit one.
+// SearchAnnouncementRequestsRequest filters announcement_requests. State,
+// States and CreatedBy are all optional; omitting all of them returns every
+// row (subject to pagination) — there is no default filter, unlike some
+// other search endpoints in this service, since every caller of this
+// endpoint so far (the registry page's "Pending" tab) needs to choose its
+// own filter explicitly rather than inherit an implicit one.
 type SearchAnnouncementRequestsRequest struct {
-	State     *AnnouncementRequestState `json:"state,omitempty"`
-	CreatedBy *string                   `json:"createdBy,omitempty"`
+	State *AnnouncementRequestState `json:"state,omitempty"`
+	// States matches a row in any of the listed states, in one paginated
+	// result (so Total/HasMore describe the merged list, not one state).
+	// State stays for single-state callers (the registry's published-requests
+	// lookup); the two are mutually exclusive -- naming both is rejected even
+	// when States is an explicit empty list. On its own, an empty/omitted
+	// States means "no state filter," same as an omitted State.
+	States    []AnnouncementRequestState `json:"states,omitempty"`
+	CreatedBy *string                    `json:"createdBy,omitempty"`
 	// ReadyForScheduledPublish, when true, ignores State and instead matches
 	// every approved row whose ScheduledFor is set and has already arrived
 	// (scheduled_for <= now()) — the one query
 	// operations/csm-scheduled-tasks' "publish_scheduled_announcements"
-	// sub-cron needs. Mutually exclusive with State (ambiguous otherwise).
+	// sub-cron needs. Mutually exclusive with State and States (ambiguous
+	// otherwise), including an explicit empty States list.
 	ReadyForScheduledPublish bool       `json:"readyForScheduledPublish,omitempty"`
 	Pagination               Pagination `json:"pagination"`
 }
@@ -7946,6 +8322,8 @@ type UpdateKBArticleStateRequest struct {
 	State            KBArticleState `json:"state"`
 	RejectionComment *string        `json:"rejectionComment,omitempty"`
 	UpdatedBy        string         `json:"updatedBy"`
+	// CurrentState is set by the service layer for optimistic locking.
+	CurrentState KBArticleState `json:"-"`
 }
 
 type SearchKBArticlesRequest struct {

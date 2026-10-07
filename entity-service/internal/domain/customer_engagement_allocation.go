@@ -81,7 +81,9 @@ type NewCustomerEngagement struct {
 	AccountID        string
 	IsPaid           bool
 	DeliveryMode     *string
-	EngagementTypeID string
+	// EngagementType is a customer_engagement_type_enum label (e.g. "FIREFIGHTING"),
+	// not a ServiceNow sys_id.
+	EngagementType   string
 	PlannedStartDate *string
 	PlannedEndDate   *string
 }

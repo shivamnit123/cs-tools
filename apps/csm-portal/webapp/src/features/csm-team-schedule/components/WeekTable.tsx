@@ -17,13 +17,13 @@
  */
 
 import { useEffect, useMemo, useState, type JSX } from "react";
+import RotaPicker, { type RotaOption } from "./RotaPicker";
 import type {
   ScheduleAbsence,
   ScheduleAbsenceKind,
   ScheduleAssignment,
   ScheduleShift,
-  ScheduleTier,
-} from "../types";
+  ScheduleTier, RotaFamily } from "../types";
 import {
   addDays,
   escalationGrid,
@@ -33,10 +33,9 @@ import {
   isTierlessEscalation,
   shortDayName,
   standingWindowKey,
-  toIsoDate,
-} from "../utils/rota";
+  toIsoDate, rotaZoneName } from "../utils/rota";
 import { accentOf } from "../utils/rotaHues";
-import { useTeamColour } from "../utils/teamColourContext";
+import { useTeamColour, useTeamName } from "../utils/teamColourContext";
 
 interface WeekTableProps {
   weekStart: Date;
@@ -45,14 +44,19 @@ interface WeekTableProps {
   /** The page's own group and team state, rendered here as well as in the
    *  toolbar -- one control in two places, the way the prototype does it, not
    *  a second copy with its own mind. See MonthRoster for the same pair. */
-  family: "CRE" | "SRE";
-  onFamilyChange: (family: "CRE" | "SRE") => void;
+  family: RotaFamily;
+  onFamilyChange: (family: RotaFamily) => void;
   teamKey: string;
   onTeamKeyChange: (teamKey: string) => void;
   teams: string[];
   /** CRE and SRE in the order they should read -- the reader's own group
    *  first, because the first of a pair reads as the default. */
-  families: readonly ("CRE" | "SRE")[];
+  families: readonly RotaFamily[];
+  /** The rotas of the family on screen, the one shown, and the change; the
+   *  picker appears only when there is more than one. */
+  rotas?: readonly RotaOption[];
+  rotaCode?: string;
+  onRotaChange?: (code: string) => void;
   /** Absences over the week, for the leave row at the foot of the table. */
   absences?: ScheduleAbsence[];
   absenceKinds?: ScheduleAbsenceKind[];
@@ -175,10 +179,14 @@ export default function WeekTable({
   onTeamKeyChange,
   teams,
   families,
+  rotas,
+  rotaCode,
+  onRotaChange,
   absences = [],
   absenceKinds = [],
 }: WeekTableProps): JSX.Element {
   const teamColourOf = useTeamColour();
+  const teamNameOf = useTeamName();
   const days = useMemo(() => Array.from({ length: 7 }, (_, i) => addDays(weekStart, i)), [weekStart]);
 
   const rows = useMemo(() => {
@@ -219,7 +227,7 @@ export default function WeekTable({
               code: `esc:${key}`,
               shift,
               list: [],
-              label: `${row.zoneCode} ${tier} support`,
+              label: `${row.label} ${tier} support`,
               token: tier,
               sort: 110 + zi * 10 + ti,
               tiered: true,
@@ -265,7 +273,7 @@ export default function WeekTable({
           label:
             scope === "we"
               ? `${windowFor.get(key)?.label ?? `Weekend ${zone}`} ${tier} support`
-              : `${zone} ${tier} support`,
+              : `${rotaZoneName(familyShifts, zone)} ${tier} support`,
           token: tier,
           sort: (scope === "we" ? 200 : 110) + TIERS.indexOf(tier as ScheduleTier),
           tiered: true,
@@ -351,7 +359,7 @@ export default function WeekTable({
       {/* One group means nothing to switch to: only Today, or a manager,
           can look at the other group. */}
       {families.length > 1 ? (
-        <div className="seg teamseg" role="tablist" aria-label="Show CRE or SRE">
+        <div className="seg teamseg" role="tablist" aria-label={`Show ${families.join(" or ")}`}>
           {families.map((f) => (
             <button
               key={f}
@@ -365,6 +373,8 @@ export default function WeekTable({
           ))}
         </div>
       ) : null}
+
+      <RotaPicker rotas={rotas} rotaCode={rotaCode} onRotaChange={onRotaChange} />
 
       <h2>
         This week <span className="count">{headcount}</span>
@@ -471,7 +481,7 @@ export default function WeekTable({
                              restated the row heading against every name in it.
                              The tier stays: L1/L2/L3 is the one thing here
                              that nothing else says. */
-                          <div className="nm" key={a.id} title={`${a.engineer.name} · ${a.teamKey}`}>
+                          <div className="nm" key={a.id} title={`${a.engineer.name} · ${teamNameOf(a.teamKey)}`}>
                             <span className="av" style={{ background: teamColourOf(a.teamKey) }}>
                               {initialsOf(a.engineer.name)}
                             </span>
@@ -506,7 +516,7 @@ export default function WeekTable({
                       <span className="none">—</span>
                     ) : (
                       list.map(({ ab, kind }) => (
-                        <div className="nm" key={ab.id} title={`${ab.engineer.name} · ${ab.teamKey} · ${kind.label}`}>
+                        <div className="nm" key={ab.id} title={`${ab.engineer.name} · ${teamNameOf(ab.teamKey)} · ${kind.label}`}>
                           <span className={`chip sm ${kind.colourToken}`}>{kind.shortCode}</span>
                           <span className="who">{ab.engineer.name}</span>
                         </div>

@@ -58,15 +58,18 @@ type stubCaseRepo struct {
 	deleteCaseAttachment          func(ctx context.Context, id string) error
 	updateAttachmentName          func(ctx context.Context, id, name, updatedBy string) (time.Time, error)
 	confirmCaseAttachment         func(ctx context.Context, id string) (domain.Attachment, error)
+	addCaseWatcherIfAbsent        func(ctx context.Context, caseID, userID string) error
 	searchCaseComments            func(ctx context.Context, req domain.SearchCaseCommentsRequest) ([]domain.CaseComment, int, error)
 	updateCase                    func(ctx context.Context, req domain.UpdateCaseRequest) (domain.Case, *domain.CaseSeverity, error)
 	createCaseFromServiceNow      func(ctx context.Context, req domain.CreateCaseRequest, id, number, wso2ID, createdBy, state string) (domain.Case, error)
 	createCaseComment             func(ctx context.Context, req domain.CreateCaseCommentRequest, createdOn *time.Time) (domain.CaseComment, error)
+	createCaseCommentAsSystem     func(ctx context.Context, req domain.CreateCaseCommentRequest, createdOn *time.Time) (domain.CaseComment, error)
 	createCase                    func(ctx context.Context, req domain.CreateCaseRequest) (domain.Case, error)
 	getCaseByID                   func(ctx context.Context, id string, scope repository.SearchScope) (domain.CaseView, error)
 	addCaseTag                    func(ctx context.Context, caseID, label, actorEmail string) (domain.Tag, error)
 	setCaseWatchList              func(ctx context.Context, caseID string, userIDs []string, actorEmail string) ([]domain.WatchListUser, time.Time, error)
 	accountDefaultWatcherEmails   func(ctx context.Context, projectID string) ([]string, error)
+	projectOnboardingInfo         func(ctx context.Context, projectID string) (string, bool, error)
 	getCaseEtaSharedOn            func(ctx context.Context, caseID string) (*time.Time, error)
 	projectContactEmailsByRole    func(ctx context.Context, projectID, role string) ([]string, error)
 	updateCaseAssignee            func(ctx context.Context, caseID string, userID *string, callerEmail string) (time.Time, bool, error)
@@ -78,6 +81,13 @@ type stubCaseRepo struct {
 	setCaseTagSNSysID             func(ctx context.Context, caseID, tagID, snSysID string) error
 	getCaseTagSNSysID             func(ctx context.Context, caseID, tagID string) (*string, error)
 	markCaseFixIssued             func(ctx context.Context, caseID string) (time.Time, bool, error)
+	getCaseFeedback               func(ctx context.Context, caseID string) (repository.CaseFeedbackRow, bool, error)
+	createCaseFeedback            func(ctx context.Context, caseID string, params repository.CreateCaseFeedbackParams) (repository.CaseFeedbackCreated, error)
+	// updateCaseActorID captures the actorID UpdateCase was last called with,
+	// for tests asserting it was resolved from the caller's token rather
+	// than left nil -- see CaseRepository.UpdateCase's own interface doc
+	// comment on what actorID is for.
+	updateCaseActorID *string
 }
 
 func (s *stubCaseRepo) CreateCase(ctx context.Context, req domain.CreateCaseRequest) (domain.Case, error) {
@@ -116,13 +126,20 @@ func (s *stubCaseRepo) CreateCaseComment(ctx context.Context, req domain.CreateC
 	}
 	panic("not implemented")
 }
+func (s *stubCaseRepo) CreateCaseCommentAsSystem(ctx context.Context, req domain.CreateCaseCommentRequest, createdOn *time.Time) (domain.CaseComment, error) {
+	if s.createCaseCommentAsSystem != nil {
+		return s.createCaseCommentAsSystem(ctx, req, createdOn)
+	}
+	panic("not implemented")
+}
 func (s *stubCaseRepo) SearchCaseComments(ctx context.Context, req domain.SearchCaseCommentsRequest) ([]domain.CaseComment, int, error) {
 	if s.searchCaseComments != nil {
 		return s.searchCaseComments(ctx, req)
 	}
 	panic("not implemented")
 }
-func (s *stubCaseRepo) UpdateCase(ctx context.Context, req domain.UpdateCaseRequest) (domain.Case, *domain.CaseSeverity, error) {
+func (s *stubCaseRepo) UpdateCase(ctx context.Context, req domain.UpdateCaseRequest, actorID *string) (domain.Case, *domain.CaseSeverity, error) {
+	s.updateCaseActorID = actorID
 	if s.updateCase != nil {
 		return s.updateCase(ctx, req)
 	}
@@ -203,11 +220,34 @@ func (s *stubCaseRepo) GetCaseTagSNSysID(ctx context.Context, caseID, tagID stri
 func (s *stubCaseRepo) SearchTags(context.Context, string, string, int) ([]domain.Tag, error) {
 	panic("not implemented")
 }
+func (s *stubCaseRepo) GetCaseFeedback(ctx context.Context, caseID string) (repository.CaseFeedbackRow, bool, error) {
+	if s.getCaseFeedback != nil {
+		return s.getCaseFeedback(ctx, caseID)
+	}
+	panic("not implemented")
+}
+func (s *stubCaseRepo) CreateCaseFeedback(ctx context.Context, caseID string, params repository.CreateCaseFeedbackParams) (repository.CaseFeedbackCreated, error) {
+	if s.createCaseFeedback != nil {
+		return s.createCaseFeedback(ctx, caseID, params)
+	}
+	panic("not implemented")
+}
 func (s *stubCaseRepo) SetCaseWatchList(ctx context.Context, caseID string, userIDs []string, actorEmail string) ([]domain.WatchListUser, time.Time, error) {
 	if s.setCaseWatchList != nil {
 		return s.setCaseWatchList(ctx, caseID, userIDs, actorEmail)
 	}
 	panic("not implemented")
+}
+
+// AddCaseWatcherIfAbsent defaults to a no-op rather than panicking: every
+// comment-creation test case (from before this method existed) doesn't care
+// about the commenter-auto-subscribe side effect it backs, same reasoning as
+// AccountDefaultWatcherEmails below.
+func (s *stubCaseRepo) AddCaseWatcherIfAbsent(ctx context.Context, caseID, userID string) error {
+	if s.addCaseWatcherIfAbsent != nil {
+		return s.addCaseWatcherIfAbsent(ctx, caseID, userID)
+	}
+	return nil
 }
 
 // AccountDefaultWatcherEmails defaults to empty rather than panicking:
@@ -220,6 +260,13 @@ func (s *stubCaseRepo) AccountDefaultWatcherEmails(ctx context.Context, projectI
 		return s.accountDefaultWatcherEmails(ctx, projectID)
 	}
 	return nil, nil
+}
+
+func (s *stubCaseRepo) ProjectOnboardingInfo(ctx context.Context, projectID string) (string, bool, error) {
+	if s.projectOnboardingInfo != nil {
+		return s.projectOnboardingInfo(ctx, projectID)
+	}
+	return "", false, nil
 }
 
 // GetCaseEtaSharedOn defaults to nil (no fix ETA shared) rather than
@@ -1628,6 +1675,67 @@ func TestCaseService_UpdateCase_StatusChanged_RecipientsIncludeFreshDefaultsAndD
 	}
 }
 
+// TestCaseService_UpdateCase_ResolvesActorIDForClosedByStamp is the
+// regression guard for a real, reported bug: a case closed through this
+// data source always had closed_by_user_id left NULL, so the case detail
+// page fell back to showing "Case closed by system" regardless of who
+// actually closed it -- CaseRepository.UpdateCase was never given an actor
+// id to stamp onto it at all. This proves UpdateCase resolves the caller's
+// own "user" id from their x-user-id-token and passes it through to the
+// repository as actorID -- never read from the request body itself, which
+// has no such field.
+func TestCaseService_UpdateCase_ResolvesActorIDForClosedByStamp(t *testing.T) {
+	closed := domain.CaseStateClosed
+	open := domain.CaseStateOpen
+	repo := &stubCaseRepo{
+		getCaseByID: func(context.Context, string, repository.SearchScope) (domain.CaseView, error) {
+			return domain.CaseView{ID: testDeploymentUUID, State: &open}, nil
+		},
+		updateCase: func(_ context.Context, req domain.UpdateCaseRequest) (domain.Case, *domain.CaseSeverity, error) {
+			return domain.Case{ID: req.ID, State: req.State}, nil, nil
+		},
+	}
+	svc := NewCaseService(repo, stubUserRepo{
+		getUserByEmail: func(ctx context.Context, email string) (domain.User, error) {
+			return domain.User{ID: "closer-user-id", Email: email}, nil
+		},
+	}, nil, alwaysUnrestrictedAccess{}, nil)
+
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	if _, err := svc.UpdateCase(ctx, domain.UpdateCaseRequest{ID: testDeploymentUUID, State: &closed}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if repo.updateCaseActorID == nil || *repo.updateCaseActorID != "closer-user-id" {
+		t.Fatalf("UpdateCase was called with actorID = %v, want a pointer to \"closer-user-id\"", repo.updateCaseActorID)
+	}
+}
+
+// TestCaseService_UpdateCase_LeavesActorIDNilWithoutAToken proves a caller
+// with no (or an invalid) x-user-id-token still succeeds -- this branch has
+// never required an authenticated caller (see updateCaseAssignee's own doc
+// comment) -- and simply passes a nil actorID through, rather than failing
+// the whole update or guessing at who the actor is.
+func TestCaseService_UpdateCase_LeavesActorIDNilWithoutAToken(t *testing.T) {
+	closed := domain.CaseStateClosed
+	open := domain.CaseStateOpen
+	repo := &stubCaseRepo{
+		getCaseByID: func(context.Context, string, repository.SearchScope) (domain.CaseView, error) {
+			return domain.CaseView{ID: testDeploymentUUID, State: &open}, nil
+		},
+		updateCase: func(_ context.Context, req domain.UpdateCaseRequest) (domain.Case, *domain.CaseSeverity, error) {
+			return domain.Case{ID: req.ID, State: req.State}, nil, nil
+		},
+	}
+	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
+
+	if _, err := svc.UpdateCase(context.Background(), domain.UpdateCaseRequest{ID: testDeploymentUUID, State: &closed}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if repo.updateCaseActorID != nil {
+		t.Fatalf("UpdateCase was called with actorID = %v, want nil", *repo.updateCaseActorID)
+	}
+}
+
 // TestCaseService_UpdateCase_DoesNotPublishStatusChangedOnNoOp proves a
 // caller re-PATCHing the case's current state does not send every watcher a
 // false "status changed" notification -- the same no-op guard
@@ -2272,7 +2380,7 @@ func TestCaseService_CreateCase_MirrorsInitialServiceNowComments(t *testing.T) {
 			respState := domain.CaseStateOpen
 			return domain.Case{ID: id, Number: number, InternalID: wso2ID, CreatedBy: createdBy, State: &respState}, nil
 		},
-		createCaseComment: func(_ context.Context, req domain.CreateCaseCommentRequest, createdOn *time.Time) (domain.CaseComment, error) {
+		createCaseCommentAsSystem: func(_ context.Context, req domain.CreateCaseCommentRequest, createdOn *time.Time) (domain.CaseComment, error) {
 			if createdOn == nil {
 				t.Fatalf("mirrorInitialSNComments must pass a non-nil createdOn, got nil for %+v", req)
 			}
@@ -3168,6 +3276,175 @@ func TestCaseService_CreateCaseComment_PublishesCommentAdded(t *testing.T) {
 	}
 }
 
+// TestCaseService_CreateCaseComment_PublishesIsSupportEngineerResponse is the
+// regression guard for events.CommentAddedPayload.IsSupportEngineerResponse:
+// a public comment from a user holding csEngineerRole must publish
+// case.comment_added with that flag set, so
+// integrations/csm-notification-service's own SLA tracking can complete a
+// case's response clock without any role/identity resolution of its own.
+func TestCaseService_CreateCaseComment_PublishesIsSupportEngineerResponse(t *testing.T) {
+	repo := &stubCaseRepo{
+		createCaseComment: func(_ context.Context, req domain.CreateCaseCommentRequest, _ *time.Time) (domain.CaseComment, error) {
+			return domain.CaseComment{ID: "comment-1", CaseID: req.CaseID, Type: req.Type, Content: req.Content}, nil
+		},
+		getCaseByID: func(context.Context, string, repository.SearchScope) (domain.CaseView, error) {
+			return domain.CaseView{
+				ID: testDeploymentUUID, Number: "CS0001", InternalID: "WSO2-CS-1", Subject: "s",
+				ProjectDetails: &domain.EntityRef{ID: "proj-1", Name: "Project One"},
+				WatchList:      []domain.WatchListUser{{Email: "watcher@example.com"}},
+			}, nil
+		},
+	}
+	userRepo := stubUserRepo{
+		getUserByEmail: func(context.Context, string) (domain.User, error) {
+			return domain.User{ID: "user-1", Email: "engineer@example.com"}, nil
+		},
+		getUserRoles: func(context.Context, string) ([]string, error) {
+			return []string{"sn_customerservice_agent"}, nil
+		},
+	}
+	publisher := &mockEventPublisher{}
+	svc := NewCaseServiceWithSNWriteback(repo, userRepo, publisher, alwaysUnrestrictedAccess{}, nil, nil, nil, nil, "sn_customerservice_agent")
+
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "engineer@example.com"))
+	req := domain.CreateCaseCommentRequest{CaseID: testDeploymentUUID, Type: domain.CommentTypeComment, Content: "Looking into it"}
+	if _, err := svc.CreateCaseComment(ctx, req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(publisher.calls) != 1 {
+		t.Fatalf("expected exactly 1 publish call, got %d", len(publisher.calls))
+	}
+	var payload events.CommentAddedPayload
+	if err := json.Unmarshal(publisher.calls[0].payload, &payload); err != nil {
+		t.Fatalf("failed to decode payload: %v", err)
+	}
+	if !payload.IsSupportEngineerResponse {
+		t.Errorf("IsSupportEngineerResponse = false, want true for a comment from a csEngineerRole-holding author")
+	}
+}
+
+// TestCaseService_CreateCaseComment_DoesNotPublishIsSupportEngineerResponseForNonEngineer
+// proves the flag above is genuinely role-gated, not unconditional.
+func TestCaseService_CreateCaseComment_DoesNotPublishIsSupportEngineerResponseForNonEngineer(t *testing.T) {
+	repo := &stubCaseRepo{
+		createCaseComment: func(_ context.Context, req domain.CreateCaseCommentRequest, _ *time.Time) (domain.CaseComment, error) {
+			return domain.CaseComment{ID: "comment-1", CaseID: req.CaseID, Type: req.Type, Content: req.Content}, nil
+		},
+		getCaseByID: func(context.Context, string, repository.SearchScope) (domain.CaseView, error) {
+			return domain.CaseView{
+				ID: testDeploymentUUID, Number: "CS0001", InternalID: "WSO2-CS-1", Subject: "s",
+				ProjectDetails: &domain.EntityRef{ID: "proj-1", Name: "Project One"},
+				WatchList:      []domain.WatchListUser{{Email: "watcher@example.com"}},
+			}, nil
+		},
+	}
+	userRepo := stubUserRepo{
+		getUserByEmail: func(context.Context, string) (domain.User, error) {
+			return domain.User{ID: "user-2", Email: "customer@example.com"}, nil
+		},
+		getUserRoles: func(context.Context, string) ([]string, error) {
+			return []string{"customer"}, nil
+		},
+	}
+	publisher := &mockEventPublisher{}
+	svc := NewCaseServiceWithSNWriteback(repo, userRepo, publisher, alwaysUnrestrictedAccess{}, nil, nil, nil, nil, "sn_customerservice_agent")
+
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "customer@example.com"))
+	req := domain.CreateCaseCommentRequest{CaseID: testDeploymentUUID, Type: domain.CommentTypeComment, Content: "Any update?"}
+	if _, err := svc.CreateCaseComment(ctx, req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(publisher.calls) != 1 {
+		t.Fatalf("expected exactly 1 publish call, got %d", len(publisher.calls))
+	}
+	var payload events.CommentAddedPayload
+	if err := json.Unmarshal(publisher.calls[0].payload, &payload); err != nil {
+		t.Fatalf("failed to decode payload: %v", err)
+	}
+	if payload.IsSupportEngineerResponse {
+		t.Error("IsSupportEngineerResponse = true, want false for a non-engineer author")
+	}
+	// Decoding into the struct above can't tell "false" apart from "key
+	// absent" -- both leave the Go field at its zero value. Decode into a
+	// raw map too, to confirm the key itself is actually on the wire (no
+	// omitempty): a consumer needs to tell a confirmed non-engineer reply
+	// apart from an older publisher that never sent this field at all.
+	var raw map[string]any
+	if err := json.Unmarshal(publisher.calls[0].payload, &raw); err != nil {
+		t.Fatalf("failed to decode raw payload: %v", err)
+	}
+	if v, ok := raw["isSupportEngineerResponse"]; !ok || v != false {
+		t.Errorf("raw payload isSupportEngineerResponse = %v (present=%v), want false present on the wire", v, ok)
+	}
+}
+
+// TestCaseService_CreateCaseComment_PlainNewCaseServiceNeedsWithCSEngineerRole
+// is the regression guard for the plain DATA_SOURCE=postgres wiring gap:
+// NewCaseService (unlike NewCaseServiceWithSNWriteback) has no
+// csEngineerRole constructor parameter at all, so a caseService built from
+// it alone can never confirm a comment author as a support engineer, no
+// matter what roles that author actually holds -- isSupportEngineerAuthor
+// bails out on s.csEngineerRole == "" before ever calling GetUserRoles. Only
+// after WithCSEngineerRole (the same post-construction wiring shape as
+// WithProductCategoryEnforcement) attaches the role does the identical
+// comment start publishing IsSupportEngineerResponse: true.
+func TestCaseService_CreateCaseComment_PlainNewCaseServiceNeedsWithCSEngineerRole(t *testing.T) {
+	newSvc := func() CaseService {
+		repo := &stubCaseRepo{
+			createCaseComment: func(_ context.Context, req domain.CreateCaseCommentRequest, _ *time.Time) (domain.CaseComment, error) {
+				return domain.CaseComment{ID: "comment-1", CaseID: req.CaseID, Type: req.Type, Content: req.Content}, nil
+			},
+			getCaseByID: func(context.Context, string, repository.SearchScope) (domain.CaseView, error) {
+				return domain.CaseView{
+					ID: testDeploymentUUID, Number: "CS0001", InternalID: "WSO2-CS-1", Subject: "s",
+					ProjectDetails: &domain.EntityRef{ID: "proj-1", Name: "Project One"},
+					WatchList:      []domain.WatchListUser{{Email: "watcher@example.com"}},
+				}, nil
+			},
+		}
+		userRepo := stubUserRepo{
+			getUserByEmail: func(context.Context, string) (domain.User, error) {
+				return domain.User{ID: "user-1", Email: "engineer@example.com"}, nil
+			},
+			getUserRoles: func(context.Context, string) ([]string, error) {
+				return []string{"sn_customerservice_agent"}, nil
+			},
+		}
+		return NewCaseService(repo, userRepo, &mockEventPublisher{}, alwaysUnrestrictedAccess{}, nil)
+	}
+
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "engineer@example.com"))
+	req := domain.CreateCaseCommentRequest{CaseID: testDeploymentUUID, Type: domain.CommentTypeComment, Content: "Looking into it"}
+
+	publishedFlag := func(svc CaseService, publisher *mockEventPublisher) bool {
+		if _, err := svc.CreateCaseComment(ctx, req); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(publisher.calls) != 1 {
+			t.Fatalf("expected exactly 1 publish call, got %d", len(publisher.calls))
+		}
+		var payload events.CommentAddedPayload
+		if err := json.Unmarshal(publisher.calls[0].payload, &payload); err != nil {
+			t.Fatalf("failed to decode payload: %v", err)
+		}
+		return payload.IsSupportEngineerResponse
+	}
+
+	plain := newSvc()
+	plainPublisher := plain.(*caseService).publisher.(*mockEventPublisher)
+	if got := publishedFlag(plain, plainPublisher); got {
+		t.Error("IsSupportEngineerResponse = true on a plain NewCaseService with no WithCSEngineerRole wiring, want false (csEngineerRole unset)")
+	}
+
+	wired := WithCSEngineerRole(newSvc(), "sn_customerservice_agent")
+	wiredPublisher := wired.(*caseService).publisher.(*mockEventPublisher)
+	if got := publishedFlag(wired, wiredPublisher); !got {
+		t.Error("IsSupportEngineerResponse = false after WithCSEngineerRole, want true for a csEngineerRole-holding author")
+	}
+}
+
 // TestCaseService_CreateCaseComment_RecordsSNWritebackFailureOnMirrorError
 // covers the failure path: Postgres already committed the comment by the
 // time Dispatch runs, so a failed mirror write must not surface as a
@@ -3285,9 +3562,14 @@ func TestCaseService_CreateCaseComment_DoesNotMirrorWithoutSNWriteback(t *testin
 // TestCaseService_CreateCaseCommentAs_UsesActorEmailDirectly covers the M2M
 // path this method exists for: no x-user-id-token is required, and --
 // mirroring addCaseTagAs -- the caller-supplied actorEmail is used directly
-// for created_by and the published event's author name, with no
-// userRepo.GetUserByEmail lookup at all (stubUserRepo{} panics if it were
-// called, since no getUserByEmail func is configured here). Also proves the
+// for created_by and the published event's author name, with no identity
+// resolution required to succeed. subscribeCommenterToWatchList does make a
+// best-effort userRepo.GetUserByEmail lookup here (same as
+// isSupportEngineerAuthor already does elsewhere in this same call), which
+// the configured getUserByEmail below answers with a NotFoundError -- an M2M
+// actorEmail is not guaranteed to be a provisioned sys_user-equivalent row,
+// so this proves that case is swallowed silently (no AddCaseWatcherIfAbsent
+// call, no error surfaced) rather than failing the comment. Also proves the
 // created comment's CreatedBy in the response is the actorEmail, not a
 // resolved user row's email.
 func TestCaseService_CreateCaseCommentAs_UsesActorEmailDirectly(t *testing.T) {
@@ -3305,9 +3587,18 @@ func TestCaseService_CreateCaseCommentAs_UsesActorEmailDirectly(t *testing.T) {
 			}, nil
 		},
 	}
-	// Deliberately no getUserByEmail configured -- CreateCaseCommentAs must
-	// never call it (unlike CreateCaseComment).
-	userRepo := stubUserRepo{}
+	// An M2M actorEmail has no guaranteed "user" row -- see
+	// subscribeCommenterToWatchList's own doc comment.
+	addWatcherCalled := false
+	repo.addCaseWatcherIfAbsent = func(context.Context, string, string) error {
+		addWatcherCalled = true
+		return nil
+	}
+	userRepo := stubUserRepo{
+		getUserByEmail: func(context.Context, string) (domain.User, error) {
+			return domain.User{}, &apierror.NotFoundError{Msg: "user not found"}
+		},
+	}
 	publisher := &mockEventPublisher{}
 	svc := NewCaseService(repo, userRepo, publisher, alwaysUnrestrictedAccess{}, nil)
 
@@ -3332,6 +3623,9 @@ func TestCaseService_CreateCaseCommentAs_UsesActorEmailDirectly(t *testing.T) {
 	}
 	if payload.Name != actorEmail {
 		t.Errorf("published author Name = %q, want %q (actorEmail, since no user row was looked up)", payload.Name, actorEmail)
+	}
+	if addWatcherCalled {
+		t.Error("AddCaseWatcherIfAbsent was called despite the actorEmail not resolving to a real user")
 	}
 }
 

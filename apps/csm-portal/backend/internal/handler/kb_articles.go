@@ -87,6 +87,34 @@ func (h *KBArticleHandler) CreateKBArticle(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// authorId is set here from the authenticated caller rather than
+	// taken from the request: entity-service writes it straight into
+	// author_id/created_by/updated_by, and author identity also grants
+	// author-only rights (submit, edit-published) later. A caller-supplied
+	// value would let anyone with write access attribute an article to
+	// someone else and hand them those rights. Same reasoning as
+	// PatchKBArticleContent's updatedBy.
+	myID, err := h.currentPostgresUserID(r.Context())
+	if err != nil {
+		slog.ErrorContext(r.Context(), "resolve current user failed (create)", "userID", user.UserID, "err", err)
+		mapUpstreamErrorGeneric(w, err, "Failed to create KB article.")
+		return
+	}
+
+	var payload map[string]any
+	// nil check as well as err: json.Valid accepts a bare "null", which
+	// unmarshals into a nil map without error -- writing to that panics.
+	if err := json.Unmarshal(body, &payload); err != nil || payload == nil {
+		writeError(w, http.StatusBadRequest, ErrMsgBadRequest)
+		return
+	}
+	payload["authorId"] = myID
+	body, err = json.Marshal(payload)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, ErrMsgInternal)
+		return
+	}
+
 	result, err := h.entity.CreateKBArticle(r.Context(), body)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "entity CreateKBArticle failed", "userID", user.UserID, "err", err)
@@ -261,8 +289,12 @@ type kbArticleStateDecisionPayload struct {
 //	published       -> draft          : author only (edit)
 //	published       -> retired        : manager only (retire)
 //
-// The entity service's DB trigger still independently rejects any
-// structurally-illegal transition regardless of this check.
+// This is the ONLY place the who-may-do-what rules are enforced. The
+// transition itself is separately validated by entity-service's
+// isLegalKBArticleTransition, but there is no DB-level defence in depth:
+// migration 000027 dropped trg_kb_article_valid_transition along with the
+// old schema, and the real knowledge_article table has no equivalent
+// trigger. Anything calling entity-service directly bypasses these checks.
 func (h *KBArticleHandler) PatchKBArticleState(w http.ResponseWriter, r *http.Request) {
 	user := middleware.UserInfoFromContext(r.Context())
 	if user == nil {
@@ -324,6 +356,16 @@ func (h *KBArticleHandler) PatchKBArticleState(w http.ResponseWriter, r *http.Re
 
 	requiresAuthor := (current.State == "draft" && payload.State == "pending_review") || // submit
 		(current.State == "published" && payload.State == "draft") // edit published
+
+	// Deny by default. Without this, a transition matching neither rule --
+	// notably same-state (published -> published) -- runs no permission
+	// check at all, yet still writes updated_by, resets published_on and
+	// appends a history row. Every transition the UI performs matches one
+	// of the two rules above.
+	if !requiresAuthor && !requiresManager {
+		writeError(w, http.StatusForbidden, ErrMsgForbidden)
+		return
+	}
 
 	if requiresAuthor {
 		myID, err := h.currentPostgresUserID(r.Context())
@@ -464,7 +506,9 @@ func (h *KBArticleHandler) PatchKBArticleContent(w http.ResponseWriter, r *http.
 	}
 
 	var contentPayload map[string]any
-	if err := json.Unmarshal(body, &contentPayload); err != nil {
+	// Same nil guard as CreateKBArticle: a bare "null" body unmarshals
+	// into a nil map without error, and writing to it panics.
+	if err := json.Unmarshal(body, &contentPayload); err != nil || contentPayload == nil {
 		writeError(w, http.StatusBadRequest, ErrMsgBadRequest)
 		return
 	}

@@ -22,16 +22,34 @@ import "time"
 // escalation tier. Portal-native data with no ServiceNow equivalent, so these
 // types describe the system of record rather than a mirror of one.
 
-// ScheduleZone is an SRE time zone. WeekendZoneCode names the zone that
-// absorbs this one at the weekend, when three weekday zones collapse into
+// ScheduleZone is a block of the day a rota is worked in: SaaS SRE's time
+// zones TZ1-TZ3, or a rotation's Day and Night. WeekendZoneCode names the zone
+// that absorbs this one at the weekend, when three weekday zones collapse into
 // two -- without it, a Saturday's small hours (which belong to Friday's TZ3
-// crew) cannot be attributed to any weekend zone.
+// crew) cannot be attributed to any weekend zone. RotaCode is the rota the
+// zone belongs to; absent for a zone no rota claims, which reads as before.
 type ScheduleZone struct {
 	ID              string  `json:"id"`
 	Code            string  `json:"code"`
 	Label           string  `json:"label"`
 	WeekendZoneCode *string `json:"weekendZoneCode,omitempty"`
 	SortOrder       int     `json:"sortOrder"`
+	RotaCode        *string `json:"rotaCode,omitempty"`
+}
+
+// ScheduleRota is a named rotation inside a family -- SRE runs SaaS and IaaS,
+// SME one per product -- with the rules its own sheet states. A team belongs to
+// the rota whose TeamType matches team.type, the same convention family follows.
+// EscalationMinutes is informational (nil where the source does not say): the
+// escalation ladder keeps its own timing.
+type ScheduleRota struct {
+	Code              string  `json:"code"`
+	Label             string  `json:"label"`
+	Family            string  `json:"family"`
+	Rotates           string  `json:"rotates"`
+	EscalationMinutes *int16  `json:"escalationMinutes,omitempty"`
+	SourceSheet       *string `json:"sourceSheet,omitempty"`
+	SortOrder         int     `json:"sortOrder"`
 }
 
 // ScheduleShift is a named window of the working day. StartMinute and
@@ -77,8 +95,8 @@ type ScheduleAbsenceKind struct {
 	// Custom is true for a kind a lead added from the portal, which a lead may
 	// also delete. The catalogue's own kinds, seeded by migration, are not.
 	Custom bool `json:"custom"`
-	// Family is the rota the kind is offered on, CRE or SRE; absent for a kind
-	// both rotas use, which is every kind of leave.
+	// Family is the rota the kind is offered on, CRE, SRE or SME; absent for a
+	// kind every rota uses, which is every kind of leave.
 	Family *string `json:"family,omitempty"`
 	// Retired is true for a kind no longer offered. It is still served so the
 	// days already marked with it keep their label, but nothing should offer it.
@@ -94,6 +112,7 @@ type ScheduleCatalogue struct {
 	Shifts       []ScheduleShift       `json:"shifts"`
 	AbsenceKinds []ScheduleAbsenceKind `json:"absenceKinds"`
 	Teams        []ScheduleTeam        `json:"teams"`
+	Rotas        []ScheduleRota        `json:"rotas"`
 }
 
 // ScheduleTeam is one team the rota is run for.
@@ -109,6 +128,9 @@ type ScheduleTeam struct {
 	Name      string `json:"name"`
 	Family    string `json:"family"`
 	SortOrder int    `json:"sortOrder"`
+	// RotaCode is the rota this team's type belongs to; absent for a team on
+	// no named rota (CRE's, and Americas).
+	RotaCode *string `json:"rotaCode,omitempty"`
 }
 
 // ScheduleEngineer is who is working, flattened onto the assignment so a day

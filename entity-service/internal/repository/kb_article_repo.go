@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
@@ -90,18 +91,44 @@ func NewKBArticleRepository(db *pgxpool.Pool) KBArticleRepository {
 	return &kbArticleRepo{db: db}
 }
 
-const kbArticleColumns = `id, knowledge_base_id, title, body, state, author_id,
+const kbArticleColumns = `id, knowledge_base_id, title, COALESCE(body, '') AS body, COALESCE(state, '') AS state, author_id,
 	revised_by_id, source_case_id, rejection_comment, updated_by, base_version_id, latest,
 	created_on, updated_on, published_on, retired_on`
 
+// scanKBArticle scans one knowledge_article row, in kbArticleColumns order.
+//
+// knowledge_base_id, body, state, author_id and latest are all nullable in
+// the table (migration 0044) and are NULL on a large share of real rows, but
+// domain.KBArticle declares them as required (non-pointer) fields on the
+// wire. pgx cannot scan a NULL into a plain
+// string/bool, so scanning straight into those fields failed the whole page
+// on the first such row. They are scanned into pointer locals instead and
+// converted to their zero value ("" / false) afterwards, so the wire contract
+// stays exactly as documented -- same approach as CaseView.InternalID and
+// DeploymentView.Type.
+//
+// Errors are returned unwrapped so callers can still match pgx.ErrNoRows and
+// *pgconn.PgError.
 func scanKBArticle(row interface {
 	Scan(dest ...any) error
 }, a *domain.KBArticle) error {
-	return row.Scan(
-		&a.ID, &a.KnowledgeBaseID, &a.Title, &a.Body, &a.State, &a.AuthorID,
-		&a.RevisedByID, &a.SourceCaseID, &a.RejectionComment, &a.UpdatedBy, &a.BaseVersionID, &a.Latest,
+	var knowledgeBaseID, body, state, authorID *string
+	var latest *bool
+
+	if err := row.Scan(
+		&a.ID, &knowledgeBaseID, &a.Title, &body, &state, &authorID,
+		&a.RevisedByID, &a.SourceCaseID, &a.RejectionComment, &a.UpdatedBy, &a.BaseVersionID, &latest,
 		&a.CreatedOn, &a.UpdatedOn, &a.PublishedOn, &a.RetiredOn,
-	)
+	); err != nil {
+		return err
+	}
+
+	a.KnowledgeBaseID = stringOrEmpty(knowledgeBaseID)
+	a.Body = stringOrEmpty(body)
+	a.State = domain.KBArticleState(stringOrEmpty(state))
+	a.AuthorID = stringOrEmpty(authorID)
+	a.Latest = latest != nil && *latest
+	return nil
 }
 
 // CreateKBArticle implements KBArticleRepository.
@@ -254,17 +281,20 @@ func (r *kbArticleRepo) UpdateKBArticleState(ctx context.Context, id string, req
 		    updated_on = NOW(),
 		    published_on = CASE WHEN $2::text = 'published' THEN NOW() ELSE published_on END,
 		    retired_on   = CASE WHEN $2::text = 'retired'   THEN NOW() ELSE retired_on   END
-		WHERE id = $1
+		WHERE id = $1 AND state = $5::text
 		RETURNING %s`, kbArticleColumns)
 
 	var a domain.KBArticle
-	err = scanKBArticle(tx.QueryRow(ctx, query, id, string(req.State), req.RejectionComment, req.UpdatedBy), &a)
+	err = scanKBArticle(tx.QueryRow(ctx, query, id, string(req.State), req.RejectionComment, req.UpdatedBy, string(req.CurrentState)), &a)
 	if err != nil {
 		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) {
 			switch pgErr.Code {
 			case "P0001", "23514":
 				return domain.KBArticle{}, &apierror.ValidationError{Msg: pgErr.Message}
 			}
+		}
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.KBArticle{}, &apierror.ConflictError{Msg: "article state was modified by another request"}
 		}
 		return domain.KBArticle{}, fmt.Errorf("update kb article state: %w", err)
 	}
@@ -316,7 +346,7 @@ func (r *kbArticleRepo) DeleteKBArticle(ctx context.Context, id string) error {
 // ListKBArticleHistory implements KBArticleRepository.
 func (r *kbArticleRepo) ListKBArticleHistory(ctx context.Context, kbArticleID string) ([]domain.KBArticleHistoryEntry, error) {
 	const query = `
-		SELECT id, knowledge_article_id, title, body, state, changed_by, created_on
+		SELECT id, knowledge_article_id, title, COALESCE(body, '') AS body, COALESCE(state, '') AS state, changed_by, created_on
 		FROM knowledge_article_history
 		WHERE knowledge_article_id = $1
 		ORDER BY created_on DESC`

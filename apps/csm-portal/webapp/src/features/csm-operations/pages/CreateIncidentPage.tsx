@@ -149,11 +149,9 @@ export default function CreateIncidentPage(): JSX.Element {
   const [serviceId, setServiceId] = useState("");
   const [serviceOfferingId, setServiceOfferingId] = useState("");
   const [configurationItemId, setConfigurationItemId] = useState("");
-  // Derived from the selected Service's ServiceNow `support_group` — not
-  // independently pickable. `assignmentGroupId` is what's actually submitted
-  // (unchanged shape); `derivedAssignmentGroup` only carries the name for
-  // display in the read-only field below.
-  const [assignmentGroupId, setAssignmentGroupId] = useState("");
+  // The backend sets the assignment group from the selected Service's
+  // support group — the create payload has no assignmentGroupId. This only
+  // shows the user which group that will be, in the read-only field below.
   const [derivedAssignmentGroup, setDerivedAssignmentGroup] = useState<BeEntityRef | null>(
     null,
   );
@@ -258,7 +256,6 @@ export default function CreateIncidentPage(): JSX.Element {
     if (description.trim()) payload.additionalComments = description.trim();
     if (serviceOfferingId) payload.serviceOfferingId = serviceOfferingId;
     if (configurationItemId) payload.configurationItemId = configurationItemId;
-    if (assignmentGroupId) payload.assignmentGroupId = assignmentGroupId;
     if (assignedEngineerId) payload.assignedEngineerId = assignedEngineerId;
     if (watchList.length > 0) payload.watchList = watchList;
     if (workNotes.trim()) payload.workNotes = workNotes.trim();
@@ -515,9 +512,8 @@ export default function CreateIncidentPage(): JSX.Element {
                   // A service offering only makes sense under its own
                   // service — drop it rather than leave a stale pairing.
                   setServiceOfferingId("");
-                  // Assignment group is derived from the service, not
-                  // independently pickable — see the read-only field below.
-                  setAssignmentGroupId(service?.supportGroup?.id ?? "");
+                  // Preview only: the backend sets the group from the
+                  // service — see the read-only field below.
                   setDerivedAssignmentGroup(service?.supportGroup ?? null);
                 }}
                 disabled={postIncident.isPending}
@@ -542,8 +538,8 @@ export default function CreateIncidentPage(): JSX.Element {
                 }}
                 helperText={
                   serviceId && !derivedAssignmentGroup
-                    ? "No support group set for this service in ServiceNow."
-                    : "Derived from the selected Service."
+                    ? "This service has no support group, so the incident will be unassigned."
+                    : "Set from the selected Service when the incident is created."
                 }
               />
             </Box>

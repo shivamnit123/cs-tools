@@ -310,6 +310,17 @@ func (c *CustomerEntityClient) SearchIncidentActivities(ctx context.Context, id 
 	return c.do(ctx, http.MethodPost, fmt.Sprintf("/incidents/%s/activities/search", url.PathEscape(id)), body)
 }
 
+// ListSpecialistHandoffTeams calls GET /specialist-handoff-teams on the entity service:
+// the Special Ops teams the incident handoff dialog offers for serviceID (every team when
+// empty). Raw JSON.
+func (c *CustomerEntityClient) ListSpecialistHandoffTeams(ctx context.Context, serviceID string) ([]byte, error) {
+	path := "/specialist-handoff-teams"
+	if serviceID != "" {
+		path += "?" + url.Values{"serviceId": {serviceID}}.Encode()
+	}
+	return c.do(ctx, http.MethodGet, path, nil)
+}
+
 // HandOffIncidentToSpecialist calls POST /incidents/{id}/specialist-handoffs on the entity
 // service: hands the incident off to its specialist group in one atomic call. Response is
 // returned as raw JSON; typed response structs are deferred.
@@ -369,6 +380,13 @@ func (c *CustomerEntityClient) AggregateIncidentTasks(ctx context.Context, body 
 // Response is returned as raw JSON; typed response structs are deferred.
 func (c *CustomerEntityClient) GetIncidentTask(ctx context.Context, id string) ([]byte, error) {
 	return c.do(ctx, http.MethodGet, fmt.Sprintf("/incident-tasks/%s", url.PathEscape(id)), nil)
+}
+
+// UpdateIncidentTask calls PATCH /incident-tasks/{id} on the entity service
+// to change a task's state and/or close notes.
+// Response is returned as raw JSON; typed response structs are deferred.
+func (c *CustomerEntityClient) UpdateIncidentTask(ctx context.Context, id string, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPatch, fmt.Sprintf("/incident-tasks/%s", url.PathEscape(id)), body)
 }
 
 // PostDeployment calls POST /deployments on the entity service to create a new deployment.
@@ -480,6 +498,15 @@ func (c *CustomerEntityClient) GetChangeRequest(ctx context.Context, id string) 
 // Response is returned as raw JSON.
 func (c *CustomerEntityClient) PatchChangeRequest(ctx context.Context, id string, body []byte) ([]byte, error) {
 	return c.do(ctx, http.MethodPatch, fmt.Sprintf("/change-requests/%s", url.PathEscape(id)), body)
+}
+
+// GetChangeRequestLinkOptions calls POST /change-requests/link-options on the
+// entity service: the project's deployments, the deployment products that
+// follow from the deployments chosen so far, and the project's registered
+// customer contacts (the read-only Customer Group).
+// Response is returned as raw JSON.
+func (c *CustomerEntityClient) GetChangeRequestLinkOptions(ctx context.Context, body []byte) ([]byte, error) {
+	return c.do(ctx, http.MethodPost, "/change-requests/link-options", body)
 }
 
 // GetChangeRequestApprovals calls GET /change-requests/{id}/approvals on the entity service.
@@ -651,6 +678,14 @@ func (c *CustomerEntityClient) SearchServiceOfferings(ctx context.Context, body 
 // Response is returned as raw JSON.
 func (c *CustomerEntityClient) SearchGroups(ctx context.Context, body []byte) ([]byte, error) {
 	return c.do(ctx, http.MethodPost, "/groups/search", body)
+}
+
+// GetGroup calls GET /groups/{id} on the entity service: one group (name,
+// description, email, manager) and its active members, opened from a change
+// request approval stage's assignment group. Internal callers only, enforced by
+// entity-service. Response is returned as raw JSON.
+func (c *CustomerEntityClient) GetGroup(ctx context.Context, id string) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, fmt.Sprintf("/groups/%s", url.PathEscape(id)), nil)
 }
 
 // GetScheduleCatalogue calls GET /team-schedule/catalogue on the entity service.

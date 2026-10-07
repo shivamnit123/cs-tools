@@ -186,7 +186,7 @@ func TestSearchAssignmentsRejectsBadWindows(t *testing.T) {
 		{"to not a date", domain.SearchScheduleAssignmentsRequest{From: "2026-09-21", To: "soon"}},
 		{"to before from", domain.SearchScheduleAssignmentsRequest{From: "2026-09-21", To: "2026-09-20"}},
 		{"window too wide", domain.SearchScheduleAssignmentsRequest{From: "2026-01-01", To: "2026-12-31"}},
-		{"family is neither CRE nor SRE", domain.SearchScheduleAssignmentsRequest{From: "2026-09-21", To: "2026-09-21", Family: "OPS"}},
+		{"family is not a rota family", domain.SearchScheduleAssignmentsRequest{From: "2026-09-21", To: "2026-09-21", Family: "OPS"}},
 	}
 
 	for _, tc := range cases {
@@ -203,6 +203,27 @@ func TestSearchAssignmentsRejectsBadWindows(t *testing.T) {
 			// read would happily return every row in the table.
 			if repo.called {
 				t.Fatal("repository was called for a request that failed validation")
+			}
+		})
+	}
+}
+
+// Every rota family reaches the repository: CRE and SRE as before, and SME,
+// the product special rotations added in migration 0199. An unknown family is
+// still refused (TestSearchAssignmentsRejectsBadWindows).
+func TestSearchAssignmentsAcceptsEveryRotaFamily(t *testing.T) {
+	t.Parallel()
+
+	for _, family := range []string{"", "CRE", "SRE", "SME"} {
+		t.Run("family "+family, func(t *testing.T) {
+			t.Parallel()
+			repo := &fakeScheduleRepo{}
+			req := domain.SearchScheduleAssignmentsRequest{From: "2026-10-05", To: "2026-10-05", Family: family}
+			if _, err := NewScheduleService(repo, alwaysUnrestrictedAccess{}).SearchAssignments(context.Background(), req); err != nil {
+				t.Fatalf("family %q: unexpected error: %v", family, err)
+			}
+			if !repo.called {
+				t.Fatalf("family %q: the repository was not asked", family)
 			}
 		})
 	}

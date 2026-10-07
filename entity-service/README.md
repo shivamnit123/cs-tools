@@ -117,6 +117,10 @@ HTTP Request
 | DB_SSLMODE  | No       | require   | SSL mode          |
 | SERVER_PORT | No       | 8080      | Main API listener port |
 | HEALTH_PORT | No       | 8081      | Health probe listener port; must differ from `SERVER_PORT`, and must be left at its default in Choreo deployments (see below) |
+| SERVER_READ_TIMEOUT | No | 60s | Main API server read timeout (Go duration, e.g. `60s`); must be > 0 |
+| SERVER_WRITE_TIMEOUT | No | 60s | Main API server write timeout; must be > 0 |
+| REQUEST_TIMEOUT | No | 60s | Per-request context timeout; must be > 0 |
+| UPSTREAM_CLIENT_TIMEOUT | No | 60s | Data-source HTTP client timeout; must be > 0 |
 
 > `.env` file is loaded automatically if present. Absent `.env` is silently ignored; a malformed one causes a fatal startup error.
 
@@ -196,6 +200,27 @@ rather than async.
 | `CSM_PORTAL_BACKEND_CLIENT_ID` / `CSM_PORTAL_USER_DOMAIN` | The CSM portal backend's client id, unrestricted only if the forwarded `x-user-id-token`'s email also ends in this domain (e.g. `wso2.com`); otherwise refused (403). Must be set together or not at all (optional) |
 | `CUSTOMER_PORTAL_BACKEND_CLIENT_ID` | The customer portal backend's client id. Checked first and always resolved purely from the forwarded `x-user-id-token` -- never unconditionally trusted, structurally preventing this id from ever gaining unrestricted access even if misconfigured elsewhere (optional) |
 | `CUSTOMER_ROLES` | Comma-separated ServiceNow role names whose presence on a case comment's author marks it a customer reply — see "Customer reply state transition" below. No default; unset means that path never fires (optional) |
+
+### User cache (Redis)
+
+`GET /users/{id}` and `GET /users/me` can be served from Redis (`internal/cache`), cache-aside:
+a miss reads Postgres and stores the result for `USER_CACHE_TTL`. Every writer of user, contact
+and membership data (`POST /users`, `PATCH /users/me`, the Salesforce Contact and membership
+ingest, and the portal `/projects/{id}/contacts` writes) deletes the affected user's entries after
+its transaction commits, so the TTL is only a backstop. Errors and not-found results are never
+cached.
+
+The cache is optional and fails open: with no Redis configured, or Redis unreachable, every read
+goes to Postgres as before (a Redis outage is logged, never returned to the caller). It is wired
+only when there is a database.
+
+| Variable | Description |
+|---|---|
+| `REDIS_URL` | `rediss://:<access-key>@<host>:<port>` for a managed, TLS-only Redis (Azure Managed Redis); takes priority over `REDIS_ADDR`. Holds the access key — a secret in Choreo. Must be non-clustered or the "Enterprise" clustering policy, not "OSS Cluster" (optional) |
+| `REDIS_ADDR` / `REDIS_PASSWORD` | Plain, non-TLS `host:port` and password for a local Redis (optional) |
+| `USER_CACHE_TTL` | How long a cached user lives without an invalidation, as a Go duration (default `10m`) |
+
+Keys are namespaced `entity:v1:user:*`; emails appear in keys only as a SHA-256 hash.
 
 ### SLA status
 

@@ -17,7 +17,8 @@
  */
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type JSX } from "react";
-import type { ScheduleAbsence, ScheduleAbsenceKind, ScheduleAssignment, ScheduleShift, ScheduleZone } from "../types";
+import RotaPicker, { type RotaOption } from "./RotaPicker";
+import type { ScheduleAbsence, ScheduleAbsenceKind, ScheduleAssignment, ScheduleShift, ScheduleZone, RotaFamily } from "../types";
 import {
   dayLabel,
   groupBy,
@@ -28,7 +29,7 @@ import {
   toIsoDate,
 } from "../utils/rota";
 import { accentOf } from "../utils/rotaHues";
-import { useTeamColour } from "../utils/teamColourContext";
+import { useTeamColour, useTeamName } from "../utils/teamColourContext";
 
 /** Pixels per hour, as the prototype draws it. */
 const HOUR_PX = 38;
@@ -100,14 +101,19 @@ interface DayLadderProps {
   absenceKinds: ScheduleAbsenceKind[];
   /** The page's own group and team state. Rendered here as well as in the
    *  toolbar -- one control in two places, as the prototype has it. */
-  family: "CRE" | "SRE";
-  onFamilyChange: (family: "CRE" | "SRE") => void;
+  family: RotaFamily;
+  onFamilyChange: (family: RotaFamily) => void;
   teamKey: string;
   onTeamKeyChange: (teamKey: string) => void;
   teams: string[];
   /** CRE and SRE in the order they should read -- the reader's own group
    *  first, because the first of a pair reads as the default. */
-  families: readonly ("CRE" | "SRE")[];
+  families: readonly RotaFamily[];
+  /** The rotas of the family on screen, the one shown, and the change; the
+   *  picker appears only when there is more than one. */
+  rotas?: readonly RotaOption[];
+  rotaCode?: string;
+  onRotaChange?: (code: string) => void;
 }
 
 interface BlockRow {
@@ -203,6 +209,9 @@ export default function DayLadder({
   onTeamKeyChange,
   teams,
   families,
+  rotas,
+  rotaCode,
+  onRotaChange,
 }: DayLadderProps): JSX.Element {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const touched = useRef(false);
@@ -448,7 +457,7 @@ export default function DayLadder({
         {/* One group means nothing to switch to: only Today, or a manager,
             can look at the other group. */}
         {families.length > 1 ? (
-          <div className="seg teamseg" role="tablist" aria-label="Show CRE or SRE">
+          <div className="seg teamseg" role="tablist" aria-label={`Show ${families.join(" or ")}`}>
             {families.map((f) => (
               <button
                 key={f}
@@ -462,6 +471,8 @@ export default function DayLadder({
             ))}
           </div>
         ) : null}
+
+        <RotaPicker rotas={rotas} rotaCode={rotaCode} onRotaChange={onRotaChange} />
 
         <h2>
           On the rota <span className="count">{headcount}</span>
@@ -720,6 +731,7 @@ function LadderBlock({ block, tz }: { block: Block; tz: string }): JSX.Element {
  */
 function TeamSplit({ rows }: { rows: ScheduleAssignment[] }): JSX.Element {
   const teamColourOf = useTeamColour();
+  const teamNameOf = useTeamName();
   const byTeam = useMemo(() => [...groupBy(rows, (r) => r.teamKey).entries()], [rows]);
   const [active, setActive] = useState<string>(() => byTeam[0]?.[0] ?? "");
   const current = byTeam.find(([team]) => team === active) ?? byTeam[0];
@@ -737,7 +749,9 @@ function TeamSplit({ rows }: { rows: ScheduleAssignment[] }): JSX.Element {
             onClick={() => setActive(team)}
           >
             <i style={{ background: teamColourOf(team) }} />
-            <span className="tn">{team}</span>
+            <span className="tn" title={teamNameOf(team)}>
+              {teamNameOf(team)}
+            </span>
             <b>{teamRows.length}</b>
           </span>
         ))}
@@ -773,6 +787,7 @@ function NameRow({
   hideTag?: boolean;
 }): JSX.Element {
   const teamColourOf = useTeamColour();
+  const teamNameOf = useTeamName();
   /* Only what the row does not already say. A tier ("L2") and on-call status
      are not readable anywhere else on the card; the team is -- it is the
      avatar's colour, and the row's own tooltip. Spelling it out a third time
@@ -780,7 +795,7 @@ function NameRow({
      thing that got cut. */
   const tag = assignment.tier ?? (assignment.isOnCall ? "OC" : null);
   return (
-    <span className="lnm" title={`${assignment.engineer.name} · ${assignment.teamKey}`}>
+    <span className="lnm" title={`${assignment.engineer.name} · ${teamNameOf(assignment.teamKey)}`}>
       <span className="av" style={{ background: teamColourOf(assignment.teamKey) }}>
         {initialsOf(assignment.engineer.name)}
       </span>
@@ -802,6 +817,7 @@ function OffRotaStack({
   kinds: ScheduleAbsenceKind[];
 }): JSX.Element {
   const teamColourOf = useTeamColour();
+  const teamNameOf = useTeamName();
   const byKind = groupBy(absences, (a) => a.kindCode);
 
   // Leave first, then allocations.
@@ -836,7 +852,7 @@ function OffRotaStack({
               [...byTeam.entries()].map(([team, teamRows]) => (
                 <div key={team}>
                   <div className="offgh">
-                    {team}
+                    {teamNameOf(team)}
                     <b>{teamRows.length}</b>
                   </div>
                   <div className="offp">
@@ -857,7 +873,7 @@ function OffRotaStack({
                   <span
                     className="lnm"
                     key={r.id}
-                    title={[r.engineer.name, r.teamKey, r.allocatedTo].filter(Boolean).join(" · ")}
+                    title={[r.engineer.name, teamNameOf(r.teamKey), r.allocatedTo].filter(Boolean).join(" · ")}
                   >
                     <span className="av" style={{ background: teamColourOf(r.teamKey) }}>
                       {initialsOf(r.engineer.name)}
@@ -865,7 +881,7 @@ function OffRotaStack({
                     <span className="who">{r.engineer.name}</span>
                     {/* Who the time is for, where it is known -- the answer to
                         "can I reach them" more often than their team is. */}
-                    <i className="tier-t">{r.allocatedTo ?? r.teamKey}</i>
+                    <i className="tier-t">{r.allocatedTo ?? teamNameOf(r.teamKey)}</i>
                   </span>
                 ))}
               </div>

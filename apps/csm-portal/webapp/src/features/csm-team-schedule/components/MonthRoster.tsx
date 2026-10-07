@@ -16,7 +16,8 @@
  * under the License.
  */
 
-import { useEffect, useMemo, useRef, useState, type JSX } from "react";
+import { useEffect, useMemo, useRef, useState, type JSX, type ReactNode } from "react";
+import RotaPicker, { type RotaOption } from "./RotaPicker";
 import type {
   CellAbsence,
   ScheduleAbsence,
@@ -24,9 +25,10 @@ import type {
   ScheduleAssignment,
   ScheduleShift,
   ScheduleTier,
+  RotaFamily,
 } from "../types";
-import { addDays, initialsOf, isRotationShift, mondayOf, toIsoDate, zoneLabelOn, type RosterSpan } from "../utils/rota";
-import { useTeamColour } from "../utils/teamColourContext";
+import { addDays, initialsOf, isRotationShift, mondayOf, toIsoDate, zoneColumnOf, zoneLabelOn, type RosterSpan } from "../utils/rota";
+import { useTeamColour, useTeamName } from "../utils/teamColourContext";
 
 export type { RosterSpan };
 const SPANS: readonly RosterSpan[] = [1, 3, 6];
@@ -70,14 +72,26 @@ interface MonthRosterProps {
    *  where the answer is read. They are the page's own state passed down, not
    *  a second copy -- one control rendered in two places, which is why the
    *  toolbar above stays in step with them. */
-  family: "CRE" | "SRE";
-  onFamilyChange: (family: "CRE" | "SRE") => void;
+  family: RotaFamily;
+  onFamilyChange: (family: RotaFamily) => void;
   teamKey: string;
   onTeamKeyChange: (teamKey: string) => void;
   teams: string[];
   /** CRE and SRE in the order they should read -- the reader's own group
    *  first, because the first of a pair reads as the default. */
-  families: readonly ("CRE" | "SRE")[];
+  families: readonly RotaFamily[];
+  /** The real zone behind a roster column for one team -- the Day column is
+   *  ASG_D for Asgardeo and MOE_D for Moesif. Absent: the column is the zone. */
+  zoneCodeFor?: (teamKey: string, column: string) => string | undefined;
+  /** Controls that belong to the roster alone (Recent changes), at the end of
+   *  its own head -- where the page toolbar would otherwise wrap onto a second
+   *  line beside the tabs on this one view. */
+  actions?: ReactNode;
+  /** The rotas of the family on screen, the one shown, and the change; the
+   *  picker appears only when there is more than one. */
+  rotas?: readonly RotaOption[];
+  rotaCode?: string;
+  onRotaChange?: (code: string) => void;
   /** The signed-in reader, so their own row can be marked and brought into
    *  view. A month of a hundred-odd engineers is a haystack otherwise. */
   meEmail?: string;
@@ -185,6 +199,11 @@ export default function MonthRoster({
   onTeamKeyChange,
   teams,
   families,
+  rotas,
+  rotaCode,
+  onRotaChange,
+  zoneCodeFor,
+  actions,
   meEmail,
   leadTeams,
   editedCells,
@@ -193,6 +212,7 @@ export default function MonthRoster({
   onEditCell,
 }: MonthRosterProps): JSX.Element {
   const teamColourOf = useTeamColour();
+  const teamNameOf = useTeamName();
   const [query, setQuery] = useState("");
   /** Fade everything that is not a turn on the rota.
    *
@@ -238,20 +258,23 @@ export default function MonthRoster({
     const pick = (scope: "WEEKDAY" | "WEEKEND"): string[] => {
       const codes = new Set<string>();
       for (const sh of shifts.values()) {
-        if (sh.family !== "SRE" || !sh.zoneCode) continue;
-        if (sh.dayScope === scope || sh.dayScope === "ANY") codes.add(sh.zoneCode);
+        if (sh.family !== family || !sh.zoneCode) continue;
+        if (sh.dayScope === scope || sh.dayScope === "ANY") codes.add(zoneColumnOf(sh.zoneCode));
       }
-      return [...codes].sort();
+      // SRE's time zones in order, then a rotation's Day and Night
+      const rank = (c: string) => (c === "Day" ? 1 : c === "Night" ? 2 : 0);
+      return [...codes].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
     };
     return { weekday: pick("WEEKDAY"), weekend: pick("WEEKEND") };
-  }, [shifts]);
+  }, [shifts, family]);
 
-  /** Only SRE splits a day by zone -- CRE has no zones at all, and a day with
+  /** Only a zoned rota splits a day by zone (SRE's time zones, an SME
+   *  rotation's Day and Night) -- CRE has no zones at all, and a day with
    *  no staffed zone at all is not split either: colSpan={0} means "span every
    *  remaining column" in HTML, not "span nothing", so an empty list would
    *  silently swallow the rest of the month. */
   const split =
-    family === "SRE" && zoneColumns.weekday.length > 0 && zoneColumns.weekend.length > 0;
+    family !== "CRE" && zoneColumns.weekday.length > 0 && zoneColumns.weekend.length > 0;
   const zonesOn = (weekend: boolean): string[] =>
     weekend ? zoneColumns.weekend : zoneColumns.weekday;
 
@@ -314,7 +337,8 @@ export default function MonthRoster({
 
       // A zoned window lands in its own sub-column; anything else is a fact
       // about the whole day and spans them.
-      const zone = a.zoneCode ?? shift?.zoneCode;
+      const zoneCode = a.zoneCode ?? shift?.zoneCode;
+      const zone = zoneCode ? zoneColumnOf(zoneCode) : undefined;
       if (zone) {
         const key = `${a.rotaDate}|${zone}`;
         const held = row.zoned.get(key);
@@ -543,7 +567,7 @@ export default function MonthRoster({
         {/* One group means nothing to switch to: only Today, or a manager,
             can look at the other group. */}
         {families.length > 1 ? (
-          <div className="seg teamseg" role="tablist" aria-label="Show CRE or SRE">
+          <div className="seg teamseg" role="tablist" aria-label={`Show ${families.join(" or ")}`}>
             {families.map((f) => (
               <button
                 key={f}
@@ -557,6 +581,8 @@ export default function MonthRoster({
             ))}
           </div>
         ) : null}
+
+        <RotaPicker rotas={rotas} rotaCode={rotaCode} onRotaChange={onRotaChange} />
 
         <h2>
           Roster <span className="count">{rows.length}</span>
@@ -632,6 +658,7 @@ export default function MonthRoster({
             />
             Rotations only
           </label>
+          {actions}
         </div>
       </div>
 
@@ -687,7 +714,7 @@ export default function MonthRoster({
                         i === 0 && opensMonth(d) ? " mstart" : ""
                       }${toIsoDate(d) === todayIso ? " today" : ""}${toIsoDate(d) === selectedIso ? " sel" : ""}`}
                       scope="col"
-                      title={zoneLabelOn(shifts, z, weekend) === z ? undefined : `${zoneLabelOn(shifts, z, weekend)}: TZ1 and TZ2 are one crew at the weekend`}
+                      title={zoneLabelOn(shifts, z, weekend) === zoneLabelOn(shifts, z, false) ? undefined : `${zoneLabelOn(shifts, z, weekend)}: TZ1 and TZ2 are one crew at the weekend`}
                     >
                       {/* "TZ1+2" at the weekend, when TZ1 and TZ2 are one crew. */}
                       {zoneLabelOn(shifts, z, weekend)}
@@ -724,7 +751,7 @@ export default function MonthRoster({
                     </span>
                     <span className="who">{row.name}</span>
                     {isMe ? <i className="youtag">You</i> : null}
-                    <span className="team">{row.teamKey}</span>
+                    <span className="team">{teamNameOf(row.teamKey)}</span>
                   </span>
                 </th>
                 {days.map((d) => {
@@ -845,7 +872,7 @@ export default function MonthRoster({
                               ? `${row.name} · ${z} · ${zc.title}`
                               : undefined
                         }
-                        onClick={editable ? (e) => openCell(e, row, iso, withAlloc(row.zoned.get(`${iso}|${z}`)), z) : undefined}
+                        onClick={editable ? (e) => openCell(e, row, iso, withAlloc(row.zoned.get(`${iso}|${z}`)), zoneCodeFor?.(row.teamKey, z) ?? z) : undefined}
                       >
                         {turn && under ? (
                           // The zone's turn and what it sits on, stacked: L1

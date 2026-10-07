@@ -190,11 +190,12 @@ func TestPatchCaseAttachment_ClosedCase(t *testing.T) {
 // referenceId names — and records whether the delete was reached.
 type fakeClosedCaseAttachmentClient struct {
 	entityAttachmentClient
-	referenceID      string
-	getAttachmentErr error
-	caseState        string
-	getCaseErr       error
-	deleted          bool
+	referenceID       string
+	getAttachmentErr  error
+	caseState         string
+	getCaseErr        error
+	deploymentVisible bool
+	deleted           bool
 }
 
 func (f *fakeClosedCaseAttachmentClient) GetAttachment(ctx context.Context, id string) (entity.AttachmentDetails, error) {
@@ -209,6 +210,13 @@ func (f *fakeClosedCaseAttachmentClient) GetCase(ctx context.Context, id string)
 		return entity.CaseView{}, f.getCaseErr
 	}
 	return entity.CaseView{ID: id, State: f.caseState}, nil
+}
+
+func (f *fakeClosedCaseAttachmentClient) SearchDeployments(ctx context.Context, req entity.SearchDeploymentsRequest) (entity.SearchDeploymentsResponse, error) {
+	if !f.deploymentVisible {
+		return entity.SearchDeploymentsResponse{}, nil
+	}
+	return entity.SearchDeploymentsResponse{Deployments: []entity.DeploymentView{{ID: req.IDs[0]}}, Total: 1}, nil
 }
 
 func (f *fakeClosedCaseAttachmentClient) DeleteAttachment(ctx context.Context, id string) (entity.DeleteAttachmentResponse, error) {
@@ -251,6 +259,22 @@ func TestDeleteAttachment_ClosedCase(t *testing.T) {
 		},
 		"attachment has no reference, denied": {
 			client:     fakeClosedCaseAttachmentClient{referenceID: "", caseState: "closed"},
+			wantStatus: http.StatusNotFound,
+			wantDenied: true,
+		},
+		// The reported bug: a deployment-tab ("Deployed" tab) attachment's own
+		// uploader could never delete it, because authorizeAttachmentAccess
+		// always ran GetCase against the attachment's referenceId — which is a
+		// deployment id here, so GetCase could never resolve it and the delete
+		// 404'd unconditionally regardless of who uploaded it. getCaseErr is
+		// a 404 here because a deployment id is never a real case -- that's
+		// the actual, live response GetCase returns for one.
+		"deployment-referenced attachment visible to the caller: delete succeeds": {
+			client:     fakeClosedCaseAttachmentClient{referenceID: testDeploymentID, getCaseErr: &apierror.Error{StatusCode: http.StatusNotFound}, deploymentVisible: true},
+			wantStatus: http.StatusOK,
+		},
+		"deployment-referenced attachment outside the caller's scope: denied": {
+			client:     fakeClosedCaseAttachmentClient{referenceID: testDeploymentID, getCaseErr: &apierror.Error{StatusCode: http.StatusNotFound}, deploymentVisible: false},
 			wantStatus: http.StatusNotFound,
 			wantDenied: true,
 		},

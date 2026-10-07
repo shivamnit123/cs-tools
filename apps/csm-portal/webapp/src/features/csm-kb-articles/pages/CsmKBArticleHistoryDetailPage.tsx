@@ -22,6 +22,7 @@ import { useNavTransition } from "@hooks/useNavTransition";
 import { useGetKBArticle } from "@features/csm-kb-articles/api/useGetKBArticle";
 import { useKBArticleTimelineEvents } from "@features/csm-kb-articles/api/useKBArticleTimelineEvents";
 import { stripHtml, wordDiff } from "@features/csm-kb-articles/utils/simpleWordDiff";
+import { sanitizeRichTextHtml } from "@utils/sanitizeHtml";
 
 function formatDateTime(value: string): string {
   const d = new Date(value);
@@ -97,7 +98,7 @@ function SideBySideView({ oldBody, newBody }: { oldBody: string; newBody: string
           sx={{ border: 1, borderColor: "divider", borderRadius: 1, p: 2, lineHeight: 1.7 }}
           // eslint-disable-next-line react/no-danger -- author-authored rich
           // text HTML from our own Lexical editor.
-          dangerouslySetInnerHTML={{ __html: oldBody }}
+          dangerouslySetInnerHTML={{ __html: sanitizeRichTextHtml(oldBody) }}
         />
       </Box>
       <Box>
@@ -107,7 +108,7 @@ function SideBySideView({ oldBody, newBody }: { oldBody: string; newBody: string
         <Box
           sx={{ border: 1, borderColor: "divider", borderRadius: 1, p: 2, lineHeight: 1.7 }}
           // eslint-disable-next-line react/no-danger -- see above.
-          dangerouslySetInnerHTML={{ __html: newBody }}
+          dangerouslySetInnerHTML={{ __html: sanitizeRichTextHtml(newBody) }}
         />
       </Box>
     </Box>

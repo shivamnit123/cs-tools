@@ -165,31 +165,3 @@ describe("CreateOutagePage — email opt-ins", () => {
     });
   });
 });
-
-describe("CreateOutagePage — affected configuration items", () => {
-  beforeEach(() => postOutageMutateMock.mockReset());
-
-  it("sends the affected offerings, and needs the publication consent for them", () => {
-    render(<CreateOutagePage />);
-    fillRequired();
-    fireEvent.change(screen.getByLabelText("Affected configuration items"), { target: { value: "ci-a,ci-b" } });
-
-    // An affected offering can put the outage on the status page: no consent, no submit.
-    expect(screen.getByRole("button", { name: "Begin outage" })).toBeDisabled();
-    fireEvent.click(screen.getByLabelText("acknowledge publication"));
-    fireEvent.click(screen.getByRole("button", { name: "Begin outage" }));
-
-    expect(postOutageMutateMock.mock.calls[0][0]).toMatchObject({
-      affectedConfigurationItemIds: ["ci-a", "ci-b"],
-      acknowledgePublicPublication: true,
-    });
-  });
-
-  it("sends no affected list when none is chosen", () => {
-    render(<CreateOutagePage />);
-    fillRequired();
-    fireEvent.click(screen.getByRole("button", { name: "Begin outage" }));
-    expect(postOutageMutateMock.mock.calls[0][0]).not.toHaveProperty("affectedConfigurationItemIds");
-  });
-});
-

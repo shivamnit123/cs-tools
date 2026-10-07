@@ -120,12 +120,17 @@ func (s *kbArticleService) UpdateKBArticleState(ctx context.Context, id string, 
 	if err != nil {
 		return domain.UpdateKBArticleStateResponse{}, err
 	}
+	// Only allow rejectionComment on pending_review → draft (a rejection).
+	if req.RejectionComment != nil && !(current.State == domain.KBArticleStatePendingReview && req.State == domain.KBArticleStateDraft) {
+		req.RejectionComment = nil
+	}
 	if current.State != req.State && !isLegalKBArticleTransition(current.State, req.State) {
 		return domain.UpdateKBArticleStateResponse{}, &apierror.ValidationError{
 			Msg: fmt.Sprintf("invalid state transition: %s -> %s", current.State, req.State),
 		}
 	}
 
+	req.CurrentState = current.State
 	article, err := s.repo.UpdateKBArticleState(ctx, id, req)
 	if err != nil {
 		return domain.UpdateKBArticleStateResponse{}, err
@@ -159,6 +164,7 @@ func isLegalKBArticleTransition(from, to domain.KBArticleState) bool {
 		return false
 	}
 }
+
 // UpdateKBArticleContent implements KBArticleService.
 func (s *kbArticleService) UpdateKBArticleContent(ctx context.Context, id string, req domain.UpdateKBArticleContentRequest) (domain.KBArticle, error) {
 	if id == "" {

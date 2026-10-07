@@ -46,9 +46,11 @@ import NextRotation from "../components/NextRotation";
 import RecentChanges from "../components/RecentChanges";
 import WeekTable from "../components/WeekTable";
 import type {
+  RotaFamily,
   ScheduleAbsencesResponse,
   ScheduleAssignment,
   ScheduleAssignmentsResponse,
+  ScheduleShift,
   ScheduleTier,
 } from "../types";
 import { resolveDisplayTimeZone } from "@utils/dateTime";
@@ -66,13 +68,17 @@ import {
   toIsoDate,
   zoneAbbreviation,
   zoneLabelOn,
+  zoneColumnOf,
 } from "../utils/rota";
 import { zoneColour } from "../utils/rotaHues";
 import { SCHEDULE_THEME_VARS } from "../utils/useScheduleTheme";
 import "../teamSchedule.css";
 
 type ViewTab = "mine" | "today" | "week" | "roster";
-type Family = "CRE" | "SRE";
+type Family = RotaFamily;
+
+/** Every family in the order the switch lists them, the reader's own first. */
+const ALL_FAMILIES: readonly Family[] = ["CRE", "SRE", "SME"];
 
 // The team list used to live here, mirroring CSM_TEAM_REGISTRY. Team names
 // are organisation vocabulary and committing them coupled this page to a
@@ -154,6 +160,10 @@ export default function CsmTeamSchedulePage(): JSX.Element {
    *  would show them three disabled tabs on arrival. */
   const [familyChoice, setFamilyChoice] = useState<Family | null>(null);
   const [teamKey, setTeamKey] = useState<string>("");
+  /** The rota picked within a family that runs more than one (SRE's SaaS and
+   *  IaaS, SME's products). "" until the reader picks one, so their own rota
+   *  -- or the family's first -- is the default. */
+  const [rotaChoice, setRotaChoice] = useState<string>("");
   /** How many months the roster shows, centred on the selected day; see
    *  rosterRange. One by default: the fortnight either side of today is what
    *  a lead opens the roster to check. */
@@ -178,9 +188,26 @@ export default function CsmTeamSchedulePage(): JSX.Element {
    *  wrong list. */
   const teamsOf = useMemo(() => {
     const all = catalogue.data?.teams ?? [];
-    return (f: Family): string[] =>
-      all.filter((t) => t.family === f).map((t) => t.key);
+    return (f: Family, rota?: string): string[] =>
+      all.filter((t) => t.family === f && (!rota || t.rotaCode === rota)).map((t) => t.key);
   }, [catalogue.data?.teams]);
+
+  /** The rotas of a family that have a team on them, in the catalogue's order.
+   *  A rota with no team yet (IaaS before its teams sync) is left out: it would
+   *  only draw an empty day. */
+  const rotasOf = useMemo(() => {
+    const rotas = catalogue.data?.rotas ?? [];
+    const teams = catalogue.data?.teams ?? [];
+    return (f: Family) =>
+      rotas.filter((r) => r.family === f && teams.some((t) => t.rotaCode === r.code));
+  }, [catalogue.data?.rotas, catalogue.data?.teams]);
+
+  /** Which rota each zone belongs to, for keeping another rota's windows out
+   *  of the one on screen. */
+  const rotaOfZone = useMemo(
+    () => new Map((catalogue.data?.zones ?? []).map((z) => [z.code, z.rotaCode])),
+    [catalogue.data?.zones],
+  );
 
   // Which teams this reader may edit. Asked once: it changes when somebody is
   // made a lead, not while they are looking at a rota.
@@ -286,14 +313,41 @@ export default function CsmTeamSchedulePage(): JSX.Element {
    *  default, and theirs is. One group means no switch at all. */
   const families: Family[] = !crossesGroups
     ? [family]
-    : myFamily === "SRE"
-      ? ["SRE", "CRE"]
-      : ["CRE", "SRE"];
+    : (() => {
+        // Only the families the catalogue has a team in: SME appears once its
+        // teams exist, and until then the switch reads CRE | SRE as before.
+        const present = ALL_FAMILIES.filter((f) => (catalogue.data?.teams ?? []).some((t) => t.family === f));
+        const list = present.length > 0 ? present : (["CRE", "SRE"] as Family[]);
+        return myFamily && list.includes(myFamily) ? [myFamily, ...list.filter((f) => f !== myFamily)] : list;
+      })();
+
+  /** The reader's own rota, from their team -- what an engineer's own views
+   *  stay on, and where a rota'd family opens. */
+  const myRota = (catalogue.data?.teams ?? []).find((t) => t.key === user?.team?.teamKey)?.rotaCode;
 
   /** The team filter, where it belongs to the group on screen. A team picked
    *  on Today's SRE side means nothing on the reader's CRE roster, and would
-   *  otherwise filter it to nobody. */
+   *  otherwise filter it to nobody. Any team of the family may be picked --
+   *  SME's product teams are peers, the way CRE's ABTs are -- so this is read
+   *  before the rota, which follows from it. */
   const shownTeamKey = teamKey && teamsOf(family).includes(teamKey) ? teamKey : "";
+
+  /** The rotas the family on screen runs, and the one shown: the rota of the
+   *  team picked, else the reader's pick on a view that may cross rotas, else
+   *  their own, else the first. */
+  const familyRotas = rotasOf(family);
+  const rota: string | undefined = (() => {
+    if (familyRotas.length === 0) return undefined;
+    const has = (code?: string) => Boolean(code) && familyRotas.some((r) => r.code === code);
+    const teamRota = (catalogue.data?.teams ?? []).find((t) => t.key === shownTeamKey)?.rotaCode;
+    if (has(teamRota)) return teamRota;
+    if (crossesGroups && has(rotaChoice)) return rotaChoice;
+    if (has(myRota)) return myRota;
+    return familyRotas[0].code;
+  })();
+  /** Only a family that runs more than one rota is narrowed by it. SRE with
+   *  SaaS alone reads exactly as before. */
+  const rotaScoped = familyRotas.length > 1;
 
   const weekStart = useMemo(() => mondayOf(anchor), [anchor]);
   /** The group/team controls the cards render in their own heads. It is the
@@ -303,12 +357,24 @@ export default function CsmTeamSchedulePage(): JSX.Element {
     family,
     onFamilyChange: (f: Family) => {
       setFamilyChoice(f);
+      setRotaChoice("");
       setTeamKey("");
     },
     teamKey: shownTeamKey,
     onTeamKeyChange: setTeamKey,
+    // Every team of the family, on every view: picking one in another rota
+    // moves the card onto that rota (see `rota` above), so SME's product
+    // teams can read each other's Day and Night cover, as CRE's ABTs can.
     teams: teamsOf(family),
     families,
+    // The rota picker: offered only where the reader may cross rotas, the
+    // same rule as the family switch.
+    rotas: crossesGroups ? familyRotas.map((r) => ({ code: r.code, label: r.label })) : [],
+    rotaCode: rota,
+    onRotaChange: (code: string) => {
+      setRotaChoice(code);
+      setTeamKey("");
+    },
   };
 
   const dayView = view === "today";
@@ -323,7 +389,17 @@ export default function CsmTeamSchedulePage(): JSX.Element {
   }, [anchorIso, rosterSpan]);
   const from = dayView ? toIsoDate(anchor) : toIsoDate(weekStart);
   const to = dayView ? toIsoDate(anchor) : toIsoDate(addDays(weekStart, 6));
-  const teamKeys = shownTeamKey ? [shownTeamKey] : undefined;
+  // A family running more than one rota reads only the rota on screen's
+  // teams; otherwise the family alone, as before.
+  /** The rota the data on screen is narrowed to. Today draws a lane per zone,
+   *  so it shows one rota at a time. My week is the reader's own rota. The
+   *  week and the roster show "All teams" as it reads -- every rota of the
+   *  family, each in its own rows -- unless a team is picked. */
+  const scopeRota: string | undefined =
+    view === "mine" ? myRota : view === "today" || shownTeamKey ? rota : undefined;
+  // A family running more than one rota reads only the scoped rota's teams;
+  // otherwise the family alone, as before.
+  const teamKeys = shownTeamKey ? [shownTeamKey] : rotaScoped && scopeRota ? teamsOf(family, scopeRota) : undefined;
 
   const singleRead = useScheduleAssignments(
     {
@@ -374,7 +450,7 @@ export default function CsmTeamSchedulePage(): JSX.Element {
   // carried CRE's migration allocations -- people SRE has no relationship to.
   // The search filters by team, so an unfiltered view passes the family's own
   // teams rather than nothing.
-  const absenceTeamKeys = teamKeys ?? teamsOf(family);
+  const absenceTeamKeys = teamKeys ?? teamsOf(family, rotaScoped ? scopeRota : undefined);
   // The week view reads leave too, for its leave row; `from`/`to` are already
   // the week there.
   const dayAbsences = useScheduleAbsences({ from, to, teamKeys: absenceTeamKeys }, dayView || view === "week");
@@ -385,7 +461,24 @@ export default function CsmTeamSchedulePage(): JSX.Element {
   );
   const absences: RotaRead<ScheduleAbsencesResponse> = rosterView ? rosterAbsences : dayAbsences;
 
-  const shifts = useMemo(() => shiftsByCode(catalogue.data?.shifts ?? []), [catalogue.data?.shifts]);
+  const allShifts = useMemo(() => shiftsByCode(catalogue.data?.shifts ?? []), [catalogue.data?.shifts]);
+
+  /** The windows of the rota on screen. Every view reads its zones and its
+   *  escalation rows off the windows it is given, so another rota's zoned
+   *  windows have to be left out here -- or IaaS, which is SRE too, would add
+   *  its Day and Night to SaaS's ladder, week and roster. A window with no
+   *  zone, or a zone no rota claims, belongs to every rota as before. My week
+   *  stays on the reader's own rota whatever Today is showing. */
+  const shifts = useMemo(() => {
+    const keep = scopeRota;
+    if (!keep) return allShifts;
+    const out = new Map<string, ScheduleShift>();
+    for (const [code, sh] of allShifts) {
+      const zoneRota = sh.zoneCode ? rotaOfZone.get(sh.zoneCode) : undefined;
+      if (!zoneRota || zoneRota === keep) out.set(code, sh);
+    }
+    return out;
+  }, [allShifts, rotaOfZone, scopeRota]);
 
   // The history of the lead's own teams over the months on screen. Read only
   // while the panel is open -- it is a question a lead asks now and then, not
@@ -495,10 +588,23 @@ export default function CsmTeamSchedulePage(): JSX.Element {
    *  in the picker rather than used to hide the others -- rostering L3 for
    *  TZ2 from a TZ1 cell is an ordinary thing to want, and having to find the
    *  TZ2 column first made it a hunt. */
-  const pickerShifts = useMemo(
-    () => [...shifts.values()].filter((sh) => sh.family === family),
-    [shifts, family],
-  );
+  const pickerShifts = useMemo(() => {
+    // The clicked engineer's own rota's windows: a Moesif engineer is never
+    // offered Asgardeo's Day, even on a roster showing every SME rota.
+    const own = (catalogue.data?.teams ?? []).find((t) => t.key === picker?.teamKey)?.rotaCode;
+    return [...allShifts.values()].filter((sh) => {
+      if (sh.family !== family) return false;
+      const zoneRota = sh.zoneCode ? rotaOfZone.get(sh.zoneCode) : undefined;
+      return !own || !zoneRota || zoneRota === own;
+    });
+  }, [allShifts, family, picker?.teamKey, catalogue.data?.teams, rotaOfZone]);
+
+  /** The real zone behind a roster column for one team's engineer: the Day
+   *  column is ASG_D for Asgardeo, MOE_D for Moesif. */
+  const zoneCodeFor = (teamKey: string, column: string): string | undefined => {
+    const own = (catalogue.data?.teams ?? []).find((t) => t.key === teamKey)?.rotaCode;
+    return zones.find((z) => (!own || z.rotaCode === own) && zoneColumnOf(z.code) === column)?.code;
+  };
 
   const applyToCell = (shiftCode: string, from: string, to: string, tier?: ScheduleTier): void => {
     if (!picker) return;
@@ -665,12 +771,15 @@ export default function CsmTeamSchedulePage(): JSX.Element {
     const scope = weekend ? "WEEKEND" : "WEEKDAY";
     const staffed = new Set<string>();
     for (const sh of shifts.values()) {
-      if (sh.family !== "SRE" || !sh.zoneCode) continue;
+      if (sh.family !== family || !sh.zoneCode) continue;
       if (sh.dayScope === scope || sh.dayScope === "ANY") staffed.add(sh.zoneCode);
     }
-    const kept = zones.filter((z) => staffed.has(z.code));
-    return kept.length > 0 ? kept : zones;
-  }, [anchor, shifts, zones]);
+    // The zones of the rota on screen (a zone no rota claims counts as every
+    // rota's), so the fallback below can never pull in another rota's lanes.
+    const own = zones.filter((z) => !rota || !z.rotaCode || z.rotaCode === rota);
+    const kept = own.filter((z) => staffed.has(z.code));
+    return kept.length > 0 ? kept : own;
+  }, [anchor, shifts, zones, family, rota]);
 
   const lanes: LadderLane[] = useMemo(() => {
     if (family === "CRE") {
@@ -684,7 +793,7 @@ export default function CsmTeamSchedulePage(): JSX.Element {
       const name = zoneLabelOn(shifts, z.code, weekendDay);
       return {
         name,
-        sub: name === z.code ? z.label : "Weekend crew",
+        sub: name === zoneLabelOn(shifts, z.code, false) ? z.label : "Weekend crew",
         colour: zoneColour(z.code),
         // The same resolution the month roster uses: an assignment's own zone,
         // else its window's, so a zoned window stored without one still lands.
@@ -850,16 +959,6 @@ export default function CsmTeamSchedulePage(): JSX.Element {
               </button>
             </div>
 
-            {canEditRota && view === "roster" ? (
-              <button
-                className={`btn sm${showRecent ? " primary" : ""}`}
-                aria-pressed={showRecent}
-                onClick={() => setShowRecent((v) => !v)}
-                title="What has changed on your teams' rota and leave"
-              >
-                Recent changes
-              </button>
-            ) : null}
             {canEditRota ? (
               <button
                 className={`btn sm${editing ? " primary" : ""}`}
@@ -980,6 +1079,22 @@ export default function CsmTeamSchedulePage(): JSX.Element {
             />
           ) : view === "roster" ? (
             <MonthRoster
+              zoneCodeFor={zoneCodeFor}
+              // In the roster's own head rather than the page toolbar: it is a
+              // roster-only control, and beside the four tabs it pushed the
+              // date controls onto a second line on this one view.
+              actions={
+                canEditRota ? (
+                  <button
+                    className={`btn sm${showRecent ? " primary" : ""}`}
+                    aria-pressed={showRecent}
+                    onClick={() => setShowRecent((v) => !v)}
+                    title="What has changed on your teams' rota and leave"
+                  >
+                    Recent changes
+                  </button>
+                ) : undefined
+              }
               selectedIso={toIsoDate(anchor)}
               focusRequest={focusRequest}
               meEmail={user?.email}

@@ -36,7 +36,6 @@ import { useGetOutageMetadata, usePostOutage } from "@features/csm-operations/ap
 import { useSearchConfigurationItems } from "@api/useSearchConfigurationItems";
 import { useSearchIncidentsForSelect } from "@features/csm-operations/api/useSearchIncidentsForSelect";
 import AsyncEntitySelect from "@components/AsyncEntitySelect";
-import AsyncEntityMultiSelect from "@components/AsyncEntityMultiSelect";
 import OutagePublicationNotice from "@features/csm-operations/components/OutagePublicationNotice";
 import OutageNotificationFields, {
   type OutageNotificationValues,
@@ -87,9 +86,6 @@ export default function CreateOutagePage(): JSX.Element {
     backState?.configurationItemId ?? "",
   );
   const [incidentId, setIncidentId] = useState(backState?.incidentId ?? "");
-  // ServiceNow's Affected CIs: other service offerings this outage hits. Each
-  // turns its own status-page monitor and counts against its availability.
-  const [affectedIds, setAffectedIds] = useState<string[]>([]);
   const [externalCommunication, setExternalCommunication] = useState("");
   const [internalCommunication, setInternalCommunication] = useState("");
   const [acknowledged, setAcknowledged] = useState(false);
@@ -135,10 +131,7 @@ export default function CreateOutagePage(): JSX.Element {
   const hasTypedBegin = begin.trim().length > 0;
   const isBeginValid = !beginIncomplete && (!hasTypedBegin || (!!beginDate && !!beginUtc));
   const isShortDescriptionValid = shortDescription.trim().length > 0;
-  // Any service offering -- the main one or an affected one -- can put the
-  // outage on the status page, so either needs the publication consent.
-  const hasAnyConfigurationItem = !!configurationItemId || affectedIds.length > 0;
-  const needsAcknowledgement = hasAnyConfigurationItem && !acknowledged;
+  const needsAcknowledgement = !!configurationItemId && !acknowledged;
   const canSubmit =
     isTypeValid &&
     isBeginValid &&
@@ -199,8 +192,7 @@ export default function CreateOutagePage(): JSX.Element {
     if (incidentId) payload.incidentId = incidentId;
     if (externalCommunication.trim()) payload.externalCommunication = externalCommunication.trim();
     if (internalCommunication.trim()) payload.internalCommunication = internalCommunication.trim();
-    if (affectedIds.length > 0) payload.affectedConfigurationItemIds = affectedIds;
-    if (hasAnyConfigurationItem) payload.acknowledgePublicPublication = acknowledged;
+    if (configurationItemId) payload.acknowledgePublicPublication = acknowledged;
     if (notifications.notifyInternalStakeholders) payload.notifyInternalStakeholders = true;
     if (notifications.outageCommunication) payload.outageCommunication = true;
     if (notifications.impact.trim()) payload.impact = notifications.impact.trim();
@@ -389,24 +381,8 @@ export default function CreateOutagePage(): JSX.Element {
             </Box>
           </Box>
 
-          <AsyncEntityMultiSelect<BeConfigurationItem>
-            id="outage-affected-configuration-items"
-            label="Affected configuration items"
-            placeholder="Search service offerings…"
-            values={affectedIds}
-            onChange={(next) => {
-              setAffectedIds(next);
-              if (next.length === 0 && !configurationItemId) setAcknowledged(false);
-            }}
-            disabled={postOutage.isPending}
-            useSearch={useSearchConfigurationItems}
-            getId={(c) => c.id}
-            getLabel={configurationItemLabel}
-            helperText="Other service offerings this outage affects. Each one's status-page monitor and availability reflect the outage."
-          />
-
           <OutagePublicationNotice
-            hasConfigurationItem={hasAnyConfigurationItem}
+            hasConfigurationItem={!!configurationItemId}
             monitoredClouds={metadata?.statusPageClouds}
             acknowledged={acknowledged}
             onAcknowledgedChange={setAcknowledged}

@@ -71,6 +71,9 @@ func (f *fakeUserRepoForEscalationService) GetUserByEmail(_ context.Context, ema
 	}
 	return domain.User{}, &apierror.NotFoundError{Msg: "no user found with email: " + email}
 }
+func (f *fakeUserRepoForEscalationService) GetUsersByIDs(context.Context, []string) ([]domain.User, error) {
+	panic("fakeUserRepoForEscalationService.GetUsersByIDs: not expected to be called by these tests")
+}
 func (f *fakeUserRepoForEscalationService) SearchUsers(context.Context, domain.SearchUsersRequest) ([]domain.User, int, error) {
 	panic("fakeUserRepoForEscalationService.SearchUsers: not expected to be called by these tests")
 }

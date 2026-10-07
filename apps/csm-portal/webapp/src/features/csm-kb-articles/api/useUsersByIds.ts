@@ -47,7 +47,8 @@ export function useUsersByIds(ids: string[]): UseQueryResult<Map<string, string>
       const res = await api.post<{ ids: string[] }, UsersByIdsResponse>("/users/by-ids", { ids });
       const map = new Map<string, string>();
       for (const u of res.users ?? []) {
-        map.set(u.id, u.userName || u.email);
+        const fullName = [u.firstName, u.lastName].filter(Boolean).join(" ");
+        map.set(u.id, fullName || u.userName || u.email);
       }
       return map;
     },

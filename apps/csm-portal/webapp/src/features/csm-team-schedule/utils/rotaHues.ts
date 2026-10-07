@@ -65,9 +65,17 @@ export const ZONE_COLOURS: Record<string, string> = {
   TZ3: "#8a63d2",
 };
 
+/** A rotation's Day and Night zones (MOE_D, MOE_N): the same two colours for
+ *  every rotation, since only one rotation is ever on screen at a time. */
+const DAY_NIGHT_COLOURS = { day: "#e8962a", night: "#5a47b6" } as const;
+
 /** The colour for a time zone, falling back to a neutral for one not listed. */
 export function zoneColour(code: string): string {
-  return ZONE_COLOURS[code.toUpperCase()] ?? "#6b7280";
+  const c = code.toUpperCase();
+  if (ZONE_COLOURS[c]) return ZONE_COLOURS[c];
+  if (/_D$/.test(c)) return DAY_NIGHT_COLOURS.day;
+  if (/_N$/.test(c)) return DAY_NIGHT_COLOURS.night;
+  return "#6b7280";
 }
 
 /**

@@ -240,13 +240,6 @@ func (e *incidentLifecycleEnv) assertIncidentLifecycleState(t *testing.T, id, wa
 	return row
 }
 
-func strOrNil(p *string) string {
-	if p == nil {
-		return "<nil>"
-	}
-	return *p
-}
-
 // TestIncidentLifecycleIntegration_FullLifecycle walks one incident through
 // New -> In Progress (claimed) -> On Hold -> In Progress -> Resolved ->
 // Closed, sending what the portal sends at each step.
@@ -302,6 +295,10 @@ func TestIncidentLifecycleIntegration_FullLifecycle(t *testing.T) {
 		t.Fatalf("after Resolved resolved_on=%v resolved_by_id=%s, want set to now / %s", row.ResolvedOn, strOrNil(row.ResolvedByID), ilEngineerID)
 	}
 	resolvedOn := *row.ResolvedOn
+	// Read back as the value the portal sent, not the enum's spelling.
+	if view, err := e.repo.GetIncidentByID(repository.WithSystemIdentity(context.Background()), id); err != nil || strOrNil(view.ResolutionCode) != "SOLVED_WORKAROUND" {
+		t.Fatalf("GetIncidentByID resolutionCode = %s (err %v), want SOLVED_WORKAROUND", strOrNil(view.ResolutionCode), err)
+	}
 	e.mirror.waitForMirroredState(t, domain.IncidentStateResolved)
 
 	// Resolved -> Closed: the portal's resolution dialog sends the
@@ -329,13 +326,15 @@ func TestIncidentLifecycleIntegration_InProgressNeedsNoAssignee(t *testing.T) {
 }
 
 // TestIncidentLifecycleIntegration_Cancel covers New -> Cancelled, the other
-// way out of New, stored as incident_state_enum's 'CANCELED'.
+// way out of New, stored as incident_state_enum's 'CANCELED' and read back
+// as "CANCELLED", the value the API accepted. The webapp only knows
+// "CANCELLED": an incident read back as 'CANCELED' crashed its detail page.
 func TestIncidentLifecycleIntegration_Cancel(t *testing.T) {
 	e := newIncidentLifecycleEnv(t)
 	id := e.createIncident(t)
 
 	e.mustPatch(t, id, `{"state":"CANCELLED"}`)
-	e.assertIncidentLifecycleState(t, id, "CANCELED", "CANCELED")
+	e.assertIncidentLifecycleState(t, id, "CANCELED", "CANCELLED")
 }
 
 // TestIncidentLifecycleIntegration_UnknownAssigneeIsRejected claims an

@@ -620,6 +620,32 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /sla-duration-policy:
+    get:
+      summary: >-
+        List every (severity, clockType) duration row of the static
+        sla_duration_policy reference table — WSO2's own published
+        Enterprise Support Policy durations, seeded directly in a migration,
+        independent of the ServiceNow-synced "sla"/"sla_policy" tables
+        GET /sla-status reads. integrations/csm-notification-service fetches
+        this once at startup to compute its own SLA due dates. Internal
+        callers only. Has no ServiceNow equivalent of its own — always
+        backed by Postgres.
+      operationId: listSLADurationPolicy
+      responses:
+        "200":
+          description: Every sla_duration_policy row, unpaginated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SLADurationPolicyResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /announcement-requests:
     post:
       summary: >-
@@ -654,7 +680,7 @@ paths:
 
   /announcement-requests/search:
     post:
-      summary: Search announcement_requests rows, newest first, optionally filtered by state and/or createdBy.
+      summary: Search announcement_requests rows, newest first, optionally filtered by state (or a list of states) and/or createdBy.
       operationId: searchAnnouncementRequests
       requestBody:
         required: true
@@ -5910,7 +5936,19 @@ paths:
       description: >-
         Records the caller's decision on their own pending approval stage. Only the
         caller's own pending approval can be acted on; the change request's own state
-        cascades automatically in the backing data source.
+        cascades automatically in the backing data source. For a change request's
+        customer group stages: "Customer Approval" approved -> scheduled
+        (is_customer_approval_required), rejected -> canceled; "Customer Review" approved
+        -> closed (is_customer_review_required), rejected -> rollback.
+
+        A stage can only be decided while the change request is in the state it belongs
+        to: Peer Approval in assess, CAB / ECAB Approval in authorize, Review in review,
+        Customer Approval in customer_approval, Customer Review in customer_review. The
+        approvers of a stage the change has left are cancelled when it moves on (all of
+        them once it is closed, canceled or rolled back), and a decision on one that was
+        missed is refused with a 409 and changes nothing. A stage of unknown kind
+        (ServiceNow-synced, no recognisable label) and a change with no state are not
+        guarded.
       operationId: decideChangeRequestApproval
       parameters:
         - name: id
@@ -5944,8 +5982,30 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: >-
+            The caller may not decide: the change request's creator, a user who
+            is not an active internal user on an internal stage (peer, CAB,
+            ECAB, review), or -- while the change waits on its customer group's
+            Customer Approval / Customer Review -- anyone not in that group.
+            The message says which.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         "404":
           description: Change request or pending approval not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "409":
+          description: >-
+            The approval is no longer pending: the change request is in a state other
+            than the one the caller's stage can be decided in (for example "this
+            approval is no longer pending: the change request is in Closed, but the
+            Review stage can only be decided while it is in Review"). Nothing was
+            changed.
           content:
             application/json:
               schema:
@@ -6877,6 +6937,96 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+  /team-schedule/members:
+    get:
+      summary: Who holds which rank on these teams.
+      description: >
+        The org chart behind the rota, as the call-escalation ladder reads it.
+        Its rungs resolve from here: an incident's own team supplies the team
+        lead, the ABT supplies every team lead, and the first rung is the
+        alert-duty nominees, on their own or intersected with
+        `/team-schedule/on-duty`.
+
+
+        Either `teamKeys` or `teamTypes` must be supplied. Both being absent is
+        rejected: an unfiltered read would return every membership in the
+        organisation.
+      operationId: getScheduleMembers
+      parameters:
+        - name: teamKeys
+          in: query
+          required: false
+          schema:
+            type: string
+          description: >
+            Comma-separated team keys, as the rota names them (`vega`,
+            `americas`). Required unless `teamTypes` is supplied.
+          example: vega,americas
+        - name: teamTypes
+          in: query
+          required: false
+          schema:
+            type: string
+          description: >
+            Comma-separated team types, which is how teams are grouped into an
+            ABT: `cre-abt` holds seven teams and `sre-abt` two, while a team
+            like Americas is `cre` and belongs to no ABT. Selecting by type
+            means a team added to an ABT is included without the caller
+            carrying a list of keys. Required unless `teamKeys` is supplied.
+          example: cre-abt
+        - name: roles
+          in: query
+          required: false
+          schema:
+            type: string
+          description: >
+            Comma-separated roles to keep. Omit for every role. One of
+            `engineer`, `sub_lead`, `lead`, `americas_team_lead`, `cre_head`, `cs_head`.
+          example: lead
+        - name: alertTiers
+          in: query
+          required: false
+          schema:
+            type: string
+          description: >
+            Comma-separated alert-duty nominations to keep (`T1`, `T2`, `T3`).
+            Omit for members holding any nomination or none. A nomination is a
+            standing duty to take the first call for a team, independent of
+            rank and never held by a lead.
+          example: T1,T2,T3
+      responses:
+        "200":
+          description: >
+            Every membership matching. A team with nobody at the asked-for rank
+            returns an empty list, not an error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TeamMembersResponse'
+        "400":
+          description: Bad request — no teamKeys or teamTypes, or a role that is not one of the five.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: No user token and not an authorized internal client.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is not internal staff — the rota is not available to customers.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Unexpected error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /groups/search:
     post:
       summary: Search groups (ServiceNow data source only).
@@ -6902,6 +7052,74 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         "401":
           description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /groups/{id}:
+    get:
+      summary: >-
+        Get one group and its members (PostgreSQL data source only; internal
+        callers only).
+      description: >-
+        What opens when a user clicks the assignment group of a change request
+        approval stage (the `assignmentGroup.id` of
+        GET /change-requests/{id}/approvals): the group's name, description,
+        group email and manager, and its active members in name order.
+        `id` is a `"group"` id, NOT a `team` id (POST /groups/search lists
+        teams). Members are the users the approval pools provision from: for the
+        CAB Approval / ECAB Approval / Devops Approval groups, which the pools
+        resolve by name, a `team_member` whose `group_id` is any group of that
+        name or whose `team_id` is a team of that name; for any other group (a
+        change's assigned group) a `team_member` whose `group_id` is this group.
+        Only active INTERNAL users are listed -- the rule every approver pool
+        applies, so a customer in a staff group, an inactive user or a user with
+        no derivable type is neither provisioned as an approver nor shown -- and
+        a user with several membership rows is listed once. Not available under DATA_SOURCE=servicenow (the route is
+        not registered). Internal callers only: an external (customer) caller
+        gets 403, so a customer's contacts cannot be enumerated here.
+      operationId: getGroup
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The group and its members.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GroupDetail'
+        "400":
+          description: The id is not a valid UUID.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is not an internal caller.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: No group with this id.
           content:
             application/json:
               schema:
@@ -7228,6 +7446,64 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
         "404":
           description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /change-requests/link-options:
+    post:
+      summary: >-
+        Options for the change request form's Customer Project -> Deployments ->
+        Deployment products cascade, plus the read-only Customer Group
+        (PostgreSQL data source only).
+      operationId: getChangeRequestLinkOptions
+      description: >-
+        Given the selected Customer Project, returns the project's active
+        deployments (each with its type, i.e. its environment role) and its
+        `customerContacts`: the project's REGISTERED portal-user contacts, which
+        are the change request's read-only Customer Group (nothing to pick). Given
+        the deployments chosen so far as well, also returns the deployment
+        products that follow from them -- the same derivation that POST
+        /change-requests and PATCH /change-requests/{id} validate against.
+        Deployment products are read-only on the form: they are always the
+        active deployed products of the chosen deployments.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangeRequestLinkOptionsRequest'
+      responses:
+        "200":
+          description: The options for the selection.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangeRequestLinkOptionsResponse'
+        "400":
+          description: >-
+            Bad request: projectId missing or not a UUID; a deployment that is
+            unknown, inactive or belongs to another project; not supported on
+            the ServiceNow data source.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is not an internal caller.
           content:
             application/json:
               schema:
@@ -7853,6 +8129,12 @@ paths:
 
     patch:
       summary: Partially update an incident (ServiceNow data source only).
+      description: >-
+        On postgres-servicenow-dual-write, moving the incident to CLOSED also moves each of
+        its open incident tasks to CLOSED_INCOMPLETE, and moving it to CANCELED moves them
+        to CLOSED_SKIPPED, each with ServiceNow's work note ("Incident Task is Closed
+        Incomplete based on closure of INC..."), in the same transaction -- a port of
+        ServiceNow's "Cascade closure of Incident Tasks".
       operationId: updateIncident
       parameters:
         - name: id
@@ -7946,11 +8228,51 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
 
+  /specialist-handoff-teams:
+    get:
+      summary: The Special Ops teams an incident specialist handoff can go to.
+      description: >-
+        On the Postgres data sources, the teams SPECIALIST_HANDOFF_CONFIG gives the product
+        the service belongs to, in configured order (a team's key is the handoff's
+        escalationTeam). Several teams mean the caller must pick one; one team is the
+        handoff's target with nothing to pick; none means the service cannot be handed off.
+        On ServiceNow, its hard-coded routing: Choreo's Special Ops, Runtime and APIM teams,
+        Asgardeo's Special Ops.
+      operationId: listSpecialistHandoffTeams
+      parameters:
+        - name: serviceId
+          in: query
+          required: false
+          description: The incident's service. Omitted, every product's teams.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The teams, in configured order.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SpecialistHandoffTeamsResponse'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
   /incidents/{id}/specialist-handoffs:
     post:
       summary: >-
-        Hand an incident off to its specialist group (ServiceNow data source only). One
-        atomic call: moves the incident to the specialist group for its business service,
+        Hand an incident off to its specialist group. On the Postgres data sources the
+        handoff writes Postgres only (no ServiceNow call), mirroring ServiceNow's
+        "Escalate to Special Ops" UI action. One atomic call: moves the incident to the specialist group for its business service,
         clears the assignee, opens a runbook-gap task, and (by default) files an internal
         issue for the receiving team. Not routed through any case-escalation path -- this is
         a distinct contract sharing no vocabulary with it.
@@ -8010,7 +8332,7 @@ paths:
 
   /incidents:
     post:
-      summary: Create a new incident (ServiceNow data source only).
+      summary: Create a new incident.
       operationId: createIncident
       requestBody:
         required: true
@@ -8832,8 +9154,7 @@ paths:
 
     patch:
       summary: >-
-        Update a problem -- a forward state transition, plain-field updates, or both
-        (ServiceNow data source only).
+        Update a problem -- a forward state transition, plain-field updates, or both.
       operationId: updateProblem
       parameters:
         - name: id
@@ -9002,6 +9323,60 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+    patch:
+      summary: >-
+        Change an incident task's state and/or close notes (Postgres data sources only).
+      description: >-
+        Closing a task (CLOSED_COMPLETE, CLOSED_INCOMPLETE or CLOSED_SKIPPED) sets it
+        inactive and records when and by whom, unless already recorded; moving it back to
+        an open state makes it active again and keeps those, as ServiceNow does. Closing or
+        canceling the parent incident closes any task still open (Closed Incomplete /
+        Closed Skipped), as ServiceNow's "Cascade closure of Incident Tasks" does.
+      operationId: updateIncidentTask
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateIncidentTaskRequest'
+      responses:
+        "200":
+          description: The updated incident task.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncidentTaskDetail'
+        "400":
+          description: No field given, or an unknown state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "404":
+          description: Incident task not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "503":
+          description: Not available on the ServiceNow data source.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
 
   /conversations/search:
     post:
@@ -9043,8 +9418,7 @@ paths:
     get:
       summary: Get system-wide reference metadata (time zones, project types, feedback emojis).
       description: >
-        Postgres: projectTypes come from project_type and timeZones come from timezone;
-        feedbackEmojies has no Postgres source yet and comes back empty.
+        Populated on both data sources, including feedbackEmojies.
       operationId: getSystemMetadata
       responses:
         "200":
@@ -9282,7 +9656,12 @@ paths:
 
   /conversations:
     post:
-      summary: Start a new conversation on a project (ServiceNow data source only).
+      summary: Start a new conversation on a project.
+      description: >-
+        On the Postgres data sources the conversation is stored natively
+        (number from next_portal_work_item_number(), state ACTIVE, the first
+        message as its description); under postgres-servicenow-dual-write
+        ServiceNow creates it first and the Postgres row takes its id and number.
       operationId: createConversation
       requestBody:
         required: true
@@ -9298,13 +9677,19 @@ paths:
               schema:
                 $ref: '#/components/schemas/CreateConversationResponse'
         "400":
-          description: Bad request — missing projectId/initialMessage, or other invalid field.
+          description: Bad request — missing projectId/initialMessage, a project that does not exist (Postgres), or other invalid field.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         "401":
-          description: Missing or invalid x-user-id-token header (ServiceNow data source only).
+          description: Missing or invalid x-user-id-token header.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is not a member of the project.
           content:
             application/json:
               schema:
@@ -9321,16 +9706,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-        "503":
-          description: Conversations are only supported for the ServiceNow data source.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
 
   /cases/{id}/feedback:
     get:
-      summary: Get the feedback submitted for a case (ServiceNow data source only).
+      summary: Get the feedback submitted for a case.
       operationId: getCaseFeedback
       parameters:
         - name: id
@@ -9359,6 +9738,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: Case feedback can only be viewed by internal users.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         "404":
           description: Case not found, or no feedback has been submitted for this case yet.
           content:
@@ -9371,14 +9756,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
-        "503":
-          description: Case feedback is only supported for the ServiceNow data source.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
     post:
-      summary: Submit feedback for a case (ServiceNow data source only).
+      summary: Submit feedback for a case.
       operationId: submitCaseFeedback
       parameters:
         - name: id
@@ -9408,25 +9787,25 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         "401":
-          description: Missing or invalid x-user-id-token header (ServiceNow data source only).
+          description: Missing or invalid x-user-id-token header.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         "404":
-          description: Case not found.
+          description: Case not found, or not accessible to the caller.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "409":
+          description: The case is not yet closed, or feedback has already been submitted for it.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         "500":
           description: Internal server error.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        "503":
-          description: Case feedback is only supported for the ServiceNow data source.
           content:
             application/json:
               schema:
@@ -11088,6 +11467,548 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /users/by-ids:
+    post:
+      summary: Resolve a batch of user ids to their profiles.
+      description: >-
+        Values in `ids` that are not well-formed UUIDs cannot match a user and are
+        skipped, rather than failing the request: callers build the list from
+        records whose user reference can be free text (for example an email
+        address). Users that do match are still returned.
+      operationId: getUsersByIDs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Matching users.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /kb-articles:
+    post:
+      summary: Create a KB article (draft).
+      operationId: createKBArticle
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "201":
+          description: Created article.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /kb-articles/search:
+    post:
+      summary: Search KB articles.
+      operationId: searchKBArticles
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Matching articles.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /kb-articles/{id}:
+    get:
+      summary: Get one KB article by id.
+      operationId: getKBArticle
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The requested article.
+          content:
+            application/json:
+              schema:
+                type: object
+        "404":
+          description: No such article.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    patch:
+      summary: Edit a KB article's title/body (draft).
+      operationId: patchKBArticleContent
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Updated article.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    delete:
+      summary: Delete a KB article (draft or pending_review only).
+      operationId: deleteKBArticle
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Deleted.
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /kb-articles/{id}/state:
+    patch:
+      summary: Transition a KB article's state.
+      operationId: patchKBArticleState
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Updated article.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: Illegal transition or bad request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Conflicting concurrent update.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /kb-articles/{id}/history:
+    get:
+      summary: List a KB article's version history.
+      operationId: listKBArticleHistory
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Version history.
+          content:
+            application/json:
+              schema:
+                type: object
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /knowledge-bases:
+    get:
+      summary: List active knowledge bases.
+      operationId: listKnowledgeBases
+      responses:
+        "200":
+          description: Knowledge bases.
+          content:
+            application/json:
+              schema:
+                type: object
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    post:
+      summary: Create a knowledge base.
+      operationId: createKnowledgeBase
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "201":
+          description: Created knowledge base.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /knowledge-bases/{id}:
+    patch:
+      summary: Rename a knowledge base.
+      operationId: updateKnowledgeBaseName
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Updated knowledge base.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /knowledge-bases/{id}/active:
+    patch:
+      summary: Activate or deactivate a knowledge base.
+      operationId: setKnowledgeBaseActive
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Updated knowledge base.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /kb-manager-users:
+    post:
+      summary: Grant a user manager access to a knowledge base.
+      operationId: createKBManagerUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "201":
+          description: Created grant.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    delete:
+      summary: Revoke a user's manager access to a knowledge base.
+      operationId: deleteKBManagerUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "204":
+          description: Revoked.
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /kb-manager-users/search:
+    post:
+      summary: Search knowledge-base manager users.
+      operationId: searchKBManagerUsers
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Matching manager users.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /kb-manager-groups:
+    post:
+      summary: Grant a group manager access to a knowledge base.
+      operationId: createKBManagerGroup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "201":
+          description: Created grant.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    delete:
+      summary: Revoke a group's manager access to a knowledge base.
+      operationId: deleteKBManagerGroup
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "204":
+          description: Revoked.
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /kb-manager-groups/search:
+    post:
+      summary: Search knowledge-base manager groups.
+      operationId: searchKBManagerGroups
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: Matching manager groups.
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
 components:
   securitySchemes:
     internalClientCredential:
@@ -11101,6 +12022,20 @@ components:
         do not carry this requirement.
 
   schemas:
+    SpecialistHandoffTeamsResponse:
+      type: object
+      properties:
+        teams:
+          type: array
+          items:
+            type: object
+            properties:
+              key:
+                type: string
+                description: Sent as the handoff's escalationTeam.
+              label:
+                type: string
+
     AllocationEvent:
       type: object
       description: >-
@@ -12857,6 +13792,12 @@ components:
               - uat
               - development
           description: Filter by deployment types.
+        ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: Filter by the deployment's own UUID. Postgres data source only.
 
     DeploymentView:
       type: object
@@ -13204,6 +14145,13 @@ components:
         description:
           type: string
           description: Description of the deployed product.
+        category:
+          type: string
+          enum: [pdp, ms, ps, cl, pc]
+          description: >-
+            Optional product category/classification (PDP/MS/PS/CL/PC). Postgres-only --
+            never forwarded to the ServiceNow mirror under dual-write, since ServiceNow's own
+            create payload has no equivalent field.
 
     CreateDeployedProductResponse:
       type: object
@@ -13227,7 +14175,7 @@ components:
 
     UpdateDeployedProductRequest:
       oneOf:
-        - description: Update deployed product detail fields. At least one of cores, tps, description, or updates must be provided.
+        - description: Update deployed product detail fields. At least one of cores, tps, description, category, or updates must be provided.
           type: object
           minProperties: 1
           additionalProperties: false
@@ -13248,6 +14196,12 @@ components:
               type: string
               nullable: true
               description: Description of the deployed product.
+            category:
+              type: string
+              enum: [pdp, ms, ps, cl, pc]
+              description: >-
+                Optional product category/classification (PDP/MS/PS/CL/PC). Postgres-only --
+                never forwarded to the ServiceNow mirror under dual-write.
             updates:
               type: array
               items:
@@ -15628,8 +16582,31 @@ components:
               nullable: true
             hasCustomerApproved:
               type: boolean
+              description: >-
+                The customer's OUTCOME: true once the customer's approval has
+                been recorded (state scheduled out of customer_approval). Not
+                the creation checkbox -- see customerApprovalRequired.
             hasCustomerReviewed:
               type: boolean
+              description: >-
+                The customer's OUTCOME: true once the customer's review has
+                been recorded (state closed out of customer_review). Not the
+                creation checkbox -- see customerReviewRequired.
+            customerApprovalRequired:
+              type: boolean
+              description: >-
+                The creation form's "Customer Approval" checkbox: the change
+                needs the customer's approval before it is scheduled. When
+                true, CAB / ECAB approval (or Request Approval on a Standard
+                change) moves the change to customer_approval instead of
+                scheduled. PostgreSQL data source only (always false on the
+                ServiceNow data source).
+            customerReviewRequired:
+              type: boolean
+              description: >-
+                The creation form's "Customer Review" checkbox: the change
+                needs the customer's review before it is closed. When true,
+                review offers customer_review instead of closed.
             approvedBy:
               $ref: '#/components/schemas/EntityRef'
               nullable: true
@@ -15640,6 +16617,37 @@ components:
               type: array
               items:
                 type: string
+              description: >-
+                Next states a human may move the change request to, per state
+                (the single source of truth the portal renders).
+                new: [assess, canceled] -- "assess" is the "Request Approval"
+                action for every type; the state it lands in depends on the
+                type (Assess for Normal, Authorize for Emergency, Scheduled for
+                Standard -- customer_approval instead when
+                customerApprovalRequired).
+                assess: [authorize, canceled]; authorize: [canceled] (CAB/ECAB
+                approval moves the change on by itself: to scheduled, or to
+                customer_approval when customerApprovalRequired).
+                customer_approval: [scheduled, authorize, canceled] --
+                "scheduled" here means "record the customer's approval" and is
+                the ONLY state from which a manual scheduled is accepted;
+                "authorize" here means Re-schedule (PATCH {state: authorize}
+                with a changed plannedStartOn and/or plannedEndOn sends the
+                change back through CAB/ECAB approval; it is accepted from this
+                state only and refused when the window does not change). When
+                the change has a customer group with a pending "Customer
+                Approval" stage "scheduled" is withdrawn: [authorize,
+                canceled], and the decision comes from the group's members
+                through the approvals.
+                scheduled: [implement, canceled]; implement: [review,
+                canceled].
+                review: [customer_review, rollback, canceled] when
+                customerReviewRequired, else [closed, rollback, canceled].
+                customer_review: [closed, rollback, canceled], or [canceled]
+                while a customer group's "Customer Review" stage is pending.
+                "rollback" (the failed-review off-ramp) is accepted only from
+                review and customer_review; it is terminal.
+                Terminal states: none.
             implementationPlan:
               type: string
               nullable: true
@@ -15668,17 +16676,25 @@ components:
               type: string
               nullable: true
               description: Raw, unvalidated free text (e.g. "10 mins").
-            environments:
-              type: array
-              items:
-                $ref: '#/components/schemas/EntityRef'
             deploymentProducts:
               type: array
               items:
                 $ref: '#/components/schemas/EntityRef'
-            customerGroup:
-              $ref: '#/components/schemas/EntityRef'
-              nullable: true
+              description: >-
+                Read-only, derived from `deployments`: the deployed products of
+                the chosen deployments, named "<product> <version>".
+            customerContacts:
+              type: array
+              description: >-
+                The change request's Customer Group, READ-ONLY and derived live
+                (never stored): the REGISTERED portal-user contacts (a
+                project_contact in state REGISTERED holding the PORTAL_USER
+                project role, whose user is active) of the change request's
+                Customer Project, name order. Always an array: empty without a
+                project or without such contacts. They are the customer's
+                approvers at Customer Approval / Customer Review.
+              items:
+                $ref: '#/components/schemas/ChangeRequestCustomerContact'
             changeRequestType:
               type: string
               nullable: true
@@ -15703,6 +16719,9 @@ components:
               type: array
               items:
                 $ref: '#/components/schemas/EntityRef'
+              description: >-
+                The project's deployments the change touches (the project is
+                `project`). Always an array on the PostgreSQL data source.
             workStart:
               type: string
               nullable: true
@@ -15731,6 +16750,19 @@ components:
           description: >-
             Approver response status. Open string set (e.g. APPROVED, NOT_REQUIRED,
             REQUESTED, REJECTED, CANCELLED, NO_CONSENSUS); not a fixed enum.
+        canDecide:
+          type: boolean
+          description: >-
+            True only on the calling user's own REQUESTED row, when they may
+            actually decide it (they are not the change request's creator, and
+            on an internal stage -- peer, CAB, ECAB, review -- are an active
+            internal user) and the change request is in the state the row's
+            stage belongs to (peer: assess, CAB / ECAB: authorize, review:
+            review, customer approval / review: customer_approval /
+            customer_review) -- a REQUESTED row left on a stage the change has
+            moved past is false. Advisory --
+            the decision endpoint re-checks. Postgres data source only; false
+            elsewhere.
         createdOn:
           type: string
           nullable: true
@@ -15754,7 +16786,13 @@ components:
       properties:
         stage:
           type: string
-          description: Approval stage name (e.g. Assess, Authorize, Customer Approval).
+          description: >-
+            Approval stage name: "Peer Approval", "CAB Approval", "ECAB Approval",
+            "Review", and -- for the change's customer group, while it is in
+            customer_approval / customer_review -- "Customer Approval" /
+            "Customer Review" (approverName is then the customer group's name),
+            for stages provisioned by this service; legacy/synced stages may be
+            "Assess", "Authorize" or "Customer Approval".
         approverType:
           type: string
           enum: [STATIC_GROUP, DYNAMIC_CONTACT]
@@ -15764,10 +16802,29 @@ components:
         status:
           type: string
           enum: [APPROVED, REJECTED, PENDING]
+        assignmentGroup:
+          $ref: '#/components/schemas/ChangeRequestApprovalGroup'
         approvers:
           type: array
           items:
             $ref: '#/components/schemas/ChangeRequestApprover'
+
+    ChangeRequestApprovalGroup:
+      type: object
+      nullable: true
+      description: >-
+        The group an approval stage is assigned to (`approval_stage.assignment_group_id`);
+        open it with GET /groups/{id} to list its members. null for the Customer
+        Approval / Customer Review stages (their approvers are the project's
+        registered contacts, not a group), for a stage recorded against no group,
+        and always under the ServiceNow data source. `approverName` is unchanged.
+      required: [id, name]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
 
     ChangeRequestApprovals:
       type: object
@@ -16170,9 +17227,17 @@ components:
       type: object
       required:
         - subject
+        - type
       properties:
         subject:
           type: string
+        type:
+          type: string
+          enum: [standard, normal, emergency]
+          description: >-
+            Required. Decides the approval flow: Standard needs no approval
+            (Request Approval goes straight to Scheduled); Normal needs peer
+            approval then CAB approval; Emergency needs ECAB approval only.
         category:
           type: string
           enum:
@@ -16211,15 +17276,6 @@ components:
             - high
             - medium
             - low
-        type:
-          type: string
-          enum:
-            - standard
-            - normal
-            - emergency
-            - model
-            - site_reliability_ops
-            - azure
         state:
           type: string
           enum:
@@ -16271,8 +17327,14 @@ components:
           pattern: '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$'
         comment:
           type: string
+          description: >-
+            The customer-visible "Additional comments" entry. On the PostgreSQL
+            data source stored as a comment row of type `comment`; blank is ignored.
         workNote:
           type: string
+          description: >-
+            The internal "Work notes" entry. On the PostgreSQL data source stored
+            as a comment row of type `work_note`; blank is ignored.
         affectedServicesText:
           type: string
         affectedComponentsText:
@@ -16283,16 +17345,54 @@ components:
         customerGroupId:
           type: string
           format: uuid
+          deprecated: true
+          description: >-
+            NO LONGER ACCEPTED. Any value is a 400 `customerGroupId is no longer
+            accepted: the customer group is derived from the customer project's
+            registered contacts`. The Customer Group is read-only: the REGISTERED
+            portal-user contacts of `projectId`, exposed as `customerContacts` on
+            the change request and by POST /change-requests/link-options.
+        projectId:
+          type: string
+          format: uuid
+          description: >-
+            The Customer Project (PostgreSQL data source only). Must exist.
+        deploymentIds:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+            format: uuid
+          description: >-
+            The project's deployments the change touches (PostgreSQL data
+            source only). Each must exist, be active and belong to `projectId`
+            (so `projectId` is required with it). 400 messages: "projectId is
+            required when deploymentIds are provided", "deploymentIds contains
+            an unknown deployment: <id>", "deploymentIds contains a deployment
+            that does not belong to the selected project: <id>", "deploymentIds
+            contains an inactive deployment: <id>".
         environmentIds:
           type: array
+          deprecated: true
           items:
             type: string
             format: uuid
+          description: >-
+            NO LONGER SUPPORTED. Any value is a 400 `environmentIds is no longer
+            supported: deployments carry the environment` (a deployment's type is
+            its environment role).
         deploymentProductIds:
           type: array
+          maxItems: 100
           items:
             type: string
             format: uuid
+          description: >-
+            READ-ONLY, derived: always the active deployed products of the chosen
+            deployments. Optional; when given it must be exactly that set, else
+            400 ("deploymentProductIds is read-only: it is derived from the
+            selected deployments and must match them exactly"). PostgreSQL data
+            source only.
         durationInput:
           type: integer
           description: >-
@@ -16304,6 +17404,100 @@ components:
           description: >-
             Whether the Implementation Plan is visible to customers on the
             customer-facing portal.
+        customerApprovalRequired:
+          type: boolean
+          description: >-
+            The "Customer Approval" checkbox: the change needs the customer's
+            approval before it is scheduled (CAB / ECAB approval, or Request
+            Approval on a Standard change, then moves it to customer_approval
+            instead of scheduled). Defaults to false. PostgreSQL data source
+            only.
+        customerReviewRequired:
+          type: boolean
+          description: >-
+            The "Customer Review" checkbox: the change needs the customer's
+            review before it is closed (review offers customer_review instead
+            of closed). Defaults to false. PostgreSQL data source only.
+
+    ChangeRequestLinkOptionsRequest:
+      type: object
+      required:
+        - projectId
+      properties:
+        projectId:
+          type: string
+          format: uuid
+          description: The selected Customer Project.
+        deploymentIds:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+            format: uuid
+          description: >-
+            The deployments chosen so far. Must belong to the project. Omit (or
+            send empty) to get just the project's deployments.
+
+    ChangeRequestCustomerContact:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: The project contact's id (project_contact.id).
+        name:
+          type: string
+        email:
+          type: string
+
+    ChangeRequestLinkOptionsResponse:
+      type: object
+      required: [deployments, deploymentProducts, customerContacts]
+      properties:
+        customerContacts:
+          type: array
+          description: >-
+            The project's REGISTERED portal-user contacts, name order: the
+            read-only Customer Group of a change request on it. Empty when the
+            project has none.
+          items:
+            $ref: '#/components/schemas/ChangeRequestCustomerContact'
+        deployments:
+          type: array
+          description: The project's active deployments, name order.
+          items:
+            type: object
+            required: [id, name, type]
+            properties:
+              id:
+                type: string
+                format: uuid
+              name:
+                type: string
+              type:
+                type: string
+                description: >-
+                  The deployment type, i.e. its environment role:
+                  primary_production, staging, qa, stress, uat or development.
+        deploymentProducts:
+          type: array
+          description: >-
+            Read-only: the active deployed products of the chosen deployments.
+            Empty when none were chosen.
+          items:
+            type: object
+            required: [id, name, deployment]
+            properties:
+              id:
+                type: string
+                format: uuid
+                description: The deployed product id (what deploymentProductIds carries).
+              name:
+                type: string
+                description: '"<product> <version>".'
+              deployment:
+                $ref: '#/components/schemas/EntityRef'
 
     CreateChangeRequestResponse:
       type: object
@@ -16412,6 +17606,21 @@ components:
           description: >-
             Whether the Implementation Plan is visible to customers on the
             customer-facing portal.
+        customerApprovalRequired:
+          type: boolean
+          description: >-
+            The "Customer Approval" checkbox. Editable only until the approval
+            gate has been passed, i.e. while the state is new, assess or
+            authorize; a change of value afterwards is a 400 ("customerApprovalRequired
+            can no longer be changed ..."). Resending the stored value is
+            always accepted. PostgreSQL data source only.
+        customerReviewRequired:
+          type: boolean
+          description: >-
+            The "Customer Review" checkbox. Editable until the change leaves
+            review (any state up to and including review); a change of value
+            from customer_review onwards is a 400 ("customerReviewRequired can
+            no longer be changed ..."). PostgreSQL data source only.
         implementationPlan:
           type: string
           nullable: true
@@ -16449,27 +17658,64 @@ components:
           type: string
           format: uuid
           nullable: true
-          description: Explicit null clears the field.
+          deprecated: true
+          description: >-
+            NO LONGER ACCEPTED (any value, null included, is a 400 `customerGroupId
+            is no longer accepted: the customer group is derived from the customer
+            project's registered contacts`). The Customer Group is read-only and
+            follows `projectId`: changing the project re-derives it, and a live
+            Customer Approval / Customer Review stage is replaced by one for the new
+            project's contacts.
+        deploymentIds:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+            format: uuid
+          description: >-
+            Replaces the whole list of the project's deployments the change
+            touches; an explicitly empty array clears it (and with it the
+            deployment products). Each deployment must belong
+            to the change request's project (`projectId` in this request, else
+            the stored one). Changing `projectId` while deployments are stored
+            requires `deploymentIds` in the same request. Cannot be combined
+            with `deploymentId` / `deployedProductId`. Deployment products are
+            always re-derived. EDIT WINDOW: `projectId`, `deploymentIds` and
+            `deploymentProductIds` can be changed only while the change request
+            has not reached `implement` (states new .. scheduled); afterwards a
+            change is a 400 ("<field> can no longer be changed: ...") while
+            resending the stored value is accepted. PostgreSQL data source only.
         environmentIds:
           type: array
           nullable: true
+          deprecated: true
           items:
             type: string
             format: uuid
-          description: Replaces the whole list; an explicitly empty array clears it.
+          description: >-
+            NO LONGER SUPPORTED. Any value is a 400 `environmentIds is no longer
+            supported: deployments carry the environment`.
         deploymentProductIds:
           type: array
           nullable: true
+          maxItems: 100
           items:
             type: string
             format: uuid
-          description: Replaces the whole list; an explicitly empty array clears it.
+          description: >-
+            READ-ONLY, derived from the deployments. Accepted only when it is
+            exactly the derived set (otherwise 400); the stored list is always
+            the derived one.
         comment:
           type: string
-          description: Appends a journal entry. Cannot be empty and cannot clear anything.
+          description: >-
+            Appends a customer-visible journal entry ("Additional comments", a
+            comment row of type `comment`). Cannot be empty and cannot clear anything.
         workNote:
           type: string
-          description: Appends a journal entry. Cannot be empty and cannot clear anything.
+          description: >-
+            Appends an internal journal entry ("Work notes", a comment row of
+            type `work_note`). Cannot be empty and cannot clear anything.
         durationInput:
           type: integer
           nullable: true
@@ -17323,7 +18569,9 @@ components:
 
     ScheduleZone:
       type: object
-      description: An SRE time zone.
+      description: >
+        A block of the day a rota is worked in: SaaS SRE's time zones TZ1-TZ3,
+        or a rotation's Day and Night.
       properties:
         id: { type: string, format: uuid }
         code: { type: string, example: TZ1 }
@@ -17333,6 +18581,30 @@ components:
           description: >
             The zone that absorbs this one at the weekend, when three weekday
             zones collapse into two.
+        sortOrder: { type: integer }
+        rotaCode:
+          type: string
+          example: SRE_SAAS
+          description: The rota this zone belongs to; absent for a zone no rota claims.
+    ScheduleRota:
+      type: object
+      required: [code, label, family, rotates, sortOrder]
+      description: >
+        A named rotation inside a family -- SRE's SaaS and IaaS, one per SME
+        product -- with the rules its own sheet states. A team is on the rota
+        whose team type matches team.type.
+      properties:
+        code: { type: string, example: SME_MOESIF }
+        label: { type: string, example: Moesif }
+        family: { type: string, enum: [CRE, SRE, SME] }
+        rotates: { type: string, enum: [DAILY, WEEKLY, IRREGULAR] }
+        escalationMinutes:
+          type: integer
+          description: >
+            Minutes before an unanswered page moves up a level, as the rota's
+            sheet states; absent where it does not say. Informational -- the
+            escalation ladder keeps its own timing.
+        sourceSheet: { type: string }
         sortOrder: { type: integer }
     ScheduleShift:
       type: object
@@ -17345,7 +18617,7 @@ components:
         code: { type: string, example: SRE_TZ1_L1 }
         shortCode: { type: string, example: L1 }
         label: { type: string }
-        family: { type: string, enum: [CRE, SRE] }
+        family: { type: string, enum: [CRE, SRE, SME] }
         zoneCode: { type: string }
         tier: { type: string, enum: [L1, L2, L3] }
         dayScope: { type: string, enum: [WEEKDAY, WEEKEND, ANY] }
@@ -17379,12 +18651,16 @@ components:
       properties:
         key: { type: string, example: castor }
         name: { type: string }
-        family: { type: string, enum: [CRE, SRE] }
+        family: { type: string, enum: [CRE, SRE, SME] }
         sortOrder:
           type: integer
           description: >-
             Display order, and what gives a team a stable colour without any
             client naming it.
+        rotaCode:
+          type: string
+          example: SRE_SAAS
+          description: The rota the team's type belongs to; absent for a team on no named rota.
     CreateScheduleAbsenceKindRequest:
       type: object
       required: [shortCode, label, bucket, colourToken]
@@ -17418,7 +18694,7 @@ components:
           description: True for a tag a lead added from the portal, which a lead may also delete.
         family:
           type: string
-          enum: [CRE, SRE]
+          enum: [CRE, SRE, SME]
           description: The rota the kind is offered on. Absent for a kind both rotas use, which is every kind of leave.
         retired:
           type: boolean
@@ -17440,6 +18716,9 @@ components:
         teams:
           type: array
           items: { $ref: '#/components/schemas/ScheduleTeam' }
+        rotas:
+          type: array
+          items: { $ref: '#/components/schemas/ScheduleRota' }
     ScheduleEngineer:
       type: object
       properties:
@@ -17718,7 +18997,7 @@ components:
         teamKeys:
           type: array
           items: { type: string }
-        family: { type: string, enum: [CRE, SRE] }
+        family: { type: string, enum: [CRE, SRE, SME] }
         userId: { type: string, format: uuid }
         userEmail:
           type: string
@@ -17741,6 +19020,51 @@ components:
           items: { type: string }
         userId: { type: string, format: uuid }
         userEmail: { type: string }
+    TeamMembersResponse:
+      type: object
+      required: [members, count]
+      properties:
+        members:
+          type: array
+          items:
+            $ref: '#/components/schemas/TeamMemberEntry'
+        count:
+          type: integer
+    TeamMemberEntry:
+      type: object
+      required: [teamKey, role, userId, name, email]
+      properties:
+        teamKey:
+          type: string
+          example: vega
+        teamType:
+          type: string
+          description: >
+            The team's own type, which is what groups teams into an ABT:
+            `cre-abt`, `sre-abt`, `cre`, `cre-leadership`.
+          example: cre-abt
+        alertTier:
+          type: string
+          description: >
+            The standing alert-duty nomination this member holds (`T1`, `T2`,
+            `T3`), absent when they hold none.
+          example: T1
+        role:
+          type: string
+          description: >
+            The raw membership rank. Passed through unvalidated on read, so a
+            role a later migration adds reaches a caller without this contract
+            changing first.
+          example: sub_lead
+        userId:
+          type: string
+          format: uuid
+        name:
+          type: string
+          description: Empty when the user row carries no name.
+        email:
+          type: string
+          description: Empty when the user row carries no address.
     ScheduleAssignmentsResponse:
       type: object
       properties:
@@ -17801,6 +19125,74 @@ components:
           type: integer
         limit:
           type: integer
+
+    GroupManagerRef:
+      type: object
+      nullable: true
+      description: The group's manager (`group.manager_id`).
+      required: [id, name]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+
+    GroupMember:
+      type: object
+      description: One active internal member of a group.
+      required: [id, name]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: The member's `user.id`.
+        name:
+          type: string
+          description: >-
+            `user.name`, else first + last name, else the email, so a member is
+            never listed blank.
+        email:
+          type: string
+          nullable: true
+        userType:
+          type: string
+          nullable: true
+          description: '`user.user_type`; always INTERNAL, as only internal users are listed.'
+        role:
+          type: string
+          nullable: true
+          enum: [member, lead]
+          description: >-
+            "lead" when `team_member.role` is lead on any membership row that
+            makes the user a member, else "member".
+
+    GroupDetail:
+      type: object
+      required: [id, name, members, total]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        description:
+          type: string
+          nullable: true
+        email:
+          type: string
+          nullable: true
+          description: The group email (`group.group_email`).
+        manager:
+          $ref: '#/components/schemas/GroupManagerRef'
+        members:
+          type: array
+          description: Active internal members in name order; empty for a group nobody (eligible) is in.
+          items:
+            $ref: '#/components/schemas/GroupMember'
+        total:
+          type: integer
+          description: The number of members.
 
     SearchServiceOfferingsFilters:
       type: object
@@ -18858,6 +20250,11 @@ components:
         serviceId:
           type: string
           format: uuid
+          description: >-
+            The incident's assignment group is set from this service's support
+            group; there is no assignmentGroupId on create. A service with no
+            support group creates the incident unassigned. Reassign afterwards
+            with PATCH.
         serviceOfferingId:
           type: string
           format: uuid
@@ -18880,10 +20277,6 @@ components:
         urgency:
           type: string
           enum: [HIGH, MEDIUM, LOW]
-        assignmentGroupId:
-          type: string
-          format: uuid
-          nullable: true
         assignedEngineerId:
           type: string
           format: uuid
@@ -18926,7 +20319,7 @@ components:
           type: string
           nullable: true
           description: Optional caller-supplied external-system key, stored on ServiceNow's
-            correlation_id field. Look it up via SearchIncidentsFilters.correlationId
+            correlation_id field. Look it up via SearchIncidentsRequest filters.correlationId
             to find an incident this caller already created, without depending on
             free-text search over subject or workNotes.
         environment:
@@ -19267,7 +20660,7 @@ components:
         escalationTeam:
           type: string
           nullable: true
-          enum: [choreo-runtime-team, choreo-apim-team]
+          description: A team key from GET /specialist-handoff-teams; null when the product has one team.
         handedOffAt:
           type: string
         handedOffBy:
@@ -19297,8 +20690,10 @@ components:
           enum: [no-runbook, runbook-not-working]
         escalationTeam:
           type: string
-          description: Only meaningful for a Choreo-routed handoff.
-          enum: [choreo-runtime-team, choreo-apim-team]
+          maxLength: 64
+          description: >-
+            A team key from GET /specialist-handoff-teams?serviceId=. Required when the
+            incident's product has several teams (400 otherwise); ignored when it has one.
         createGithubIssue:
           type: boolean
           default: true
@@ -19339,7 +20734,7 @@ components:
             escalationTeam:
               type: string
               nullable: true
-              enum: [choreo-runtime-team, choreo-apim-team]
+              description: The team picked; null when the product has one team.
             task:
               $ref: '#/components/schemas/IncidentSpecialistHandoffTask'
             githubIssue:
@@ -19519,10 +20914,14 @@ components:
         transition:
           type: string
           description: >-
-            Forward state transition to request: one of "assess", "confirm", "fix", "resolve",
-            "close". Left as an open string (validated server-side by the data source, not a
-            closed enum here) so an invalid value's actionable error message reaches the
-            caller unchanged.
+            Forward state transition to request: one of "assess" (New -> Assess), "confirm"
+            (Assess -> Root Cause Analysis), "fix" (-> Fix in Progress), "resolve"
+            (-> Resolved; sets resolution code FIX_APPLIED), "close" (-> Closed; makes the
+            problem inactive, refused when the resolution code is RISK_ACCEPTED). A move from
+            any other state is a 400 naming the current state. On the dual-write data source
+            ServiceNow applies the move first and may refuse it (409); Postgres then follows.
+            Left as an open string (not a closed enum here) so an invalid value's actionable
+            error message reaches the caller unchanged.
         assignedToId:
           type: string
           format: uuid
@@ -19549,8 +20948,8 @@ components:
           type: string
           nullable: true
           description: >-
-            Format: YYYY-MM-DD HH:mm:ss. Not surfaced on the native Problem form in the
-            backing data source.
+            Format: YYYY-MM-DD HH:mm:ss, in UTC (RFC3339 is also accepted). Not surfaced on
+            the native Problem form in the backing data source.
 
     UpdateProblemResponse:
       type: object
@@ -19754,6 +21153,11 @@ components:
         assignedTo:
           $ref: '#/components/schemas/EntityRef'
           nullable: true
+        assignmentGroup:
+          description: The problem's assignment group (work_item.assignment_group_id); null when it has none.
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/EntityRef'
         resolutionCode:
           type: string
           nullable: true
@@ -19913,6 +21317,16 @@ components:
         limit:
           type: integer
 
+    UpdateIncidentTaskRequest:
+      type: object
+      minProperties: 1
+      properties:
+        state:
+          type: string
+          enum: [PENDING, OPEN, WORK_IN_PROGRESS, CLOSED_COMPLETE, CLOSED_INCOMPLETE, CLOSED_SKIPPED]
+        closeNotes:
+          type: string
+
     IncidentTaskDetail:
       type: object
       properties:
@@ -19953,6 +21367,10 @@ components:
         closedOn:
           type: string
           nullable: true
+        closeNotes:
+          type: string
+          nullable: true
+          description: Postgres data sources only.
 
     SearchConversationsRequest:
       type: object
@@ -22441,6 +23859,30 @@ components:
         offset:
           type: integer
 
+    SLADurationPolicyItem:
+      type: object
+      description: >-
+        One (severity, clockType) duration row — severity is the same
+        uppercase English word a case.* event's own priority field carries
+        (e.g. "CATASTROPHIC"), not the raw case_severity_enum label.
+      properties:
+        severity:
+          type: string
+        clockType:
+          type: string
+          description: One of response, workaround, resolution.
+        durationSeconds:
+          type: integer
+          format: int64
+
+    SLADurationPolicyResponse:
+      type: object
+      properties:
+        policies:
+          type: array
+          items:
+            $ref: '#/components/schemas/SLADurationPolicyItem'
+
     CloudAvailabilityWindow:
       type: object
       description: One weighted uptime figure for one window.
@@ -23091,6 +24533,17 @@ components:
         state:
           type: string
           enum: [draft, pending_approval, approved, published]
+        states:
+          type: array
+          description: >-
+            Matches a request in any of the listed states, as one merged
+            paginated list (total/hasMore describe the merged list). On its own,
+            an empty or omitted list means no state filter. Rejected if sent
+            together with state or readyForScheduledPublish, even as an empty
+            list.
+          items:
+            type: string
+            enum: [draft, pending_approval, approved, published]
         createdBy:
           type: string
         readyForScheduledPublish:
@@ -23099,7 +24552,7 @@ components:
             When true, ignores state and instead matches every approved
             request whose scheduledFor has already arrived — the query
             operations/csm-scheduled-tasks' publish_scheduled_announcements
-            sub-cron uses. Rejected if combined with state.
+            sub-cron uses. Rejected if combined with state or states.
         pagination:
           $ref: '#/components/schemas/Pagination'
 
