@@ -22,9 +22,9 @@ var (
 	timestampRe = regexp.MustCompile(`\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}`)
 	phoneRe     = regexp.MustCompile(`\+?\d[\d\s\-().]{6,}\d`)
 	// ServiceNow journal: agent names trail a circled-W marker (U+24CC or U+24E6).
-	agentNameRe = regexp.MustCompile(`(\b[\w ]+)\s([\x{24cc}\x{24e6}])`)
+	agentNameRe = regexp.MustCompile(`(\b\w+(?:\s\w+){0,2})\s([\x{24cc}\x{24e6}])`)
 	// Customer names precede "(Additional comments)" in ServiceNow journals.
-	customerNameRe = regexp.MustCompile(`(\b[\w ]+)(?:\s\(Additional comments\))`)
+	customerNameRe = regexp.MustCompile(`(\b\w+(?:\s\w+){0,2})(?:\s\(Additional comments\))`)
 )
 
 const (
@@ -41,6 +41,7 @@ type Filter struct {
 	customerNames   map[string]string
 	agentCounter    int
 	customerCounter int
+	compiledParts   map[string]*regexp.Regexp
 }
 
 // New returns a fresh Filter with empty pseudonym maps.
@@ -50,6 +51,7 @@ func New() *Filter {
 		customerNames:   make(map[string]string),
 		agentCounter:    1,
 		customerCounter: 1,
+		compiledParts:   make(map[string]*regexp.Regexp),
 	}
 }
 
@@ -110,8 +112,12 @@ func (f *Filter) Filter(text string) string {
 	for fullName, placeholder := range allNames {
 		for _, part := range strings.Fields(fullName) {
 			if len(part) > 2 {
-				partRe := regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(part) + `\b`)
-				out = partRe.ReplaceAllString(out, placeholder)
+				re, ok := f.compiledParts[part]
+				if !ok {
+					re = regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(part) + `\b`)
+					f.compiledParts[part] = re
+				}
+				out = re.ReplaceAllString(out, placeholder)
 			}
 		}
 	}
