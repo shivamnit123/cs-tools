@@ -34,6 +34,21 @@ import (
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/kbclient"
 )
 
+// maxMetadataBytes caps the text stored in Pinecone metadata to stay well
+// under Pinecone's 40 KB per-vector metadata limit.
+const maxMetadataBytes = 30_000
+
+func truncateUTF8(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	// Walk backward to avoid cutting a multi-byte character.
+	for maxBytes > 0 && maxBytes < len(s) && s[maxBytes]>>6 == 0b10 {
+		maxBytes--
+	}
+	return s[:maxBytes]
+}
+
 // Engine implements eventbus.Handle for the kb.article_published event.
 type Engine struct {
 	kb       *kbclient.Client
@@ -85,7 +100,7 @@ func (e *Engine) embedAndUpsert(ctx context.Context, articleID string) error {
 	// article's own content and the plain-language problem framing --
 	// matches what a user is actually searching with more closely than
 	// title+body alone would.
-	embedInput := article.Title + "\n\n" + article.Body + "\n\n" + symptom
+	embedInput := truncateUTF8(article.Title + "\n\n" + article.Body + "\n\n" + symptom, maxMetadataBytes)
 	vector, err := e.generate.Embed(ctx, embedInput)
 	if err != nil {
 		return fmt.Errorf("kbembeddingengine: generate embedding for article %s: %w", articleID, err)
@@ -95,7 +110,7 @@ func (e *Engine) embedAndUpsert(ctx context.Context, articleID string) error {
 	metadata := map[string]string{
 		"title":      article.Title,
 		"article_id": article.ID,
-		"text":       article.Body,
+		"text":       truncateUTF8(article.Body, maxMetadataBytes),
 		"symptom":    symptom,
 	}
 	if err := e.pinecone.Upsert(ctx, article.ID, vector, metadata); err != nil {
