@@ -9459,6 +9459,7 @@ type SearchKBArticlesRequest struct {
 	AuthorID        string           `json:"authorId,omitempty"`
 	TeamKeys        []string         `json:"teamKeys,omitempty"`
 	SearchQuery     string           `json:"searchQuery,omitempty"`
+	PublicOnly      bool             `json:"publicOnly,omitempty"`
 	Pagination      Pagination       `json:"pagination"`
 }
 
@@ -9524,6 +9525,7 @@ type KnowledgeBase struct {
 	ID        string    `json:"id"`
 	Title     string    `json:"title"`
 	Active    bool      `json:"active"`
+	IsPublic  bool      `json:"isPublic"`
 	CreatedOn time.Time `json:"createdOn"`
 	UpdatedOn time.Time `json:"updatedOn"`
 }

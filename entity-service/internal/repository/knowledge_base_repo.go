@@ -41,7 +41,7 @@ type KnowledgeBaseRepository interface {
 	// Includes deactivated ones -- the Admin screen needs to see and
 	// reactivate them; article-creation pickers filter active themselves
 	// on the frontend/consumer side.
-	ListKnowledgeBases(ctx context.Context) ([]domain.KnowledgeBase, error)
+	ListKnowledgeBases(ctx context.Context, publicOnly bool) ([]domain.KnowledgeBase, error)
 
 	// CreateKnowledgeBase creates a new, active knowledge base.
 	CreateKnowledgeBase(ctx context.Context, req domain.CreateKnowledgeBaseRequest) (domain.KnowledgeBase, error)
@@ -66,8 +66,13 @@ func NewKnowledgeBaseRepository(db *pgxpool.Pool) KnowledgeBaseRepository {
 }
 
 // ListKnowledgeBases implements KnowledgeBaseRepository.
-func (r *knowledgeBaseRepo) ListKnowledgeBases(ctx context.Context) ([]domain.KnowledgeBase, error) {
-	rows, err := r.db.Query(ctx, "SELECT "+knowledgeBaseColumns+" FROM knowledge_base ORDER BY title")
+func (r *knowledgeBaseRepo) ListKnowledgeBases(ctx context.Context, publicOnly bool) ([]domain.KnowledgeBase, error) {
+	query := "SELECT " + knowledgeBaseColumns + " FROM knowledge_base"
+	if publicOnly {
+		query += " WHERE active = true AND is_public = true"
+	}
+	query += " ORDER BY title"
+	rows, err := r.db.Query(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("list knowledge bases: %w", err)
 	}

@@ -202,6 +202,10 @@ func (r *kbArticleRepo) SearchKBArticles(ctx context.Context, req domain.SearchK
 		argIdx++
 	}
 
+	if req.PublicOnly {
+		where += " AND knowledge_base_id IN (SELECT id FROM knowledge_base WHERE active = true AND is_public = true)"
+	}
+
 	countQuery := "SELECT COUNT(*) FROM knowledge_article " + where
 
 	dataQuery := fmt.Sprintf(

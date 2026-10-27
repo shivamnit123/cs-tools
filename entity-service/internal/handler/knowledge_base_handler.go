@@ -37,7 +37,8 @@ func NewKnowledgeBaseHandler(svc service.KnowledgeBaseService) *KnowledgeBaseHan
 
 // ListKnowledgeBases handles GET /knowledge-bases.
 func (h *KnowledgeBaseHandler) ListKnowledgeBases(w http.ResponseWriter, r *http.Request) {
-	resp, err := h.svc.ListKnowledgeBases(r.Context())
+	publicOnly := r.URL.Query().Get("publicOnly") == "true"
+	resp, err := h.svc.ListKnowledgeBases(r.Context(), publicOnly)
 	if err != nil {
 		writeServiceError(w, r, err)
 		return
